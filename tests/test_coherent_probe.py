@@ -116,3 +116,23 @@ def test_sampling_oversamples_for_defocus_and_binning():
     # detector k range fits in the simulation grid with no wrap-around onto it
     kd = 64 * big.recip_px * 2 / 2
     assert big.n * big.dk / 2 >= kd
+
+
+def test_mode_truncation_keeps_degenerate_groups_whole():
+    """The 3 x 3 source sampling makes degenerate mode pairs. Cutting through a pair picks an
+    arbitrary basis vector (LAPACK/BLAS-thread dependent), which made datacubes differ between
+    machines. Truncation must keep the whole group, so the probe intensity stays symmetric."""
+    o = stem_optics(scan=(8, 8), step_nm=1.0, conv_mrad=15.0, defocus_nm=-500.0, roi=128, binning=2,
+                    det_k_over_alpha=1.3, probe_ab={"C3": 1000.0})
+    cfg = RenderConfig(stem_model="coherent", coherent_max_modes=2)
+    p = build_probe(o, cfg)
+    w = np.asarray(p.weights)
+    assert len(w) >= 2
+    # no kept mode has an (almost) equal partner that was dropped: the kept set ends at a gap
+    full = build_probe(o, RenderConfig(stem_model="coherent", coherent_max_modes=64, coherent_mode_power=1.0))
+    ev = np.asarray(full.weights)
+    k = len(w)
+    if k < len(ev):
+        assert abs(ev[k - 1] - ev[k]) > 1e-3 * ev[k - 1]
+    # an isotropic source and a round (C1 + C3) probe give an x/y-symmetric intensity
+    assert np.allclose(p.intensity, p.intensity.T, atol=1e-3 * p.intensity.max())

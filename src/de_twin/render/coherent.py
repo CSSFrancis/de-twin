@@ -324,6 +324,12 @@ def build_probe(optics, cfg, s: Optional[Sampling] = None, *, center_px=None) ->
         first = float(frac[0])
         keep = int(np.searchsorted(np.cumsum(frac), cfg.coherent_mode_power) + 1)
         keep = max(1, min(keep, int(cfg.coherent_max_modes), len(ev)))
+        # The symmetric source sampling gives degenerate eigenvalues (e.g. an x/y pair). Within
+        # a degenerate group the eigenvectors are an arbitrary basis that LAPACK picks
+        # differently with BLAS threading, so cutting through a group makes the patterns
+        # machine-dependent. Keep whole groups: their summed intensity is basis-independent.
+        while keep < len(ev) and ev[keep] > 0 and abs(ev[keep - 1] - ev[keep]) <= 1e-3 * ev[keep - 1]:
+            keep += 1
         modes = (V[:, :keep].conj().T.astype(np.complex64) @ M) / np.sqrt(ev[:keep])[:, None].astype(np.float32)
         modes = modes.reshape(keep, n, n)
         mw = frac[:keep] / frac[:keep].sum()
