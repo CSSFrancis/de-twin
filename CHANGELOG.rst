@@ -10,6 +10,19 @@ Fragment files in ``upcoming_changes/`` are assembled into this file by
 
 .. towncrier release notes start
 
+0.1.1 (2026-09-24)
+==================
+
+Bug Fixes
+---------
+
+- The deapi face reports "Specimen Pixel Size X/Y (nanometers)" per binned pixel, including hardware and software binning, as DE-Server does.
+- The deapi face treats ``start_acquisition(0)`` as live view (repeat until stopped), as
+  DE-Server does, instead of a single acquisition; and repeated acquisitions no longer repeat
+  the same detector noise, because noise is now seeded by a twin-wide frame counter rather than
+  the frame index within each request.
+
+
 0.1.0 (2026-09-24)
 ==================
 
