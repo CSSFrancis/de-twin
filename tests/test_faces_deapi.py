@@ -1,0 +1,332 @@
+"""deapi face: a real deapi.Client against TwinFakeServer (stub twin, and the real twin if ready)."""
+
+import threading
+import time
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+deapi = pytest.importorskip("deapi")
+pytestmark = pytest.mark.deapi
+
+from de_twin.clock import Clock  # noqa: E402
+from de_twin.column import Column  # noqa: E402
+from de_twin.faces.deapi_server import (  # noqa: E402
+    TEMPERATURE_PROP,
+    TwinDeapiServer,
+    request_from_properties,
+)
+from de_twin.holder import NoHolder  # noqa: E402
+from de_twin.state import ExposureMode, FrameMeta, RenderMode, Roi  # noqa: E402
+
+
+class StubDetector:
+    def __init__(self, shape=(64, 96)):
+        self.model = SimpleNamespace(name="StubCam", sensor_shape=shape, full_frame_time_s=0.001)
+
+    def roi(self, request):
+        h, w = self.model.sensor_shape
+        return request.hw_roi or Roi(0, 0, w, h)
+
+    def output_shape(self, request):
+        r = self.roi(request)
+        bx, by = request.hw_binning
+        return r.h // by, r.w // bx
+
+
+class StubTwin:
+    """Raw frames: dark offset 100 ADU + (beam) a bright column at stage x."""
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.clock = Clock()
+        self.column = Column(clock=self.clock, stage_speed_um_s=1e6)
+        self.detector = StubDetector()
+        self.holder = NoHolder(clock=self.clock)
+        self.requests = []
+        self.specimen_name = None
+
+    def set_specimen(self, name):
+        self.specimen_name = name
+
+    def frames(self, request, pace=False, stop=None):
+        self.requests.append(request)
+        h, w = self.detector.output_shape(request)
+        rng = np.random.default_rng(request.acquisition_index)
+        for i in range(request.total_frames):
+            if stop is not None and stop.is_set():
+                return
+            state = self.column.state()
+            blanked = not request.beam_reaches_detector or state.beam_blanked
+            frame = 100.0 + rng.normal(0, 2, (h, w))
+            if not blanked:
+                if request.exposure_mode == ExposureMode.GAIN:
+                    frame += 400.0
+                else:
+                    col = int(state.stage.x_um) % w
+                    frame[:, col] += 3000.0
+                    frame += 50.0
+            meta = FrameMeta(frame_index=i, time_s=self.clock.now(), exposure_s=request.frame_time_s,
+                             electrons_per_pixel=0.0 if blanked else 5.0,
+                             render_mode=RenderMode.TEM_IMAGING, blanked=blanked,
+                             scan_point=_scan_point(request, i), microscope=state)
+            yield np.clip(frame, 0, 65535).astype(np.uint16), meta
+
+    def virtual_image(self, request, inner, outer):
+        nx, ny = request.scan.size
+        return np.arange(nx * ny, dtype=np.float32).reshape(ny, nx)
+
+
+def _scan_point(request, i):
+    if not request.scan.enabled:
+        return None
+    nx, ny = request.scan.size
+    p = (i // request.scan.frames_per_point) % (nx * ny)
+    return p % nx, p // nx
+
+
+@pytest.fixture
+def twin():
+    return StubTwin()
+
+
+@pytest.fixture
+def server(twin):
+    srv = TwinDeapiServer(twin, port=0, pace=False).start()
+    yield srv
+    srv.stop()
+
+
+@pytest.fixture
+def client(server):
+    c = deapi.Client()
+    c.usingMmf = False
+    c.connect(port=server.port)
+    yield c
+    c.disconnect()
+
+
+def _acquire(client, frame_type="singleframe_integrated", n=1):
+    client.start_acquisition(n)
+    deadline = time.time() + 10
+    while client.acquiring and time.time() < deadline:
+        time.sleep(0.01)
+    img, pixel_format, attrs, hist = client.get_result(frame_type)
+    return img, attrs
+
+
+def test_connect_and_properties(client, twin):
+    assert client["Camera Name"] == "StubCam"
+    assert client["Sensor Size X (pixels)"] == 96 and client["Sensor Size Y (pixels)"] == 64
+    assert client["Image Size X (pixels)"] == 96
+    assert client["Instrument Project Magnification"] == 20000.0
+    assert client["Instrument Project Name"] == "MAG1"
+    assert "PROJ_Magnification=20000" in client["Instrument Metadata"]
+    twin.column.set_stage(x=42.0)
+    assert client["Instrument Stage Position X (micrometers)"] == 42.0
+    client["Frames Per Second"] = 100
+    client["Exposure Time (seconds)"] = 0.05
+    assert client["Frame Count"] == 5
+    client["Frame Count"] = 3
+    assert client["Exposure Time (seconds)"] == pytest.approx(0.03)
+    assert TEMPERATURE_PROP in client.list_properties()
+    client["Simulator Virtual Specimen"] = "Gold grating"
+    assert twin.specimen_name == "Gold grating"
+    spec = client.get_property_specifications("Exposure Mode")
+    # deapi releases name these fields differently (options/valueType vs values/prop_allowable_type)
+    options = getattr(spec, "options", None) or getattr(spec, "values", None)
+    allowable = getattr(spec, "valueType", None) or getattr(spec, "prop_allowable_type", None)
+    assert "Dark" in options and "Set" in getattr(allowable, "name", str(allowable))
+
+
+def test_request_mapping(client, server, twin):
+    client["Frames Per Second"] = 50
+    client["Frame Count"] = 4
+    client["Exposure Mode"] = "Dark"
+    client["Hardware Binning X"] = 2
+    client.set_hw_roi(0, 0, 64, 32)
+    req = server.fake.request()
+    assert req.exposure_mode == ExposureMode.DARK
+    assert req.frame_time_s == pytest.approx(0.02) and req.total_frames == 4
+    assert req.hw_binning == (2, 2)
+    assert req.hw_roi == Roi(0, 0, 64, 32)
+    assert req.camera_model == "StubCam"
+    props = {"Frames Per Second": 10, "Frame Count": 2, "Exposure Mode": "Normal",
+             "Hardware ROI Offset X": 0, "Hardware ROI Offset Y": 0, "Hardware ROI Size X": 96,
+             "Hardware ROI Size Y": 64, "Hardware Binning X": 1, "Hardware Binning Y": 1,
+             "Scan - Enable": "On", "Scan - Size X": 4, "Scan - Size Y": 3,
+             "Scan - Camera Frames Per Point": 2, "Scan - Repeats": 1, "Scan - ROI Enable": "Off",
+             "Grabbing - Frames Per Buffer": 1, "Scan - Type": "Raster"}
+    r = request_from_properties(props.__getitem__, "X", (64, 96))
+    assert r.hw_roi is None and r.scan.enabled and r.scan.size == (4, 3)
+    assert r.total_frames == 4 * 3 * 2
+
+
+def test_singleframe_dark_vs_normal_and_sum(client, twin):
+    client["Frames Per Second"] = 100
+    client["Frame Count"] = 3
+    normal, attrs = _acquire(client, "singleframe_integrated")
+    assert normal.shape == (64, 96) and normal.dtype == np.uint16
+    assert attrs.frameCount == 3
+    client["Exposure Mode"] = "Dark"
+    dark, _ = _acquire(client, "singleframe_integrated")
+    assert dark.mean() == pytest.approx(100, abs=2)
+    assert normal.mean() > dark.mean() + 40
+    client["Exposure Mode"] = "Normal"
+    total, attrs = _acquire(client, "sumtotal")
+    assert total.dtype == np.float32
+    assert total.mean() == pytest.approx(3 * normal.mean(), rel=0.05)
+    assert twin.requests[1].exposure_mode == ExposureMode.DARK
+    assert not twin.requests[1].beam_reaches_detector
+
+
+def test_gain_mode_is_flood(client):
+    client["Exposure Mode"] = "Gain"
+    flood, _ = _acquire(client)
+    assert flood.mean() == pytest.approx(500, abs=5)
+    assert flood.std() < 10  # no specimen, no bright column
+
+
+def test_stage_moves_change_the_image(client, twin):
+    a, _ = _acquire(client)
+    twin.column.set_stage(x=30.0)
+    twin.column.wait_idle()
+    b, _ = _acquire(client)
+    assert int(np.argmax(a.mean(axis=0))) == 0
+    assert int(np.argmax(b.mean(axis=0))) == 30
+    assert client["Instrument Stage Position X (micrometers)"] == 30.0
+
+
+def test_hw_roi_and_binning_shape(client):
+    client.set_hw_roi(16, 8, 64, 32)
+    client["Hardware Binning X"] = 2
+    client.update_image_size()
+    img, attrs = _acquire(client)
+    assert img.shape == (16, 32)
+    assert (attrs.frameWidth, attrs.frameHeight) == (32, 16)
+
+
+def test_scan_virtual_images(client, twin):
+    client["Scan - Enable"] = "On"
+    client["Scan - Size X"] = 6
+    client["Scan - Size Y"] = 4
+    client.update_scan_size()
+    client.start_acquisition(1)
+    while client.acquiring:
+        time.sleep(0.01)
+    vi, *_ = client.get_result("virtual_image0")
+    assert vi.shape == (4, 6)
+    assert np.all(vi > 0)
+    assert twin.requests[-1].scan.enabled and twin.requests[-1].total_frames == 24
+    haadf, *_ = client.get_result("external_image1")
+    assert haadf.shape == (4, 6)
+    assert haadf[3, 5] == pytest.approx(23)
+
+
+def test_movie_buffer_has_real_frames(client):
+    client["Frames Per Second"] = 100  # keeps Exposure Time, so set it before Frame Count
+    client["Frame Count"] = 4
+    client.start_acquisition(1, request_movie_buffer=True)
+    info = client.get_movie_buffer_info()
+    frames = []
+    while True:
+        status, total, n, buf = client.get_movie_buffer(
+            None, info.headerBytes + info.imageBufferBytes, info.framesInBuffer)
+        if status.name != "OK":
+            break
+        assert (info.imageW, info.imageH) == (96, 64)
+        data = np.frombuffer(buf, np.uint16, offset=info.headerBytes).reshape(n, 64, 96)
+        frames.extend(data)
+    assert len(frames) == 4
+    assert np.mean(frames) > 120
+
+
+def test_temperature_property_drives_holder(client, twin):
+    assert client[TEMPERATURE_PROP] == pytest.approx(25.0)
+    client[TEMPERATURE_PROP] = 400.0  # a NoHolder is replaced by a heating holder
+    time.sleep(0.1)
+    assert twin.holder.state().target_c == 400.0
+    assert client[TEMPERATURE_PROP] == pytest.approx(400.0, abs=1.0)
+
+
+def test_state_is_shared_across_connections(server):
+    c1 = deapi.Client()
+    c1.usingMmf = False
+    c1.connect(port=server.port)
+    c1["Frame Count"] = 7
+    c1.disconnect()
+    c2 = deapi.Client()
+    c2.usingMmf = False
+    c2.connect(port=server.port)
+    assert c2["Frame Count"] == 7
+    c2.disconnect()
+
+
+def test_stop_acquisition(client):
+    client["Frame Count"] = 100000
+    client.start_acquisition(1)
+    time.sleep(0.05)
+    assert client.stop_acquisition()
+    deadline = time.time() + 5
+    while client.acquiring and time.time() < deadline:
+        time.sleep(0.01)
+    assert not client.acquiring
+
+
+def test_real_twin_if_available():
+    try:
+        from de_twin.twin import DigitalTwin
+
+        twin = DigitalTwin(camera="DE16")
+        twin.detector.output_shape(twin.request())
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"DigitalTwin not ready: {exc}")
+    with TwinDeapiServer(twin, port=0, pace=False) as srv:
+        c = deapi.Client()
+        c.usingMmf = False
+        c.connect(port=srv.port)
+        c["Simulator Auto References"] = "Off"
+        c.set_hw_roi(0, 0, 512, 512)
+        c.update_image_size()
+        c["Frame Count"] = 1
+        raw, _ = _acquire(c)  # no references yet: uncorrected, like a fresh DE-Server
+        c["Exposure Mode"] = "Dark"
+        c["Frame Count"] = 10
+        dark, _ = _acquire(c)  # stored as the dark reference
+        c["Exposure Mode"] = "Normal"
+        c["Frame Count"] = 1
+        corrected, _ = _acquire(c)
+        c.disconnect()
+    assert raw.shape == dark.shape == corrected.shape
+    assert raw.mean() > dark.mean() + 50
+    # dark-subtracted now: the offset is gone, the beam signal remains
+    assert corrected.mean() == pytest.approx(raw.mean() - dark.mean(), rel=0.1)
+
+
+def test_deapi_own_loop_with_patched_factory(twin, monkeypatch):
+    """deapi's initialize_server loop, patched like Ground Crew's launcher patches inp_file."""
+    import socket
+
+    from deapi.simulated_server import initialize_server
+
+    from de_twin.faces.deapi_server import make_factory
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    monkeypatch.setattr(initialize_server, "FakeServer", make_factory(twin, pace=False))
+    monkeypatch.setattr("sys.argv", ["x"])
+    threading.Thread(target=initialize_server.main, args=(port,), daemon=True).start()
+    c = deapi.Client()
+    c.usingMmf = False
+    for _ in range(100):
+        try:
+            c.connect(port=port)
+            break
+        except OSError:
+            time.sleep(0.05)
+    assert c["Camera Name"] == "StubCam"
+    img, _ = _acquire(c)
+    assert img.shape == (64, 96) and img.mean() > 120
+    c.disconnect()

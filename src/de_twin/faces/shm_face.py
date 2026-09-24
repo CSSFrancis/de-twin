@@ -1,0 +1,105 @@
+"""Shared-memory face: the twin as DE-Server's external frame source.
+
+DE-Server (test pattern "External Frame Source (Shared Memory)") creates the shared
+memory and publishes each acquisition's request. This face turns the request into an
+``AcquisitionRequest``, renders frames through the twin and publishes them, paced to the
+frame time and throttled by DE-Server's reads.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+from typing import Optional
+
+import numpy as np
+
+from ..transport import shm_layout as L
+
+log = logging.getLogger(__name__)
+
+
+class ShmFace:
+    def __init__(self, twin, name: str = L.DEFAULT_NAME, pace: bool = True):
+        self.twin = twin
+        self.name = name
+        self.pace = pace
+        self.producer = None
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self.frames_published = 0
+        self.requests_served = 0
+
+    def start(self) -> "ShmFace":
+        self._thread = threading.Thread(target=self._run, name="de-twin-shm", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+        if self.producer is not None:
+            self.producer.close()
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, *exc):
+        self.stop()
+
+    # ---------------------------------------------------------------- loop
+    def _attach(self) -> bool:
+        from ..transport.shm import FrameProducer
+
+        try:
+            self.producer = FrameProducer(self.name)
+            log.info("attached to shared memory %s", self.name)
+            return True
+        except FileNotFoundError:
+            return False
+
+    def _run(self) -> None:
+        pending = None
+        while not self._stop.is_set():
+            if self.producer is None:
+                if not self._attach():
+                    self._stop.wait(0.5)  # DE-Server creates the mapping at its first acquisition
+                continue
+            got = pending or self.producer.poll_request(timeout=0.05)
+            pending = None
+            if got is None:
+                continue
+            self.requests_served += 1
+            try:
+                pending = self._serve(*got)
+            except Exception:  # keep serving later requests
+                log.exception("failed serving request %d", got[0])
+
+    def _serve(self, request_id: int, request):
+        """Publish frames for one request; returns a newer request if one pre-empts it."""
+        p = self.producer
+        h = p.hdr
+        shape = (h.frame_height, h.frame_width)
+        dtype = np.uint8 if h.bytes_per_pixel == 1 else np.uint16
+        stop = threading.Event()
+        for raw, meta in self.twin.frames(request, pace=self.pace, stop=stop):
+            while not p.wait_slot_free(timeout=0.05):
+                if self._stop.is_set() or p.request_changed(request_id):
+                    return p.poll_request()
+            p.publish(_fit(raw, shape, dtype), request_id=request_id, frame_index=meta.frame_index,
+                      flags=L.FLAG_BLANKED if meta.blanked else 0)
+            self.frames_published += 1
+            if self._stop.is_set() or p.request_changed(request_id):
+                return p.poll_request()
+        return None
+
+
+def _fit(frame: np.ndarray, shape: tuple[int, int], dtype) -> np.ndarray:
+    """Crop or zero-pad to exactly the hw_frame DE-Server asked for."""
+    if frame.shape == shape and frame.dtype == dtype:
+        return frame
+    out = np.zeros(shape, dtype)
+    h, w = min(shape[0], frame.shape[0]), min(shape[1], frame.shape[1])
+    out[:h, :w] = np.clip(frame[:h, :w], 0, np.iinfo(dtype).max)
+    return out

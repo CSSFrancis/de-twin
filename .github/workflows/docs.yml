@@ -1,0 +1,101 @@
+name: Docs
+
+on:
+  push:
+    # dev/ on every push to main, a versioned directory for every release tag
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: docs-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write   # push to gh-pages
+
+jobs:
+  build:
+    name: Build docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install dependencies (with docs extras)
+        run: uv sync --extra docs
+
+      # -W turns warnings into errors; --keep-going collects all of them.
+      - name: Build HTML documentation
+        run: uv run sphinx-build -b html docs build/html -W --keep-going
+
+      - name: Upload HTML artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-html
+          path: build/html
+          retention-days: 7
+
+  deploy:
+    name: Deploy docs
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    # All deploys push to gh-pages: queue them rather than race.
+    concurrency:
+      group: docs-deploy
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install dependencies (with docs extras)
+        run: uv sync --extra docs
+
+      - name: Determine deployment directory
+        id: target
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "dest_dir=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "dest_dir=dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build HTML documentation
+        env:
+          DOCS_VERSION: ${{ steps.target.outputs.dest_dir }}
+        run: uv run sphinx-build -b html docs build/html -W --keep-going
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./build/html
+          destination_dir: ${{ steps.target.outputs.dest_dir }}
+          keep_files: true
+          commit_message: "docs: deploy ${{ steps.target.outputs.dest_dir }} @ ${{ github.sha }}"
+
+      - name: Deploy root redirect and switcher
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./docs/_root
+          destination_dir: .
+          keep_files: true
+          commit_message: "docs: update root redirect and switcher.json @ ${{ github.sha }}"

@@ -1,0 +1,31 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+
+# Test / coverage artefacts
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Sphinx build output
+docs/_build/
+docs/auto_examples/
+docs/api/generated/
+docs/sg_execution_times.rst
+
+# C++ test harness build output
+cpp/build/
+
+# Editors
+.idea/
+.vscode/

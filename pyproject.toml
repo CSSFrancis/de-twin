@@ -1,0 +1,164 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "de-twin"
+# Bumped by the "Prepare Release" workflow; the first release is prepared with bump=minor -> 0.1.0.
+version = "0.0.0"
+description = "Digital twin of a Direct Electron camera on a TEM: column, specimen, in-situ holder and detector, for developing automated microscope control."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Carter Francis", email = "cartsfrancis@gmail.com" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+keywords = ["electron microscopy", "TEM", "STEM", "4D-STEM", "digital twin", "simulation",
+            "direct electron", "ptychography", "in situ"]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "diffsims>=0.7",
+    "orix>=0.13",
+    "diffpy.structure>=3.1",
+]
+
+[project.optional-dependencies]
+# deapi face: DE-Server emulation for any deapi client
+deapi = ["deapi>=5.3b6"]
+# follow a real DENS Impulse holder (or DENS's own simulator)
+impulse = ["impulsePy"]
+# GPU rendering
+gpu = ["cupy-cuda12x"]
+docs = [
+    "sphinx>=8.0",
+    "pydata-sphinx-theme>=0.16",
+    "sphinx-design>=0.6",
+    "sphinx-gallery>=0.18",
+    "myst-parser>=4.0",
+    "matplotlib>=3.7",
+    "pillow>=10.0",
+]
+
+[project.urls]
+"Homepage" = "https://cssfrancis.github.io/de-twin/"
+"Documentation" = "https://cssfrancis.github.io/de-twin/"
+"Repository" = "https://github.com/CSSFrancis/de-twin"
+"Bug Tracker" = "https://github.com/CSSFrancis/de-twin/issues"
+"Changelog" = "https://github.com/CSSFrancis/de-twin/blob/main/CHANGELOG.rst"
+
+[project.scripts]
+de-twin = "de_twin.cli:main"
+
+[dependency-groups]
+dev = [
+    "deapi>=5.3b6",
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pytest-timeout>=2.3",
+    "towncrier>=24.0",
+    "ruff>=0.6",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/de_twin"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/de_twin",
+    "tests",
+    "cpp/*.h",
+    "cpp/*.cpp",
+    "cpp/*.bat",
+    "cpp/README.md",
+    "docs",
+    "examples",
+    "README.md",
+    "CHANGELOG.rst",
+    "LICENSE",
+]
+exclude = ["docs/_build", "docs/auto_examples", "docs/api/generated", "**/__pycache__"]
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+filterwarnings = ["ignore:.*diffpy.structure.*:DeprecationWarning"]
+markers = [
+    "deapi: needs the deapi package",
+    "deserver: needs a running DE-Server configured for the shared-memory frame source",
+    "slow: slow rendering tests",
+]
+
+[tool.coverage.run]
+source = ["de_twin"]
+
+[tool.coverage.report]
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "raise NotImplementedError"]
+
+[tool.ruff]
+line-length = 110
+extend-exclude = ["docs/auto_examples"]
+
+# ---------------------------------------------------------------------------
+# Changelog management (towncrier)
+# ---------------------------------------------------------------------------
+[tool.towncrier]
+package          = "de_twin"
+package_dir      = "src"
+directory        = "upcoming_changes"
+filename         = "CHANGELOG.rst"
+start_string     = ".. towncrier release notes start\n"
+issue_format     = "`#{issue} <https://github.com/CSSFrancis/de-twin/pull/{issue}>`_"
+title_format     = "{version} ({project_date})"
+underlines       = ["=", "-", "~"]
+
+[[tool.towncrier.type]]
+directory    = "api_change"
+name         = "API and Behaviour Changes"
+showcontent  = true
+
+[[tool.towncrier.type]]
+directory    = "new_feature"
+name         = "New Features"
+showcontent  = true
+
+[[tool.towncrier.type]]
+directory    = "bugfix"
+name         = "Bug Fixes"
+showcontent  = true
+
+[[tool.towncrier.type]]
+directory    = "deprecation"
+name         = "Deprecations"
+showcontent  = true
+
+[[tool.towncrier.type]]
+directory    = "removal"
+name         = "Removals"
+showcontent  = true
+
+[[tool.towncrier.type]]
+directory    = "doc"
+name         = "Documentation"
+showcontent  = true
+
+[[tool.towncrier.type]]
+directory    = "maintenance"
+name         = "Maintenance"
+showcontent  = true
