@@ -123,7 +123,7 @@ def test_connect_and_properties(client, twin):
     assert client["Instrument Project Magnification"] == 20000.0
     assert client["Instrument Project Name"] == "MAG1"
     assert "PROJ_Magnification=20000" in client["Instrument Metadata"]
-    twin.column.set_stage(x=42.0)
+    twin.column.move_stage(x=42.0)  # waits: the stage travels at 100 um/s
     assert client["Instrument Stage Position X (micrometers)"] == 42.0
     client["Frames Per Second"] = 100
     client["Exposure Time (seconds)"] = 0.05
