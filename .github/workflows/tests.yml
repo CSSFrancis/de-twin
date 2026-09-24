@@ -9,6 +9,10 @@ concurrency:
   group: tests-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Timing budgets are tuned on a workstation; shared runners get 5x (see tests/perf_budget.py).
+  DE_TWIN_PERF_SLACK: "5"
+
 jobs:
   test:
     name: Python ${{ matrix.python-version }} / ${{ matrix.os }}

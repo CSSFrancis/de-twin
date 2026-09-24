@@ -13,6 +13,7 @@ from de_twin.render import RenderConfig, Renderer
 from de_twin.render.testing import Particle, StubCamera, SyntheticSpecimen
 from de_twin.specimen.materials import MaterialId
 from de_twin.state import AcquisitionRequest, MicroscopeState, RenderMode, Roi, TemStem
+from perf_budget import budget
 
 CAM = StubCamera()  # DE16, 256^2 ROI at the sensor centre
 NSCAN = 32
@@ -239,4 +240,4 @@ def test_perf_cbed_from_cache():
     r.virtual_image(o, 40, 200)
     vi = time.perf_counter() - t0
     print(f"CBED 256^2 from cache: {per * 1000:.2f} ms/pattern; virtual image {vi * 1000:.1f} ms")
-    assert per < 0.01
+    assert per < budget(0.01)

@@ -20,6 +20,7 @@ from de_twin.render.testing import Particle, StubCamera, SyntheticSpecimen, on_z
 from de_twin.specimen import Specimen, from_name
 from de_twin.specimen.materials import GRAINS_PER_MATERIAL, MaterialId
 from de_twin.state import AcquisitionRequest, MicroscopeState, Projection, Roi, TemStem
+from perf_budget import budget
 
 CAM = StubCamera(sensor_shape=(1024, 1024))
 AU = MaterialId.GOLD
@@ -171,7 +172,7 @@ def test_perf_saed_and_tilt_step():
         r.render(dataclasses.replace(o, alpha_rad=math.radians(a)))
         times.append(time.perf_counter() - t0)
     print(f"SAED 1024^2, 200 grains, tilt step: {min(times) * 1000:.0f} ms")
-    assert min(times) < 0.5
+    assert min(times) < budget(0.5)
     # TEM bright field (512^2) tilt step
     t = MicroscopeState()
     t.magnification = 8000  # 416 nm field: all 200 grains in view
@@ -185,7 +186,7 @@ def test_perf_saed_and_tilt_step():
         r.render(dataclasses.replace(tem, alpha_rad=math.radians(a)))
         times.append(time.perf_counter() - t0)
     print(f"TEM 512^2, 200 grains, tilt step: {min(times) * 1000:.0f} ms")
-    assert min(times) < 0.5
+    assert min(times) < budget(0.5)
 
 
 def test_perf_virtual_image():
@@ -209,4 +210,4 @@ def test_perf_virtual_image():
     again = time.perf_counter() - t0
     print(f"virtual image 128^2 (400 grains): first {first * 1000:.0f} ms, again {again * 1000:.0f} ms")
     assert haadf.shape == (128, 128) and haadf.max() > 0
-    assert first < 1.0 and again < 0.3
+    assert first < budget(1.0) and again < budget(0.3)

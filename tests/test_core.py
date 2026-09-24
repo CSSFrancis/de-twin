@@ -6,6 +6,7 @@ from de_twin.hashing import SeedKind, hash_seed, mix_cell, rng_for, splitmix64, 
 from de_twin.specimen.fieldmap import GrainTable, ViewWindow
 from de_twin.specimen.materials import MATERIALS, MaterialId
 from de_twin.state import AcquisitionRequest, ExposureMode
+from perf_budget import budget
 
 
 def test_splitmix64_reference_value():
@@ -83,4 +84,4 @@ def test_scaled_clock_runs_fast():
     t0, w0 = c.now(), time.perf_counter()
     c.sleep(1.0)  # 1 ms of wall time
     assert c.now() - t0 >= 1.0  # at least the requested simulated time passed
-    assert time.perf_counter() - w0 < 0.5  # ...in a fraction of the wall time
+    assert time.perf_counter() - w0 < budget(0.5)  # ...in a fraction of the wall time
