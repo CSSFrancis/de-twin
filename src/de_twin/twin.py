@@ -71,6 +71,7 @@ class DigitalTwin:
         from .specimen import Specimen, SpecimenConfig, from_name
 
         self.lock = threading.RLock()
+        self._frame_serial = 0  # frames exposed so far; seeds the detector noise
         self.clock = clock or Clock()
         self.seed = int(seed)
         self.flood_for_gain = flood_for_gain
@@ -218,7 +219,11 @@ class DigitalTwin:
                 holder_state = self.holder_state(t)
                 flux = self.flux(request, i, state=state, optics=optics, time_s=t)
                 blanked = flux is None
-                raw, info = self.detector.expose(flux, frame_time, request, i, ht_kv=state.ht_kv)
+                # Noise is seeded by a twin-wide frame counter, not the index within this
+                # request: repeated acquisitions (live view) must not repeat their noise.
+                serial = self._frame_serial
+                self._frame_serial += 1
+                raw, info = self.detector.expose(flux, frame_time, request, serial, ht_kv=state.ht_kv)
             meta = FrameMeta(
                 frame_index=i,
                 time_s=t,

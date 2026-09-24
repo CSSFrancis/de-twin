@@ -44,6 +44,7 @@ Launcher (deapi-compatible CLI, "started .... " banner)::
 from __future__ import annotations
 
 import argparse
+import itertools
 import logging
 import socket as _socketmod
 import struct
@@ -210,7 +211,9 @@ class _Acquisition:
     def __init__(self, server: "TwinFakeServer", request: AcquisitionRequest, n_acq: int,
                  movie: bool):
         self.request = request
-        self.n_acq = max(1, int(n_acq))
+        # 0 acquisitions = repeat until stopped (live view), as DE-Server does
+        self.n_acq = max(0, int(n_acq))
+        self.continuous = self.n_acq == 0
         self.movie = movie
         self.stop = threading.Event()
         self.cond = threading.Condition()
@@ -269,8 +272,11 @@ class _Acquisition:
         srv = self._server
         try:
             self._prepare_references()
-            for a in range(self.n_acq):
+            for a in (itertools.count() if self.continuous else range(self.n_acq)):
                 self.index = a
+                if self.continuous and a:
+                    with self.cond:
+                        self.sum = None  # the sum is per repetition, like one live buffer
                 for raw, meta in srv.twin.frames(self.request, pace=srv.pace, stop=self.stop):
                     self._add(raw, meta)
                     if self.stop.is_set():
@@ -476,11 +482,22 @@ class TwinFakeServer(FakeServer):  # type: ignore[misc,valid-type]
             s = st()
             return _PROJECT_NAMES.get((col.function_mode, int(s.tem_stem)), "Unknown")
 
-        def pixel_nm():
+        def binning(axis):
+            # DE-Server reports pixel sizes per *binned* pixel: hardware x software binning
+            b = 1.0
+            for name in (f"Hardware Binning {axis}", f"Binning {axis}"):
+                try:
+                    b *= float(self[name] or 1)
+                except Exception:  # noqa: BLE001 - property not present
+                    pass
+            return b
+
+        def pixel_nm(axis="X"):
             try:
-                return float(self.twin.calibration.specimen_pixel_nm(st(), self.twin.detector.model))
+                px = float(self.twin.calibration.specimen_pixel_nm(st(), self.twin.detector.model))
             except Exception:  # noqa: BLE001
                 return -1.0
+            return px * binning(axis)
 
         def recip_px():
             try:
@@ -515,8 +532,8 @@ class TwinFakeServer(FakeServer):  # type: ignore[misc,valid-type]
             ("Instrument Alpha Selector", g("AlphaSelector"), "Integer"),
             ("Instrument Condenser Aperture Index", g("CondenserApertureIndex"), "Integer"),
             ("Instrument Type", g("InstrumentType"), "String"),
-            ("Specimen Pixel Size X (nanometers)", pixel_nm, "Float"),
-            ("Specimen Pixel Size Y (nanometers)", pixel_nm, "Float"),
+            ("Specimen Pixel Size X (nanometers)", lambda: pixel_nm("X"), "Float"),
+            ("Specimen Pixel Size Y (nanometers)", lambda: pixel_nm("Y"), "Float"),
             ("Diffraction Pixel Size X", recip_px, "Float"),
             ("Diffraction Pixel Size Y", recip_px, "Float"),
         ]
@@ -628,6 +645,8 @@ class TwinFakeServer(FakeServer):  # type: ignore[misc,valid-type]
         a = self._acq
         if a is None or not a.running:
             return 0
+        if a.continuous:
+            return 1  # until stopped
         return max(0, a.n_acq - a.index)
 
     def stop(self):

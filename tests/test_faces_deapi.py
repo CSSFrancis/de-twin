@@ -274,6 +274,21 @@ def test_stop_acquisition(client):
     assert not client.acquiring
 
 
+def test_zero_acquisitions_is_live_until_stopped(client):
+    """start_acquisition(0) is live view: it repeats until stopped (Ground Crew relies on it)."""
+    client["Frame Count"] = 1
+    client.start_acquisition(0)
+    time.sleep(0.3)
+    assert client.acquiring  # a single one-frame acquisition would have finished by now
+    time.sleep(0.3)
+    assert client.acquiring
+    assert client.stop_acquisition()
+    deadline = time.time() + 5
+    while client.acquiring and time.time() < deadline:
+        time.sleep(0.01)
+    assert not client.acquiring
+
+
 def test_real_twin_if_available():
     try:
         from de_twin.twin import DigitalTwin
@@ -330,3 +345,21 @@ def test_deapi_own_loop_with_patched_factory(twin, monkeypatch):
     img, _ = _acquire(c)
     assert img.shape == (64, 96) and img.mean() > 120
     c.disconnect()
+
+
+def test_specimen_pixel_size_includes_binning():
+    """DE-Server reports the pixel size of a binned pixel (ParseEmMetaData multiplies by the
+    hardware and software binning); clients converting pixels to stage moves rely on it."""
+    from de_twin.twin import DigitalTwin
+
+    twin = DigitalTwin(camera="DESim")
+    with TwinDeapiServer(twin, port=0, pace=False) as srv:
+        c = deapi.Client()
+        c.usingMmf = False
+        c.connect(port=srv.port)
+        unbinned = c["Specimen Pixel Size X (nanometers)"]
+        c["Hardware Binning X"] = 2
+        binned = c["Specimen Pixel Size X (nanometers)"]
+        c.disconnect()
+    assert unbinned > 0
+    assert binned == pytest.approx(2 * unbinned)
