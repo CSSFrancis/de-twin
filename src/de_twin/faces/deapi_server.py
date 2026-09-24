@@ -482,11 +482,22 @@ class TwinFakeServer(FakeServer):  # type: ignore[misc,valid-type]
             s = st()
             return _PROJECT_NAMES.get((col.function_mode, int(s.tem_stem)), "Unknown")
 
-        def pixel_nm():
+        def binning(axis):
+            # DE-Server reports pixel sizes per *binned* pixel: hardware x software binning
+            b = 1.0
+            for name in (f"Hardware Binning {axis}", f"Binning {axis}"):
+                try:
+                    b *= float(self[name] or 1)
+                except Exception:  # noqa: BLE001 - property not present
+                    pass
+            return b
+
+        def pixel_nm(axis="X"):
             try:
-                return float(self.twin.calibration.specimen_pixel_nm(st(), self.twin.detector.model))
+                px = float(self.twin.calibration.specimen_pixel_nm(st(), self.twin.detector.model))
             except Exception:  # noqa: BLE001
                 return -1.0
+            return px * binning(axis)
 
         def recip_px():
             try:
@@ -521,8 +532,8 @@ class TwinFakeServer(FakeServer):  # type: ignore[misc,valid-type]
             ("Instrument Alpha Selector", g("AlphaSelector"), "Integer"),
             ("Instrument Condenser Aperture Index", g("CondenserApertureIndex"), "Integer"),
             ("Instrument Type", g("InstrumentType"), "String"),
-            ("Specimen Pixel Size X (nanometers)", pixel_nm, "Float"),
-            ("Specimen Pixel Size Y (nanometers)", pixel_nm, "Float"),
+            ("Specimen Pixel Size X (nanometers)", lambda: pixel_nm("X"), "Float"),
+            ("Specimen Pixel Size Y (nanometers)", lambda: pixel_nm("Y"), "Float"),
             ("Diffraction Pixel Size X", recip_px, "Float"),
             ("Diffraction Pixel Size Y", recip_px, "Float"),
         ]

@@ -345,3 +345,21 @@ def test_deapi_own_loop_with_patched_factory(twin, monkeypatch):
     img, _ = _acquire(c)
     assert img.shape == (64, 96) and img.mean() > 120
     c.disconnect()
+
+
+def test_specimen_pixel_size_includes_binning():
+    """DE-Server reports the pixel size of a binned pixel (ParseEmMetaData multiplies by the
+    hardware and software binning); clients converting pixels to stage moves rely on it."""
+    from de_twin.twin import DigitalTwin
+
+    twin = DigitalTwin(camera="DESim")
+    with TwinDeapiServer(twin, port=0, pace=False) as srv:
+        c = deapi.Client()
+        c.usingMmf = False
+        c.connect(port=srv.port)
+        unbinned = c["Specimen Pixel Size X (nanometers)"]
+        c["Hardware Binning X"] = 2
+        binned = c["Specimen Pixel Size X (nanometers)"]
+        c.disconnect()
+    assert unbinned > 0
+    assert binned == pytest.approx(2 * unbinned)
