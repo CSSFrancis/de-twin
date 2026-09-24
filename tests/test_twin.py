@@ -121,3 +121,18 @@ def test_in_situ_heating_crystallises_the_specimen():
     after = tw.specimen.crystallinity(gid).mean()
     assert tw.holder_state().temperature_c == pytest.approx(650, abs=5)
     assert after > before + 0.3
+
+
+def test_repeated_acquisitions_do_not_repeat_the_noise():
+    """Live view is a stream of one-frame acquisitions; each must get fresh noise, and a fresh
+    twin must still reproduce the same sequence."""
+
+    def two_frames():
+        tw = DigitalTwin("Dense Au on holey C", camera="DESim", clock=ManualClock(), seed=1)
+        req = tw.request(frame_time_s=0.025, total_frames=1)
+        return [next(tw.frames(req))[0].astype(np.int64) for _ in range(2)]
+
+    a, b = two_frames()
+    assert np.abs(a - b).mean() > 1.0  # different shot and read noise
+    a2, b2 = two_frames()
+    assert np.array_equal(a, a2) and np.array_equal(b, b2)  # still deterministic

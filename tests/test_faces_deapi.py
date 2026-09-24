@@ -274,6 +274,21 @@ def test_stop_acquisition(client):
     assert not client.acquiring
 
 
+def test_zero_acquisitions_is_live_until_stopped(client):
+    """start_acquisition(0) is live view: it repeats until stopped (Ground Crew relies on it)."""
+    client["Frame Count"] = 1
+    client.start_acquisition(0)
+    time.sleep(0.3)
+    assert client.acquiring  # a single one-frame acquisition would have finished by now
+    time.sleep(0.3)
+    assert client.acquiring
+    assert client.stop_acquisition()
+    deadline = time.time() + 5
+    while client.acquiring and time.time() < deadline:
+        time.sleep(0.01)
+    assert not client.acquiring
+
+
 def test_real_twin_if_available():
     try:
         from de_twin.twin import DigitalTwin

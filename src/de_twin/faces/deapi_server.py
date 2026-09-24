@@ -44,6 +44,7 @@ Launcher (deapi-compatible CLI, "started .... " banner)::
 from __future__ import annotations
 
 import argparse
+import itertools
 import logging
 import socket as _socketmod
 import struct
@@ -210,7 +211,9 @@ class _Acquisition:
     def __init__(self, server: "TwinFakeServer", request: AcquisitionRequest, n_acq: int,
                  movie: bool):
         self.request = request
-        self.n_acq = max(1, int(n_acq))
+        # 0 acquisitions = repeat until stopped (live view), as DE-Server does
+        self.n_acq = max(0, int(n_acq))
+        self.continuous = self.n_acq == 0
         self.movie = movie
         self.stop = threading.Event()
         self.cond = threading.Condition()
@@ -269,8 +272,11 @@ class _Acquisition:
         srv = self._server
         try:
             self._prepare_references()
-            for a in range(self.n_acq):
+            for a in (itertools.count() if self.continuous else range(self.n_acq)):
                 self.index = a
+                if self.continuous and a:
+                    with self.cond:
+                        self.sum = None  # the sum is per repetition, like one live buffer
                 for raw, meta in srv.twin.frames(self.request, pace=srv.pace, stop=self.stop):
                     self._add(raw, meta)
                     if self.stop.is_set():
@@ -628,6 +634,8 @@ class TwinFakeServer(FakeServer):  # type: ignore[misc,valid-type]
         a = self._acq
         if a is None or not a.running:
             return 0
+        if a.continuous:
+            return 1  # until stopped
         return max(0, a.n_acq - a.index)
 
     def stop(self):
