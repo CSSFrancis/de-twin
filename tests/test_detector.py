@@ -9,6 +9,7 @@ import pytest
 
 from de_twin.detector import CAMERAS, Detector, camera
 from de_twin.state import AcquisitionRequest, Roi
+from perf_budget import budget
 
 
 def req(**kw) -> AcquisitionRequest:
@@ -292,4 +293,4 @@ def test_performance_4k():
     best = min(ts)
     print(f"DE16 4096^2 expose: best {best * 1e3:.0f} ms")
     assert f.shape == (4096, 4096)
-    assert best < 0.6  # target ~0.2 s on a multi-core desktop
+    assert best < budget(0.6)  # target ~0.2 s on a multi-core desktop

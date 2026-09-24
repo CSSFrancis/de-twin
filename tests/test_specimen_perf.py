@@ -5,6 +5,7 @@ import time
 import pytest
 
 from de_twin.specimen import Specimen, ViewWindow, from_name
+from perf_budget import budget
 
 
 def _time(fn, repeat=2):
@@ -25,8 +26,8 @@ def test_populated_grid_square_1024_is_fast():
     first = time.perf_counter() - t0
     steady = _time(lambda: s.rasterize(v))
     print(f"populate+raster {first:.3f}s, steady {steady:.3f}s")
-    assert first < 1.5
-    assert steady < 0.75
+    assert first < budget(1.5)
+    assert steady < budget(0.75)
 
 
 def test_low_mag_whole_grid_is_fast():
@@ -35,9 +36,9 @@ def test_low_mag_whole_grid_is_fast():
     t = _time(lambda: s.rasterize(v))
     print(f"whole grid {t:.3f}s")
     assert s.last_stats["areas_populated"] == 0
-    assert t < 1.0
+    assert t < budget(1.0)
 
 
 def test_specimen_construction_is_cheap():
     t = _time(lambda: Specimen(from_name("Dense Au on holey C")))
-    assert t < 0.5
+    assert t < budget(0.5)

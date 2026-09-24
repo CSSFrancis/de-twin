@@ -29,11 +29,11 @@ keywords = ["electron microscopy", "TEM", "STEM", "4D-STEM", "digital twin", "si
             "direct electron", "ptychography", "in situ"]
 requires-python = ">=3.10"
 dependencies = [
-    "numpy>=1.24",
-    "scipy>=1.10",
+    "numpy>=2.0",
+    "scipy>=1.13",
     "diffsims>=0.7",
     "orix>=0.13",
-    "diffpy.structure>=3.1",
+    "diffpy.structure>=3.2",
 ]
 
 [project.optional-dependencies]
@@ -49,7 +49,7 @@ docs = [
     "sphinx-design>=0.6",
     "sphinx-gallery>=0.18",
     "myst-parser>=4.0",
-    "matplotlib>=3.7",
+    "matplotlib>=3.9",
     "pillow>=10.0",
 ]
 

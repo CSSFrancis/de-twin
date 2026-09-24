@@ -15,6 +15,7 @@ from de_twin.render.testing import (Particle, StubCamera, SyntheticSpecimen, fit
                                     phase_correlation_shift)
 from de_twin.specimen.materials import MaterialId
 from de_twin.state import AcquisitionRequest, MicroscopeState, Vec2
+from perf_budget import budget
 
 CAM1K = StubCamera(sensor_shape=(1024, 1024))
 CAM512 = StubCamera(sensor_shape=(512, 512))
@@ -286,4 +287,4 @@ def test_perf_tem_4k():
     r.render(_optics(camera=StubCamera(), magnification=30000, defocus_um=-1.2))
     cached = time.perf_counter() - t0
     print(f"TEM 4096^2: first {first:.3f}s, refocus {refocus:.3f}s, cached {cached:.3f}s")
-    assert first < 1.5 and refocus < 0.8 and cached < 0.2
+    assert first < budget(1.5) and refocus < budget(0.8) and cached < budget(0.2)
