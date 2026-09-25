@@ -105,9 +105,9 @@ def test_render_mode_selection_and_override():
 def test_raster_downsampling_and_scale():
     o = _derive(_state(magnification=20000))
     assert o.output_shape == (4096, 4096)
-    assert o.raster_downsample == 2 and o.view.shape == (2048, 2048)
+    assert o.raster_downsample == 4 and o.view.shape == (1024, 1024)  # MAX_RASTER_PIXELS
     assert o.specimen_pixel_nm == pytest.approx(0.325)
-    assert o.view.pixel_um == pytest.approx(0.325e-3 * 2)
+    assert o.view.pixel_um == pytest.approx(0.325e-3 * 4)
     small = StubCamera(sensor_shape=(1024, 1024))
     o = _derive(_state(magnification=20000), camera=small)
     assert o.raster_downsample == 1 and o.view.shape == (1024, 1024)

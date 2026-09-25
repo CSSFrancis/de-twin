@@ -312,7 +312,9 @@ class Detector:
                    a=m.charge_spread_at(ht) / (bx if direct else 1))
 
         with self._lock:
-            if m.hardware_counting:
+            if _fast_detector(m):
+                res = [self._expose_fast(ctx, gh, gw)]
+            elif m.hardware_counting:
                 res = list(_pool().map(ctx.counting_band, bands))
             else:
                 doses = [0.0] * len(bands)
@@ -340,6 +342,77 @@ class Detector:
             "counting": bool(m.hardware_counting),
         }
         return out, info
+
+    def _expose_fast(self, ctx: "_Ctx", gh: int, gw: int) -> tuple[float, int]:
+        """One integrating frame through the fused numba kernels (`detector.fast`).
+        Returns ``(dose, saturated pixels)`` like the band workers do."""
+        from . import fast
+
+        m = ctx.model
+        table = fast.normal_table()
+        zstart, nstart = fast.offsets(fast.frame_key(ctx.seed, ctx.frame_index, 0))
+        dose = 0.0
+        has = ctx.flux is not None
+        if has:
+            if self._S is None or self._S.shape != (gh, gw):
+                self._S = np.empty((gh, gw), np.float32)
+            k = 1.0 / max(m.adu_cv, 1e-3) ** 2
+            lam, p0, dose = self._exposure_means(ctx.flux, float(ctx.t * ctx.nb))
+            lut = getattr(self, "_gamma_lut", None)
+            if lut is None or lut[0] != k:
+                lut = self._gamma_lut = (k, fast.gamma_lut(k))
+            fast.deposit(lam, p0, float(ctx.adu), float(k),
+                         np.uint64(fast.frame_key(ctx.seed, ctx.frame_index, 1)), self._S,
+                         table, zstart, lut[1])
+        S = self._S if has else ctx.gain  # unread without signal
+        base = float(m.dark_current_adu_per_s * ctx.t)
+        sigma = float(m.read_noise_adu / math.sqrt(ctx.nb)) if m.read_noise_adu > 0 else 0.0
+        if ctx.gbx == 1 and ctx.gby == 1:
+            hot = self._hot_grid(ctx, gh, gw)
+            sat = fast.analog_out(S, has, float(ctx.a), 1.0 / ctx.nb, ctx.gain, ctx.off, base,
+                                  sigma, float(ctx.scale), table, nstart, hot,
+                                  float(ctx.vmax), ctx.out)
+            return float(dose), int(sat)
+        x = getattr(self, "_X", None)
+        if x is None or x.shape != (gh, gw):
+            x = self._X = np.empty((gh, gw), np.float32)
+        fast.analog(S, has, float(ctx.a), 1.0 / ctx.nb, ctx.gain, ctx.off, base, sigma,
+                    float(ctx.scale), table, nstart, x)
+        if ctx.hy.size:
+            np.add.at(x, (ctx.hy, ctx.hx), ctx.hrate * np.float32(ctx.t * ctx.scale))
+        sat = fast.finish(x, float(ctx.vmax), int(ctx.gbx), int(ctx.gby), ctx.out)
+        return float(dose), int(sat)
+
+    def _exposure_means(self, flux: np.ndarray, t_nb: float):
+        """The per-pixel mean electrons and exp(-mean) of an exposure, shared by all its
+        frames: the flux of an exposure is one array, so they are made once."""
+        from . import fast
+
+        # `expose` slices the flux, so each frame gets a new VIEW of the same array: key
+        # on the array underneath (held, so its id cannot be reused) and the window.
+        owner = flux.base if flux.base is not None else flux
+        key = (id(owner), flux.__array_interface__["data"][0], flux.shape, flux.strides, t_nb)
+        cached = getattr(self, "_means", None)
+        if cached is not None and cached[0] == key and cached[1] is owner:
+            return cached[2], cached[3], cached[4]
+        lam = np.empty(flux.shape, np.float32)
+        p0 = np.empty(flux.shape, np.float32)
+        dose = fast.prepare(flux, t_nb, lam, p0)
+        self._means = (key, owner, lam, p0, float(dose))
+        return lam, p0, float(dose)
+
+    def _hot_grid(self, ctx: "_Ctx", gh: int, gw: int) -> np.ndarray:
+        """The hot pixels' ADU for this exposure as a grid (zero almost everywhere),
+        reused between frames of the same geometry and exposure."""
+        key = (gh, gw, float(ctx.t), float(ctx.scale), ctx.hy.tobytes(), ctx.hx.tobytes())
+        cached = getattr(self, "_hot_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        hot = np.zeros((gh, gw), np.float32)
+        if ctx.hy.size:
+            np.add.at(hot, (ctx.hy, ctx.hx), ctx.hrate * np.float32(ctx.t * ctx.scale))
+        self._hot_cache = (key, hot)
+        return hot
 
     def _binned_maps(self, r: Roi, bx: int, by: int):
         key = (r.x, r.y, r.w, r.h, bx, by)
@@ -513,6 +586,16 @@ class _Ctx:
 
 
 _TLS = threading.local()
+
+
+def _fast_detector(model) -> bool:
+    """The fused numba kernels, for an integrating camera, unless numba is missing or
+    ``DE_TWIN_NUMPY_DETECTOR=1`` asks for the numpy path (a reference for comparisons)."""
+    if model.hardware_counting or os.environ.get("DE_TWIN_NUMPY_DETECTOR") == "1":
+        return False
+    from . import fast
+
+    return fast.AVAILABLE
 
 
 def _buf(name: str, shape, dtype=np.float32) -> np.ndarray:
