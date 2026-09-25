@@ -79,3 +79,32 @@ def test_warm_up_can_be_skipped():
         assert face.ready.wait(5)
     finally:
         face.stop()
+
+
+def test_a_slow_render_does_not_starve_the_consumer(served, monkeypatch):
+    """DE-Server stops an acquisition when a frame is ~1 s late; while the twin is busy
+    with a slow render the face republishes the last frame instead."""
+    import time
+
+    from de_twin.faces import shm_face
+
+    twin, face, consumer = served
+    monkeypatch.setattr(shm_face, "KEEPALIVE_S", 0.1)
+    real = twin.frames
+
+    def slow_frames(request, **kw):
+        for k, item in enumerate(real(request, **kw)):
+            if k == 2:
+                time.sleep(1.0)  # a slow render
+            yield item
+
+    monkeypatch.setattr(twin, "frames", slow_frames)
+    consumer.begin(frame_shape=(1024, 1024), frame_time_s=0.01, total_frames=0)
+    gaps, t = [], time.monotonic()
+    for _ in range(12):
+        consumer.read(timeout=10)
+        now = time.monotonic()
+        gaps.append(now - t)
+        t = now
+    assert max(gaps[1:]) < 0.5, gaps
+    assert face.keepalives >= 3
