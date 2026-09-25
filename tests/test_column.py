@@ -52,6 +52,22 @@ def test_magnification_crosses_lowmag_and_back(col):
     assert col.get("MagMode") == "LowMAG" and col.get("Magnification") == 200.0
 
 
+def test_the_mag_ladder_steps_across_lowmag_and_mag1(col):
+    """A client stepping `mag_ladder` rung by rung walks from LowMAG into MAG1 and back."""
+    col.set("Magnification", 120)
+    ladder = list(col.mag_ladder())
+    assert ladder == sorted(ladder) and ladder[0] == 120.0 and ladder[-1] == ladders.MAG1_MAGS[-1]
+    for rung in ladder:
+        col.set("Magnification", rung)
+        assert col.get("Magnification") == rung
+        assert list(col.mag_ladder()) == ladder
+    assert col.get("MagMode") == "MAG1"
+    for rung in reversed(ladder):
+        col.set("Magnification", rung)
+        assert col.get("Magnification") == rung
+    assert col.get("MagMode") == "LowMAG"
+
+
 def test_camera_length_only_in_diffraction(col):
     with pytest.raises(ColumnRefused):
         col.set("CameraLength", 20)

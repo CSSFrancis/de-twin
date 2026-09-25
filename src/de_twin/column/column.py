@@ -370,8 +370,14 @@ class Column:
         return self._fm
 
     def mag_ladder(self):
-        """Magnifications of the active optics mode (``None`` in TEM diffraction)."""
+        """Magnifications a ``Magnification`` write can reach from here (``None`` in TEM
+        diffraction). In TEM imaging that is LowMAG's and MAG1's together: a write
+        beyond the active mode's ladder crosses into the other (`imaging_mode_for`),
+        as a real column's mag knob does, so a client stepping this ladder is not
+        stuck at the top of LowMAG."""
         with self.lock:
+            if self._s.tem_stem == TemStem.TEM and self._fm != L.FM_DIFF:
+                return L.LOWMAG_MAGS + L.MAG1_MAGS
             return L.active_ladders(self._fm, int(self._s.tem_stem))[0]
 
     def cl_ladder(self):
