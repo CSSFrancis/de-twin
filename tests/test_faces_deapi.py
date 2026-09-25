@@ -377,3 +377,40 @@ def test_a_fresh_face_exposes_for_half_a_second():
         exposure = float(c["Exposure Time (seconds)"])
         c.disconnect()
     assert exposure == pytest.approx(face_mod.DEFAULT_EXPOSURE_S, rel=0.05)
+
+
+def test_port_is_known_after_stop(twin):
+    srv = TwinDeapiServer(twin, port=0, pace=False).start()
+    port = srv.port
+    assert port > 0
+    srv.stop()
+    assert srv.port == port  # no getsockname on a closed socket
+
+
+def test_simulator_source_marks_the_frames(client):
+    from de_twin import __version__
+
+    assert client["Simulator Source"] == f"de-twin {__version__}"
+
+
+def test_apollo_super_resolution_over_deapi():
+    from de_twin.clock import ManualClock
+    from de_twin.twin import DigitalTwin
+
+    twin = DigitalTwin("Dense Au on holey C", camera="Apollo", clock=ManualClock())
+    with TwinDeapiServer(twin, port=0, pace=False) as srv:
+        c = deapi.Client()
+        c.usingMmf = False
+        c.connect(port=srv.port)
+        c["Simulator Auto References"] = "Off"
+        c.set_hw_roi(0, 0, 256, 256)
+        c.update_image_size()
+        c["Frame Count"] = 1
+        std, _ = _acquire(c, "singleframe_integrated")
+        c["Centroiding Mode"] = "Super-resolution"
+        c.update_image_size()
+        assert int(c["Image Size X (pixels)"]) == 512
+        sr, _ = _acquire(c, "singleframe_integrated")
+        c.disconnect()
+    assert std.shape == (256, 256) and sr.shape == (512, 512)
+    assert srv.fake.request().super_resolution is True

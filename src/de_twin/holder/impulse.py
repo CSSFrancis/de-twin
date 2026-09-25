@@ -34,6 +34,49 @@ def _field(data: Any, *names: str) -> Optional[float]:
     return None
 
 
+#: How long `import_impulse` waits. impulsePy connects to Impulse when it is imported and
+#: blocks for good when Impulse is not running.
+IMPORT_TIMEOUT_S = 5.0
+_IMPORT: dict = {}
+_IMPORT_LOCK = threading.Lock()
+
+
+def import_impulse(timeout_s: Optional[float] = None):
+    """``impulsePy``, imported on a thread of its own: a TimeoutError rather than a hang
+    when Impulse is not running. An import still stuck from an earlier call fails at once
+    (a second import would only queue behind it on the import lock)."""
+    import importlib
+    import sys
+
+    if "impulsePy" in sys.modules:  # imported (or blocked: None raises ImportError)
+        return importlib.import_module("impulsePy")
+    with _IMPORT_LOCK:
+        pending = _IMPORT.get("pending")
+        if pending is None:
+            done, result = threading.Event(), {}
+
+            def run():
+                try:
+                    result["module"] = importlib.import_module("impulsePy")
+                except BaseException as e:  # noqa: BLE001 - re-raised on the caller's thread
+                    result["error"] = e
+                finally:
+                    done.set()
+                    with _IMPORT_LOCK:
+                        _IMPORT.pop("pending", None)
+
+            pending = _IMPORT["pending"] = (done, result)
+            threading.Thread(target=run, name="impulsePy-import", daemon=True).start()
+            wait = IMPORT_TIMEOUT_S if timeout_s is None else float(timeout_s)
+        else:
+            wait = 0.0
+    done, result = pending
+    if not done.wait(wait):
+        raise TimeoutError(f"importing impulsePy did not finish in {wait:g} s (is Impulse running?)")
+    if "error" in result:
+        raise result["error"]
+    return result["module"]
+
 class ImpulseFollower:
     """A real DENS holder through ``impulsePy`` (or any object with its API)."""
 
@@ -42,7 +85,7 @@ class ImpulseFollower:
 
     def __init__(self, impulse: Any = None, *, clock=None):
         if impulse is None:
-            import impulsePy as impulse  # noqa: N813 - lazy optional dependency
+            impulse = import_impulse()
         self._impulse = impulse
         self._now = clock_fn(clock)
         self._lock = threading.RLock()

@@ -9,7 +9,6 @@ frame time and throttled by DE-Server's reads.
 from __future__ import annotations
 
 import logging
-import queue
 import threading
 from typing import Optional
 
@@ -34,10 +33,22 @@ class ShmFace:
     first frame (imports, GPU start-up, building the specimen), while DE-Server waits about
     one frame time plus a second before it gives up on the acquisition. ``ready`` is set
     once the face is warm and serving.
+
+    Throughput (the corner cut): ``reuse=N`` publishes each rendered frame up to N times,
+    so a 4096² camera can stream at hundreds of frames per second while the detector
+    physics renders tens; ``threads`` caps the cores the physics takes. Every frame is a
+    correct single frame of the current view; what recycling costs is independence, so a
+    sum of many frames is noisier than N-fold as many would be. ``reuse=1`` (the default)
+    publishes every frame once.
     """
 
-    def __init__(self, twin, name: str = L.DEFAULT_NAME, pace: bool = True, warm_up: bool = True):
+    def __init__(self, twin, name: str = L.DEFAULT_NAME, pace: bool = True, warm_up: bool = True,
+                 *, reuse: int = 1, pool_size: int = 16, threads: Optional[int] = None):
         self.twin = twin
+        self.reuse = max(1, int(reuse))
+        self.pool_size = int(pool_size)
+        self.threads = threads
+        self.frames_reused = 0
         self.name = name
         self.pace = pace
         self.warm_up = warm_up
@@ -108,66 +119,55 @@ class ShmFace:
     def _serve(self, request_id: int, request):
         """Publish frames for one request; returns a newer request if one pre-empts it.
 
-        The twin renders on a thread of its own, so a slow render does not starve
-        DE-Server: while it runs, the last frame is republished every `KEEPALIVE_S`.
+        The twin renders on a thread of its own into a small pool (`_FramePool`), so a
+        slow render does not starve DE-Server: while it runs, the last frame is
+        republished every `KEEPALIVE_S`. With ``reuse > 1`` the pool also recycles: each
+        rendered frame may be published up to ``reuse`` times, fresh frames first, so
+        the stream runs at the frame rate DE-Server asks for rather than at the rate the
+        detector physics can manage.
         """
+        import time
+
         p = self.producer
         h = p.hdr
         shape = (h.frame_height, h.frame_width)
         dtype = np.uint8 if h.bytes_per_pixel == 1 else np.uint16
-        stop = threading.Event()
-        frames: "queue.Queue" = queue.Queue(maxsize=2)
-
-        def put(item) -> bool:
-            while not stop.is_set():
-                try:
-                    frames.put(item, timeout=0.05)
-                    return True
-                except queue.Full:
-                    continue
-            return False
-
-        def render() -> None:
-            try:
-                for item in self.twin.frames(request, pace=self.pace, stop=stop):
-                    if not put(item):
-                        return
-            except Exception as e:  # noqa: BLE001 - raised on the serving thread
-                put(e)
-                return
-            put(_DONE)
-
-        worker = threading.Thread(target=render, name="de-twin-shm-render", daemon=True)
-        worker.start()
-        last = None
+        recycle = self.reuse > 1
+        pool = _FramePool(self.twin, request, size=max(2, self.pool_size if recycle else 2),
+                          reuse=self.reuse, pace=self.pace and not recycle, threads=self.threads)
+        frame_time = max(float(request.frame_time_s), 1e-6)
+        t0 = time.monotonic()
+        k = 0
         try:
             while True:
-                try:
-                    item = frames.get(timeout=KEEPALIVE_S)
-                except queue.Empty:
-                    if self._stop.is_set() or p.request_changed(request_id):
-                        return p.poll_request()
-                    if last is None:
-                        continue
-                    item = last
-                    self.keepalives += 1
-                if item is _DONE:
+                if self._stop.is_set() or p.request_changed(request_id):
+                    return p.poll_request()
+                got = pool.take(KEEPALIVE_S)
+                if got is _DONE:
                     return None
-                if isinstance(item, BaseException):
-                    raise item
-                raw, meta = item
+                if isinstance(got, BaseException):
+                    raise got
+                if got is None:
+                    continue  # nothing rendered yet
+                (raw, meta), fresh = got
+                if not fresh and not recycle:
+                    self.keepalives += 1
                 while not p.wait_slot_free(timeout=0.05):
                     if self._stop.is_set() or p.request_changed(request_id):
                         return p.poll_request()
-                p.publish(_fit(raw, shape, dtype), request_id=request_id,
-                          frame_index=meta.frame_index,
+                p.publish(_fit(raw, shape, dtype), request_id=request_id, frame_index=k,
                           flags=L.FLAG_BLANKED if meta.blanked else 0)
                 self.frames_published += 1
-                last = item
-                if self._stop.is_set() or p.request_changed(request_id):
-                    return p.poll_request()
+                self.frames_reused += 0 if fresh else 1
+                k += 1
+                if request.total_frames > 0 and k >= request.total_frames:
+                    return None
+                if recycle and self.pace:
+                    delay = t0 + k * frame_time - time.monotonic()
+                    if delay > 0:
+                        self._stop.wait(delay)
         finally:
-            stop.set()  # the renderer stops at its next frame; the twin's lock orders them
+            pool.close()
 
 def _fit(frame: np.ndarray, shape: tuple[int, int], dtype) -> np.ndarray:
     """Crop or zero-pad to exactly the hw_frame DE-Server asked for."""
@@ -177,3 +177,94 @@ def _fit(frame: np.ndarray, shape: tuple[int, int], dtype) -> np.ndarray:
     h, w = min(shape[0], frame.shape[0]), min(shape[1], frame.shape[1])
     out[:h, :w] = np.clip(frame[:h, :w], 0, np.iinfo(dtype).max)
     return out
+
+
+
+class _FramePool:
+    """The twin's frames for one request, rendered on a thread of their own.
+
+    A ring of up to *size* frames of the CURRENT view: when the microscope state of a new
+    frame differs from the last one's, the older frames are dropped, so a recycled frame
+    never shows a view the column has left. `take` hands out the oldest frame not yet
+    published, else (recycling) the least-used one still under *reuse* publications, else
+    waits; after *keepalive* seconds with nothing new it hands back the last frame
+    anyway. *threads* caps the numba threads the detector uses (leave cores for the
+    consumer's own processing).
+    """
+
+    def __init__(self, twin, request, *, size: int, reuse: int, pace: bool,
+                 threads: Optional[int] = None):
+        self.size = int(size)
+        self.reuse = max(1, int(reuse))
+        self._cond = threading.Condition()
+        self._ring: list = []  # [item, uses]
+        self._last = None
+        self._end = None  # _DONE or an exception
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._render, args=(twin, request, pace, threads),
+                                        name="de-twin-shm-render", daemon=True)
+        self._thread.start()
+
+    def _render(self, twin, request, pace, threads) -> None:
+        if threads:
+            try:
+                import numba
+
+                numba.set_num_threads(max(1, min(int(threads), numba.config.NUMBA_NUM_THREADS)))
+            except Exception:  # noqa: BLE001 - no numba: nothing to cap
+                pass
+        state = None
+        try:
+            for item in twin.frames(request, pace=pace, stop=self._stop):
+                with self._cond:
+                    if item[1].microscope != state:
+                        state = item[1].microscope
+                        self._ring = []  # a new view: nothing older may be shown
+                    while not self._stop.is_set() and sum(1 for e in self._ring if e[1] == 0) >= self.size:
+                        self._cond.wait(0.05)
+                    if self._stop.is_set():
+                        return
+                    self._ring.append([item, 0])
+                    if len(self._ring) > self.size:  # drop the most-used frame
+                        worst = max(range(len(self._ring) - 1), key=lambda i: self._ring[i][1])
+                        del self._ring[worst]
+                    self._cond.notify_all()
+            end = _DONE
+        except Exception as e:  # noqa: BLE001 - raised on the publishing thread
+            end = e
+        with self._cond:
+            self._end = end
+            self._cond.notify_all()
+
+    def take(self, keepalive: float):
+        """``((raw, meta), fresh)``, ``_DONE``, an exception, or None (nothing yet)."""
+        import time
+
+        deadline = time.monotonic() + keepalive
+        with self._cond:
+            while True:
+                fresh = [e for e in self._ring if e[1] == 0]
+                if fresh:
+                    e = fresh[0]
+                    e[1] += 1
+                    self._cond.notify_all()
+                    self._last = e[0]
+                    return e[0], True
+                if self._end is not None:
+                    return self._end
+                if self.reuse > 1:
+                    usable = [e for e in self._ring if e[1] < self.reuse]
+                    if usable:
+                        e = min(usable, key=lambda e: e[1])
+                        e[1] += 1
+                        self._last = e[0]
+                        return e[0], False
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return (self._last, False) if self._last is not None else None
+                self._cond.wait(left)
+
+    def close(self) -> None:
+        self._stop.set()  # the renderer stops at its next frame; the twin's lock orders them
+        with self._cond:
+            self._cond.notify_all()

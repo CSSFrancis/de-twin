@@ -303,9 +303,14 @@ class DigitalTwin:
                 blanked = flux is None
                 # Noise is seeded by a twin-wide frame counter, not the index within this
                 # request: repeated acquisitions (live view) must not repeat their noise.
-                serial = self._frame_serial
-                self._frame_serial += 1
-                raw, info = self.detector.expose(flux, frame_time, request, serial, ht_kv=state.ht_kv)
+                # A request with its own seed is pinned instead: frame i by (seed, i).
+                if request.seed is None:
+                    serial, seed = self._frame_serial, None
+                    self._frame_serial += 1
+                else:
+                    serial, seed = i, int(request.seed)
+                raw, info = self.detector.expose(flux, frame_time, request, serial,
+                                                 ht_kv=state.ht_kv, seed=seed)
             meta = FrameMeta(
                 frame_index=i,
                 time_s=t,
@@ -321,6 +326,13 @@ class DigitalTwin:
                 self.clock.sleep_until(t_start + (i + 1) * frame_time)
             yield raw, meta
             i += 1
+
+    def reset_serial(self) -> None:
+        """Restart the running frame count that seeds the detector noise, so the next
+        acquisition's noise is the same as a fresh twin's (see ``AcquisitionRequest.seed``
+        to pin one acquisition without touching the count)."""
+        with self.lock:
+            self._frame_serial = 0
 
     def acquire(self, request: AcquisitionRequest, *, pace: bool = False) -> np.ndarray:
         """Sum of all frames of ``request`` (uint32/float64 like a DE-Server integrated image)."""
@@ -341,7 +353,8 @@ class DigitalTwin:
 
         ``exposure_s`` is split into frames at ``fps``, each corrected with
         references the twin measures on first use (see :attr:`processor`).
-        ``units``: "electrons" | "adu" | "raw".
+        ``units``: "electrons" | "adu" | "raw". ``seed=`` (a request field) pins the
+        image's noise: the same seed gives the same image whatever came before.
         """
         from .processing import frames_for_exposure
 

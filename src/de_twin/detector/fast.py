@@ -58,7 +58,7 @@ _U53 = 1.0 / 9007199254740994.0
 def _njit(**kw):
     if not AVAILABLE:
         return lambda f: f
-    return nb.njit(cache=True, fastmath=True, **kw)
+    return nb.njit(cache=True, fastmath=True, nogil=True, **kw)  # nogil: other threads (publishing) run meanwhile
 
 
 _TABLE = None
@@ -290,3 +290,164 @@ def frame_key(seed: int, frame_index: int, stage: int) -> int:
 def offsets(key: int) -> tuple[int, int]:
     """This frame's two starting points in the normal table (gamma, read noise)."""
     return int(_mix_py(key ^ 0xA5A5) % NORMALS), int(_mix_py(key ^ 0x5A5A) % NORMALS)
+
+
+# ---------------------------------------------------------------- counting cameras
+# A counting camera sums ``ncyc`` sensor cycles per frame; a pixel counts at most one
+# event per cycle and nearby events coincide (paralysable, ``cluster_area_px``). Per
+# EXPOSURE (`counting_prepare`) that is one Poisson mean per pixel; per FRAME it is one
+# Poisson draw, capped at the cycles summed.
+
+
+@_njit(parallel=True)
+def counting_prepare(flux, has_flux, gain, t_nb, area, cyc_nb, false_rate, hot, mean, p0):
+    """Per exposure: each pixel's mean counts over the frame and exp(-mean).
+    Returns the electrons delivered (the dose)."""
+    h, w = gain.shape
+    t32 = np.float32(t_nb)
+    cut = np.float32(POISSON_EXACT_BELOW)
+    kk = np.float32(area / cyc_nb)  # lam A per cycle, over lam per frame
+    inv_a = np.float32(1.0 / area)
+    fr = np.float32(false_rate)
+    cyc = np.float32(cyc_nb)
+    rows = np.zeros(h)
+    for r in nb.prange(h):
+        g = gain[r]
+        hr = hot[r]
+        mr = mean[r]
+        pr = p0[r]
+        acc = 0.0
+        for c in range(w):
+            p = fr + hr[c]
+            if has_flux:
+                lam = flux[r, c] * t32
+                if lam < 0:
+                    lam = np.float32(0.0)
+                acc += lam
+                p += -math.expm1(-lam * g[c] * kk) * inv_a
+            if p > 1:
+                p = np.float32(1.0)
+            m = p * cyc
+            mr[c] = m
+            pr[c] = math.exp(-m) if m < cut else np.float32(0.0)
+        rows[r] = acc
+    return rows.sum()
+
+
+@_njit(parallel=True)
+def count(mean, p0, key, table, zstart, cap, inv_nb, vmax, out, xout, to_float):
+    """Per frame: counts ~ Poisson(mean), capped at *cap* cycles, averaged over the
+    *inv_nb* binned pixels. Into the uint8 *out* (clipped, rounded; returns the clipped
+    count) or, with *to_float*, into the float grid *xout* for `finish` to bin."""
+    h, w = mean.shape
+    cut = np.float32(POISSON_EXACT_BELOW)
+    key = np.uint64(key)
+    inb = np.float32(inv_nb)
+    vm = np.float32(vmax)
+    sats = np.zeros(h, np.int64)
+    for r in nb.prange(h):
+        mr = mean[r]
+        pr = p0[r]
+        base = r * w
+        sat = 0
+        for c in range(w):
+            L = mr[c]
+            n = 0
+            if L > 0:
+                i = base + c
+                if L < cut:
+                    x = key + np.uint64(i) * np.uint64(_GOLD)
+                    x = (x ^ (x >> np.uint64(30))) * np.uint64(_M1)
+                    x = (x ^ (x >> np.uint64(27))) * np.uint64(_M2)
+                    x = x ^ (x >> np.uint64(31))
+                    u = np.float32(((x >> np.uint64(11)) + np.uint64(1)) * _U53)
+                    p = pr[c]
+                    f = p
+                    while u > f and n < 200:
+                        n += 1
+                        p *= L / np.float32(n)
+                        f += p
+                else:
+                    zz = table[(zstart + i) & _MASK]
+                    n = int(math.floor(L + math.sqrt(L) * zz + np.float32(0.5)))
+                    if n < 0:
+                        n = 0
+                if n > cap:
+                    n = cap
+            v = np.float32(n) * inb
+            if to_float:
+                xout[r, c] = v
+                continue
+            if v >= vm:
+                sat += 1
+                v = vm
+            out[r, c] = v + np.float32(0.5)
+        sats[r] = sat
+    return sats.sum()
+
+
+@_njit(parallel=True)
+def count_super(mean, p0, key, table, zstart, cap, vmax, out):
+    """Per frame, super-resolution: as `count`, and each event lands in one of its
+    pixel's 2x2 sub-pixels, uniformly at random. *out* is (2h, 2w) uint8.
+
+    The corner cut: where in the pixel an event landed is drawn, not modelled. The
+    rendered flux carries no detail finer than a sensor pixel, so a uniform draw is
+    what a real super-resolution readout of the same image would show."""
+    h, w = mean.shape
+    cut = np.float32(POISSON_EXACT_BELOW)
+    key = np.uint64(key)
+    sub = key ^ np.uint64(0x5B5B5B5B5B5B5B5B)
+    vm = int(vmax)
+    sats = np.zeros(h, np.int64)
+    for r in nb.prange(h):
+        o0 = out[2 * r]
+        o1 = out[2 * r + 1]
+        for c in range(2 * w):
+            o0[c] = 0
+            o1[c] = 0
+        mr = mean[r]
+        pr = p0[r]
+        base = r * w
+        sat = 0
+        for c in range(w):
+            L = mr[c]
+            if L <= 0:
+                continue
+            i = base + c
+            n = 0
+            if L < cut:
+                x = key + np.uint64(i) * np.uint64(_GOLD)
+                x = (x ^ (x >> np.uint64(30))) * np.uint64(_M1)
+                x = (x ^ (x >> np.uint64(27))) * np.uint64(_M2)
+                x = x ^ (x >> np.uint64(31))
+                u = np.float32(((x >> np.uint64(11)) + np.uint64(1)) * _U53)
+                p = pr[c]
+                f = p
+                while u > f and n < 200:
+                    n += 1
+                    p *= L / np.float32(n)
+                    f += p
+            else:
+                zz = table[(zstart + i) & _MASK]
+                n = int(math.floor(L + math.sqrt(L) * zz + np.float32(0.5)))
+                if n < 0:
+                    n = 0
+            if n > cap:
+                n = cap
+            if n == 0:
+                continue
+            y = sub + np.uint64(i) * np.uint64(_GOLD)
+            y = (y ^ (y >> np.uint64(30))) * np.uint64(_M1)
+            y = (y ^ (y >> np.uint64(27))) * np.uint64(_M2)
+            y = y ^ (y >> np.uint64(31))
+            for j in range(n):
+                q = int((y >> np.uint64((2 * j) & 63)) & np.uint64(3))
+                row = o0 if (q >> 1) == 0 else o1
+                cc = 2 * c + (q & 1)
+                if row[cc] >= vm:
+                    sat += 1
+                else:
+                    row[cc] += 1
+        sats[r] = sat
+    return sats.sum()

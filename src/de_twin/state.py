@@ -211,6 +211,11 @@ class AcquisitionRequest:
     camera_inserted: bool = True
     scan: ScanRequest = field(default_factory=ScanRequest)
     acquisition_index: int = 0
+    #: Counting cameras: read out at 2x the ROI each way (Apollo "Super-resolution").
+    super_resolution: bool = False
+    #: Pins this acquisition's detector noise: frame k is seeded by (seed, k) whatever the
+    #: twin exposed before. None: the twin's own seed and running frame count.
+    seed: Optional[int] = None
 
     @property
     def beam_reaches_detector(self) -> bool:

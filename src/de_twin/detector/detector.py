@@ -15,6 +15,8 @@ Counting cameras (Apollo family) emit counted events per pixel (uint8):
 each delivered frame sums ``round(t / cycle)`` sensor cycles, a pixel counts
 at most one event per cycle, and events closer than ``cluster_area_px``
 coincide (paralysable loss, ``p = (1 - exp(-lam * A)) / A`` per cycle).
+With ``request.super_resolution`` (unbinned) the frame is 2x the ROI each way and every
+event lands in one of its pixel's 2x2 sub-pixels, drawn uniformly (`fast.count_super`).
 
 Speed: the frame is processed in fixed bands of rows on a thread pool (numpy
 releases the GIL) using per-thread scratch buffers. Each band draws from its
@@ -116,10 +118,21 @@ class Detector:
         return Roi(x, y, max(1, min(w, W - x)), max(1, min(h, H - y)))
 
     def output_shape(self, request: Optional[AcquisitionRequest] = None) -> tuple[int, int]:
-        """(h, w) of the hardware frame: ROI, then binning (integer division, like DE-Server)."""
+        """(h, w) of the hardware frame: ROI, then binning (integer division, like DE-Server);
+        twice that each way for a super-resolution counting frame."""
+        h, w = self._grid_shape(request)
+        return (2 * h, 2 * w) if self.super_resolution(request) else (h, w)
+
+    def _grid_shape(self, request: Optional[AcquisitionRequest] = None) -> tuple[int, int]:
         r = self.roi(request)
         bx, by = _binning(request)
         return max(1, r.h // by), max(1, r.w // bx)
+
+    def super_resolution(self, request: Optional[AcquisitionRequest] = None) -> bool:
+        """Whether *request* reads this camera out at super-resolution: a counting camera,
+        asked for it, unbinned (binning and super-resolution do not combine)."""
+        return bool(request is not None and getattr(request, "super_resolution", False)
+                    and self.model.hardware_counting and _binning(request) == (1, 1))
 
     # ------------------------------------------------------- ground truth
     def _build_maps(self) -> None:
@@ -240,7 +253,8 @@ class Detector:
 
     # --------------------------------------------------------------- expose
     def expose(self, flux, exposure_s: float, request: Optional[AcquisitionRequest] = None,
-               frame_index: int = 0, *, ht_kv: Optional[float] = None) -> tuple[np.ndarray, dict]:
+               frame_index: int = 0, *, ht_kv: Optional[float] = None,
+               seed: Optional[int] = None) -> tuple[np.ndarray, dict]:
         """Simulate one raw frame.
 
         ``flux``: electrons / sensor pixel / second, a float array of the ROI
@@ -250,6 +264,7 @@ class Detector:
         model's dtype (uint16, or uint8 for counting cameras). ``info`` holds
         ``dose_e_per_px`` (mean electrons per sensor pixel), ``saturated``,
         ``saturated_pixels``, ``blanked`` and the resolved geometry.
+        ``seed`` replaces the detector's own for this frame's noise (a pinned acquisition).
         """
         self._build_maps()
         m = self.model
@@ -258,7 +273,8 @@ class Detector:
         t = max(0.0, float(exposure_s))
         r = self.roi(request)
         bx, by = _binning(request)
-        oh, ow = self.output_shape(request)
+        oh, ow = self._grid_shape(request)
+        sr = self.super_resolution(request)
         blanked = flux is None
 
         # --- choose the simulation grid
@@ -297,7 +313,7 @@ class Detector:
         hrate = self._hot_rate[hm] / np.float32(nb)
 
         gh, gw = gain.shape
-        out = np.empty((oh, ow), m.dtype)
+        out = np.empty((2 * oh, 2 * ow) if sr else (oh, ow), m.dtype)
         band = max(8, _BAND_PIXELS // max(gw, 1))
         band = gby * max(1, band // gby)
         bands = [(i, r0, min(r0 + band, gh)) for i, r0 in enumerate(range(0, gh, band))]
@@ -305,14 +321,16 @@ class Detector:
         scale = 2.0 ** (min(bd, m.bit_depth) - m.bit_depth) if bd else 1.0
         vmax = float(min(m.max_value, (1 << bd) - 1) if bd else m.max_value)
 
-        ctx = _Ctx(model=m, seed=self.seed, frame_index=int(frame_index), t=t, flux=flux,
+        ctx = _Ctx(model=m, seed=self.seed if seed is None else int(seed), frame_index=int(frame_index), t=t, flux=flux,
                    nb=nb, gain=gain, off=off, gbx=gbx, gby=gby, out=out, vmax=vmax, scale=scale,
                    hy=hy, hx=hx, hrate=hrate, S=None,
                    adu=m.adu_per_electron_at(ht),
                    a=m.charge_spread_at(ht) / (bx if direct else 1))
 
         with self._lock:
-            if _fast_detector(m):
+            if m.hardware_counting and (sr or _fast_detector(m)):
+                res = [self._expose_counting_fast(ctx, gh, gw, sr)]
+            elif _fast_detector(m):
                 res = [self._expose_fast(ctx, gh, gw)]
             elif m.hardware_counting:
                 res = list(_pool().map(ctx.counting_band, bands))
@@ -340,6 +358,7 @@ class Detector:
             "binning": (bx, by),
             "ht_kv": ht,
             "counting": bool(m.hardware_counting),
+            "super_resolution": sr,
         }
         return out, info
 
@@ -382,6 +401,63 @@ class Detector:
             np.add.at(x, (ctx.hy, ctx.hx), ctx.hrate * np.float32(ctx.t * ctx.scale))
         sat = fast.finish(x, float(ctx.vmax), int(ctx.gbx), int(ctx.gby), ctx.out)
         return float(dose), int(sat)
+
+    def _expose_counting_fast(self, ctx: "_Ctx", gh: int, gw: int, sr: bool) -> tuple[float, int]:
+        """One counting frame through the numba kernels (`fast.count`, `fast.count_super`)."""
+        from . import fast
+
+        m = ctx.model
+        ncyc = max(1, int(round(ctx.t / m.full_frame_time_s)))
+        cap = ncyc * ctx.nb
+        mean, p0, dose = self._counting_means(ctx, gh, gw, ncyc)
+        table = fast.normal_table()
+        zstart, _ = fast.offsets(fast.frame_key(ctx.seed, ctx.frame_index, 0))
+        key = np.uint64(fast.frame_key(ctx.seed, ctx.frame_index, 3))
+        if sr:
+            sat = fast.count_super(mean, p0, key, table, zstart, int(cap), float(ctx.vmax), ctx.out)
+            return dose, int(sat)
+        if ctx.gbx == 1 and ctx.gby == 1:
+            sat = fast.count(mean, p0, key, table, zstart, int(cap), 1.0 / ctx.nb,
+                             float(ctx.vmax), ctx.out, mean, False)
+            return dose, int(sat)
+        x = getattr(self, "_X", None)
+        if x is None or x.shape != (gh, gw):
+            x = self._X = np.empty((gh, gw), np.float32)
+        fast.count(mean, p0, key, table, zstart, int(cap), 1.0 / ctx.nb, float(ctx.vmax),
+                   ctx.out, x, True)
+        sat = fast.finish(x, float(ctx.vmax), int(ctx.gbx), int(ctx.gby), ctx.out)
+        return dose, int(sat)
+
+    def _counting_means(self, ctx: "_Ctx", gh: int, gw: int, ncyc: int):
+        """Each pixel's mean counts per frame and exp(-mean), made once per exposure."""
+        from . import fast
+
+        m = ctx.model
+        flux = ctx.flux
+        if flux is not None:
+            owner = flux.base if flux.base is not None else flux
+            fkey = (id(owner), flux.__array_interface__["data"][0], flux.shape, flux.strides)
+        else:
+            owner, fkey = None, None
+        # `expose` slices the gain map too: a new view each frame, of the same memory
+        gain = ctx.gain
+        gowner = gain.base if gain.base is not None else gain
+        gkey = (id(gowner), gain.__array_interface__["data"][0], gain.shape, gain.strides)
+        key = (fkey, float(ctx.t), ctx.nb, ncyc, gkey, (gh, gw), ctx.hy.tobytes(), ctx.hx.tobytes())
+        cached = getattr(self, "_cmeans", None)
+        if cached is not None and cached[0] == key and cached[1] is owner and cached[2] is gowner:
+            return cached[3], cached[4], cached[5]
+        hot = np.zeros((gh, gw), np.float32)
+        if ctx.hy.size:  # spurious counts per cycle
+            np.add.at(hot, (ctx.hy, ctx.hx), ctx.hrate * np.float32(ctx.nb * m.full_frame_time_s))
+        mean = np.empty((gh, gw), np.float32)
+        p0 = np.empty((gh, gw), np.float32)
+        dose = fast.counting_prepare(flux if flux is not None else ctx.gain, flux is not None,
+                                     ctx.gain, float(ctx.t * ctx.nb), float(m.cluster_area_px),
+                                     float(ncyc * ctx.nb), float(m.false_event_rate), hot,
+                                     mean, p0)
+        self._cmeans = (key, owner, gowner, mean, p0, float(dose))
+        return mean, p0, float(dose)
 
     def _exposure_means(self, flux: np.ndarray, t_nb: float):
         """The per-pixel mean electrons and exp(-mean) of an exposure, shared by all its
@@ -589,9 +665,10 @@ _TLS = threading.local()
 
 
 def _fast_detector(model) -> bool:
-    """The fused numba kernels, for an integrating camera, unless numba is missing or
-    ``DE_TWIN_NUMPY_DETECTOR=1`` asks for the numpy path (a reference for comparisons)."""
-    if model.hardware_counting or os.environ.get("DE_TWIN_NUMPY_DETECTOR") == "1":
+    """The fused numba kernels, unless numba is missing or ``DE_TWIN_NUMPY_DETECTOR=1``
+    asks for the numpy path (a reference for comparisons). Super-resolution frames are
+    numba only."""
+    if os.environ.get("DE_TWIN_NUMPY_DETECTOR") == "1":
         return False
     from . import fast
 

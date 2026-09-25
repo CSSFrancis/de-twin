@@ -29,7 +29,7 @@ BAND = 5.0
 def _njit(**kw):
     if not AVAILABLE:
         return lambda f: f
-    return nb.njit(cache=True, fastmath=True, **kw)
+    return nb.njit(cache=True, fastmath=True, nogil=True, **kw)  # nogil: other threads (publishing) run meanwhile
 
 
 @_njit(parallel=True)

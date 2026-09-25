@@ -148,6 +148,15 @@ class DynamicProperty(Property):  # type: ignore[misc]
         self._setter(value)
 
 
+#: Read-only property naming the simulator behind the frames (``"de-twin <version>"``), so
+#: a client can stamp provenance on what it saves. A real DE-Server has no such property.
+SIMULATOR_SOURCE_PROPERTY = "Simulator Source"
+
+
+def model_counting(twin) -> bool:
+    return bool(getattr(twin.detector.model, "hardware_counting", False))
+
+
 def request_from_properties(get: Callable[[str], Any], camera_model: str,
                             sensor_shape: tuple[int, int], *,
                             scan_points: Optional[list] = None,
@@ -187,7 +196,16 @@ def request_from_properties(get: Callable[[str], Any], camera_model: str,
         camera_model=camera_model, exposure_mode=mode, frame_time_s=1.0 / fps,
         total_frames=frame_count,
         frames_per_buffer=max(1, int(float(get("Grabbing - Frames Per Buffer") or 1))),
-        hw_roi=roi, hw_binning=(bx, by), scan=scan, acquisition_index=acquisition_index)
+        hw_roi=roi, hw_binning=(bx, by), scan=scan, acquisition_index=acquisition_index,
+        super_resolution=_super_resolution(get))
+
+
+def _super_resolution(get: Callable[[str], Any]) -> bool:
+    """DE-Server's "Centroiding Mode" asks for super-resolution (counting cameras only)."""
+    try:
+        return "super" in str(get("Centroiding Mode") or "").lower()
+    except Exception:  # noqa: BLE001 - an integrating camera has no such property
+        return False
 
 
 def _resample(img: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
@@ -580,6 +598,39 @@ class TwinFakeServer(FakeServer):  # type: ignore[misc,valid-type]
         ]
         for name, getter, dt in ro:
             self._put(DynamicProperty(name, getter, data_type=dt, category="Instrument"))
+        # Counting cameras: DE-Server's "Centroiding Mode" (Standard | Super-resolution).
+        # Super-resolution reads out 2x the ROI each way, and the image size says so.
+        if model_counting(self.twin):
+            self._centroiding = "Standard"
+
+            def set_centroiding(value):
+                v = str(value).strip()
+                if v.lower() not in ("standard", "super-resolution"):
+                    log.warning("centroiding mode %s not supported", value)
+                    return
+                self._centroiding = "Super-resolution" if "super" in v.lower() else "Standard"
+
+            self._put(DynamicProperty("Centroiding Mode", lambda: self._centroiding, set_centroiding,
+                                      data_type="String", value_type="Set",
+                                      options="'Standard*', 'Super-resolution'",
+                                      default_value="Standard", category="Basic"))
+            for axis in ("x", "y"):
+                orig = self._values.get(f"image_size_{axis}_pixels")
+                if orig is None:
+                    continue
+
+                def size(orig=orig):
+                    n = int(float(orig.value))
+                    return 2 * n if (self._centroiding == "Super-resolution"
+                                     and tuple(self._hw_bin) == (1, 1)) else n
+
+                self._put(DynamicProperty(orig.name, size, data_type="Integer", category=orig.category))
+
+        # Provenance: frames from here are simulated, and by what
+        from .. import __version__
+
+        self._put(DynamicProperty(SIMULATOR_SOURCE_PROPERTY, lambda: f"de-twin {__version__}",
+                                  data_type="String", category="Twin"))
 
     def _holder_state(self):
         holder = self.twin.holder
@@ -962,6 +1013,7 @@ class TwinDeapiServer:
         self.twin = twin
         self.host = host
         self._requested_port = int(port)
+        self._port = int(port)
         self.fake = TwinFakeServer(twin=twin, pace=pace)
         self._stop = threading.Event()
         self._tcp: Optional[_socketmod.socket] = None
@@ -969,7 +1021,8 @@ class TwinDeapiServer:
 
     @property
     def port(self) -> int:
-        return int(self._tcp.getsockname()[1]) if self._tcp else self._requested_port
+        """The bound TCP port (cached at `start`: the socket may be closed by now)."""
+        return self._port
 
     def start(self) -> "TwinDeapiServer":
         tcp = _socketmod.socket(_socketmod.AF_INET, _socketmod.SOCK_STREAM)
@@ -977,6 +1030,7 @@ class TwinDeapiServer:
         tcp.bind((self.host, self._requested_port))
         tcp.listen()
         tcp.settimeout(0.25)
+        self._port = int(tcp.getsockname()[1])
         self._tcp = tcp
         for target in (self._accept_loop, self._udp_loop):
             t = threading.Thread(target=target, daemon=True, name=f"TwinDeapi-{target.__name__}")
