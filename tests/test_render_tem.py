@@ -247,13 +247,15 @@ def test_raster_and_frame_caches():
     assert np.array_equal(a, b)
     r.render(_optics(magnification=50000, defocus_um=-1.5))  # focus change: no re-raster
     assert spec.rasterize_calls == 1
-    r.render(_optics(magnification=50000, stage_x=0.01))  # view change: re-raster
+    r.render(_optics(magnification=50000, defocus_um=-1.5, stage_x=0.005))  # a nudge: a crop
+    assert spec.rasterize_calls == 1
+    r.render(_optics(magnification=50000, stage_x=50.0))  # a jump beyond it: re-raster
     assert spec.rasterize_calls == 2
     spec.generation += 1  # specimen content changed
-    r.render(_optics(magnification=50000, stage_x=0.01))
+    r.render(_optics(magnification=50000, stage_x=50.0))
     assert spec.rasterize_calls == 3
     r.invalidate()
-    r.render(_optics(magnification=50000, stage_x=0.01))
+    r.render(_optics(magnification=50000, stage_x=50.0))
     assert spec.rasterize_calls == 4
 
 

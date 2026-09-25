@@ -19,6 +19,21 @@ class RenderConfig:
     amplitude_contrast: float = 0.07  # absorptive part of the amorphous texture (w)
     lattice_fringes: bool = True
     lattice_phase_rad: float = 0.15  # total phase amplitude of resolved lattice fringes
+    #: TEM imaging renders a view this fraction of the field larger on each side and
+    #: serves a stage move that stays inside the margin by cropping it: the image moves
+    #: rigidly with the specimen, so a joystick nudge costs a crop, not a render. 0 off.
+    pan_margin: float = 0.15
+    #: Interactive use (dragging the stage, zooming): while the view keeps changing, a
+    #: view the cache cannot crop is rendered at up to `preview_side`² and upsampled
+    #: (~35-70 ms rather than ~0.3-0.9 s); the first time the same view is asked for
+    #: again — the next frame after you stop — it is rendered in full. Off by default,
+    #: so a library caller always gets the full render.
+    interactive: bool = False
+    preview_side: int = 256
+    #: How long (wall-clock seconds) the view must stay put before it counts as stopped
+    #: and is rendered in full. Live view asks for several frames per drag step, so
+    #: "asked for the same view twice" is not "stopped".
+    settle_s: float = 0.3
     illumination_profile: bool = True  # draw the edge of the illuminated disk when it is in view
     texture_seed_salt: int = 0x7E57
 

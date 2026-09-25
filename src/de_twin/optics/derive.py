@@ -32,7 +32,11 @@ from .aberrations import Aberrations, uncorrected
 from .physics import electron_wavelength_nm, focal_spread_nm
 from .state import OpticsState
 
-MAX_RASTER_PIXELS = 2048 * 2048
+#: The largest raster a TEM image is rendered at; a bigger camera frame is upsampled from
+#: it. 1024² keeps a re-render (every stage move and focus step) well under a second on a
+#: 4096² camera, at the cost of detail finer than a quarter of its pixels, which the
+#: detector's own charge spreading and the dose already blur.
+MAX_RASTER_PIXELS = 1024 * 1024
 MIN_RASTER_SIDE = 32
 SAED_RASTER_SIDE = 256
 EDGE_SOFTENING_SIGMA_PX = 0.5

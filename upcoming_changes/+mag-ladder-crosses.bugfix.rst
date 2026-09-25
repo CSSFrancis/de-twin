@@ -1,0 +1,1 @@
+The column's ``mag_ladder()`` in TEM imaging lists LowMAG's and MAG1's magnifications together, the ones a ``Magnification`` write can reach, so a client stepping it (Ground Crew's mag +/-) crosses from low to medium magnification instead of stopping at the top of LowMAG.
