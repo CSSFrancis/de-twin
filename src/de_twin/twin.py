@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import threading
 from typing import Iterator, Optional, Union
 
@@ -62,6 +64,7 @@ class DigitalTwin:
         clock: Optional[Clock] = None,
         flood_for_gain: bool = True,
         detector_overrides: Optional[dict] = None,
+        start_on_specimen: bool = True,
     ):
         from .column import Column
         from .detector import Detector, camera as camera_by_name
@@ -96,6 +99,11 @@ class DigitalTwin:
         self.calibration = calibration or Calibration.default()
         self.optics_config = optics_config or OpticsConfig()
         self.renderer = Renderer(self.specimen, render_config)
+        # Only a column the twin built is its to move: a supplied one may be a mirror of
+        # real hardware, whose stage and beam are the operator's.
+        self._own_column = column is None
+        if start_on_specimen and self._own_column:
+            self.start_on_specimen()
 
     # ------------------------------------------------------------------ state
     @property
@@ -110,8 +118,80 @@ class DigitalTwin:
         state = getattr(self.holder, "state", None)
         return state(t) if callable(state) else HolderState(t_s=t)
 
-    def set_specimen(self, specimen) -> None:
-        """Swap the specimen (e.g. a new preset) keeping column/holder/detector."""
+    def start_on_specimen(self) -> None:
+        """Point the column at the specimen, as an operator would on loading it.
+
+        The stage goes to `Specimen.home_um` (the origin is often a grid bar, a chip frame or
+        bare film), the beam to the preset's `start_dose_e_per_px_s` (by solving the
+        Intensity — the default spread beam gives ~2 e- per live frame, which reads as pure
+        noise), and the defocus to its `start_defocus_um`. Everything stays the operator's
+        to change afterwards.
+        """
+        from .optics.derive import stage_for_view_center
+
+        opts = getattr(self.specimen, "options", None)
+        if opts is None or not hasattr(self.specimen, "home_um"):
+            return  # a synthetic test specimen has no holder to find
+        # `home_um` is a point on the SPECIMEN; the stage carries the specimen, so the stage
+        # position that puts it on axis is not the point itself.
+        x, y = stage_for_view_center(self.specimen.home_um(), self.column.state(), self.optics_config)
+        self.column.move_stage(x=x, y=y)
+        self.column.set_defocus_um(self._start_defocus_um(opts))
+        target = float(opts.start_dose_e_per_px_s) or self.safe_dose_e_per_px_s()
+        if target > 0:
+            self.column.set("Intensity", self._intensity_for_dose(target))
+
+    def _start_defocus_um(self, opts) -> float:
+        """The preset's start defocus; for unstained proteins in ice with none set,
+        1.5 um underfocus — a phase object shows almost nothing in focus, and that is
+        how cryo is imaged."""
+        df = float(opts.start_defocus_um)
+        if df == 0.0 and getattr(self.specimen.config, "preparation", "") == "proteins"                 and float(getattr(opts, "negative_stain_fraction", 0.0)) < 0.5:
+            return -1.5
+        return df
+
+    def safe_dose_e_per_px_s(self, fps: float = 40.0) -> float:
+        """A dose rate the detector takes without saturating a frame at *fps*.
+
+        A DE integrating pixel holds only a few electrons per frame (~206 ADU per e- at
+        300 kV against ~2100 ADU of range), so its frames are meant to be sparse and an
+        image is their sum over the exposure: ~35 % of that per frame here. A counting
+        camera wants ~0.1 e- per pixel per sensor cycle, or coincidence loss sets in.
+        """
+        m = self.detector.model
+        if m.hardware_counting:
+            return 0.1 * float(m.hw_quanta) * fps
+        ht = float(self.column.state().ht_kv or m.reference_ht_kv)
+        per_e = float(m.adu_per_electron_at(ht)) if callable(getattr(m, "adu_per_electron_at", None))             else float(m.adu_per_electron)
+        per_frame = max(0.0, (float(m.saturation_adu) - float(m.dark_offset_adu)) / max(per_e, 1e-9))
+        return 0.35 * per_frame * fps
+
+    def _intensity_for_dose(self, target: float) -> float:
+        """The Intensity (C2) at which the beam gives *target* e-/px/s at the current
+        magnification: dose falls monotonically as Intensity spreads the beam, so bisect
+        on the optics (no rendering)."""
+        req = self.request()
+        state = self.column.state()
+        lo, hi = 0.02, 0.98
+
+        def dose(v: float) -> float:
+            return float(self.optics(req, dataclasses.replace(state, intensity=v)).dose_e_per_px_s)
+
+        if dose(lo) <= target:
+            return lo
+        if dose(hi) >= target:
+            return hi
+        for _ in range(40):
+            mid = 0.5 * (lo + hi)
+            if dose(mid) > target:
+                lo = mid
+            else:
+                hi = mid
+        return round(0.5 * (lo + hi), 4)
+
+    def set_specimen(self, specimen, start: bool = True) -> None:
+        """Swap the specimen (e.g. a new preset) keeping column/holder/detector. With
+        *start*, the column is pointed at the new specimen (`start_on_specimen`)."""
         from .render import Renderer
         from .specimen import Specimen, SpecimenConfig, from_name
 
@@ -122,6 +202,8 @@ class DigitalTwin:
         with self.lock:
             self.specimen = specimen
             self.renderer = Renderer(specimen, getattr(self.renderer, "config", None))
+        if start and getattr(self, "_own_column", False):
+            self.start_on_specimen()
 
     # ---------------------------------------------------------------- optics
     def optics(self, request: AcquisitionRequest, state: Optional[MicroscopeState] = None):

@@ -119,6 +119,12 @@ class SpecimenOptions:
 
     # -- hints for other subpackages (carried by presets/aliases, not used by the specimen) -------
     dose_rate_counts_per_s: float = _opt(4000.0, 1.0, 1e6, "Preset dose-rate hint for the renderer.")
+    start_dose_e_per_px_s: float = _opt(0.0, 0.0, 1e6, "Dose rate a twin starts the beam at, in "
+                                        "e-/detector px/s (it solves the Intensity for it). 0 is the "
+                                        "detector's own safe rate: well inside what a pixel holds per "
+                                        "frame at 40 fps, so frames never saturate.")
+    start_defocus_um: float = _opt(0.0, -20.0, 20.0, "Defocus a twin starts at: a thin phase object "
+                                   "(proteins in ice) shows no contrast in focus.")
     legacy_force_descan: bool = _opt(False, doc="PNJunction-Scan quirk: renderer should force descan on.")
 
     # ------------------------------------------------------------------------------------------
@@ -176,7 +182,7 @@ NON_REGENERATING = frozenset({
     "strain_magnitude", "drift_per_step_x_nm", "drift_per_step_y_nm", "time_step_s",
     "in_situ_crystallization", "nucleation_start_s", "nucleation_end_s", "crystal_growth_s",
     "specimen_temperature_c", "crystallization_onset_c", "melting_temperature_c",
-    "dose_rate_counts_per_s", "legacy_force_descan",
+    "dose_rate_counts_per_s", "legacy_force_descan", "start_dose_e_per_px_s", "start_defocus_um",
 })
 # Of those, the ones baked into populated areas (C++ clears the population cache for them).
 CLEARS_POPULATION = frozenset({
@@ -269,7 +275,7 @@ _PRESET_TABLE: dict[str, tuple[str, str, str, dict]] = {
     "Apoferritin in ice": ("mesh_grid", "proteins", "vitreous_ice", dict(
         film_thickness_nm=0.0, ice_thickness_nm=60.0, protein_diameter_nm=12.0,
         protein_density_per_um2=2000.0, negative_stain_fraction=0.0, dose_fading_per_step=0.0,
-        dose_rate_counts_per_s=6000.0)),
+        dose_rate_counts_per_s=6000.0, start_defocus_um=-1.5)),
     "Negative stain on carbon": ("mesh_grid", "proteins", "continuous", dict(
         film_thickness_nm=12.0, ice_thickness_nm=60.0, protein_diameter_nm=18.0,
         protein_density_per_um2=900.0, negative_stain_fraction=0.9, dose_fading_per_step=0.0,

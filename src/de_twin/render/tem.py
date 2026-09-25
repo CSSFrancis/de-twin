@@ -111,8 +111,11 @@ def bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max: float
     table = np.zeros((len(g_u), len(tb_u)))
     for mid in np.unique(g_u // GRAINS_PER_MATERIAL):
         sel = np.flatnonzero(g_u // GRAINS_PER_MATERIAL == mid)
+        lib = library_for(int(mid), cfg.max_g_inv_nm)
+        if lib is None:
+            continue  # an amorphous material: no Bragg contrast (the FIB-liftout pattern's "auto" post)
         m = effective_matrices(grains.matrices[g_u[sel]], optics.alpha_rad, optics.beta_rad)
-        ex = library_for(int(mid), cfg.max_g_inv_nm).excite(
+        ex = lib.excite(
             m, lam, np.broadcast_to(tb_u * THICKNESS_BIN_NM, (len(sel), len(tb_u))), optics.ht_kv,
             optics.convergence_mrad)
         gxy = np.hypot(ex.gx, ex.gy)

@@ -83,6 +83,18 @@ def view_center_um(state: MicroscopeState, cfg: OpticsConfig) -> tuple[float, fl
     return cx, cy
 
 
+def stage_for_view_center(center_um: tuple[float, float], state: MicroscopeState,
+                          cfg: OpticsConfig) -> tuple[float, float]:
+    """The stage (x, y) µm that puts specimen point *center_um* on axis, with the column's
+    current image and beam shifts — the inverse of :func:`view_center_um`."""
+    sx = -1.0 if cfg.flip_x else 1.0
+    sy = -1.0 if cfg.flip_y else 1.0
+    ox, oy, _ = cfg.stage_offset_um
+    x = -(center_um[0] / sx - state.image_shift_um.x - state.beam_shift_um.x) - ox
+    y = -(center_um[1] / sy - state.image_shift_um.y - state.beam_shift_um.y) - oy
+    return x, y
+
+
 def derive_optics(state: MicroscopeState, request: AcquisitionRequest, camera,
                   calibration: Calibration | None = None,
                   cfg: OpticsConfig | None = None) -> OpticsState:

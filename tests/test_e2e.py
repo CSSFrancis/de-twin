@@ -49,14 +49,15 @@ def test_soap_stage_move_shifts_deapi_images():
             return c.get_result("sumtotal")[0].astype(np.float64)
 
         px_um = twin.optics(twin.request()).specimen_pixel_nm / 1000.0
+        x0 = twin.column.state().stage.x_um  # the twin starts over the specimen, not at 0
         a = image()
-        scope.set_stage_position(x=60 * px_um)
+        scope.set_stage_position(x=x0 + 60 * px_um)
         deadline = time.time() + 10
         while scope.operation_status() == 1 and time.time() < deadline:
             time.sleep(0.02)
         b = image()
         # DE-Server's metadata view of the column agrees with the SOAP face
-        assert float(c["Instrument Stage Position X (micrometers)"]) == pytest.approx(60 * px_um, abs=1e-3)
+        assert float(c["Instrument Stage Position X (micrometers)"]) == pytest.approx(x0 + 60 * px_um, abs=1e-3)
         c.disconnect()
     dx, dy = xcorr_shift(b, a)
     assert abs(abs(dx) - 60) <= 2 and abs(dy) <= 2
