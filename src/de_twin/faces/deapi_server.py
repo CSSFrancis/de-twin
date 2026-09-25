@@ -116,6 +116,9 @@ def _to_bool(value: Any) -> bool:
     return str(value).strip().lower() in ("on", "true", "1", "yes")
 
 
+#: The exposure a fresh face starts with, in seconds (see `_frame_count`).
+DEFAULT_EXPOSURE_S = 0.5
+
 class DynamicProperty(Property):  # type: ignore[misc]
     """A property whose value is computed (and optionally applied) by callables."""
 
@@ -413,7 +416,10 @@ class TwinFakeServer(FakeServer):  # type: ignore[misc,valid-type]
                                       options="'1*', '2'", default_value="1", category="Basic"))
         # exposure: frames per second / frame count / exposure time stay consistent
         self._fps = min(float(default_fps), max_fps * 10)
-        self._frame_count = 1
+        # A 0.5 s exposure to begin with, not one frame: a DE frame is sparse by
+        # design (a pixel holds a few electrons), and an image is the sum of frames
+        # over the exposure. One frame per image reads as pure noise.
+        self._frame_count = max(1, int(round(DEFAULT_EXPOSURE_S * self._fps)))
 
         def set_fps(value):
             exposure = self._frame_count / self._fps

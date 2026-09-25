@@ -363,3 +363,17 @@ def test_specimen_pixel_size_includes_binning():
         c.disconnect()
     assert unbinned > 0
     assert binned == pytest.approx(2 * unbinned)
+
+
+def test_a_fresh_face_exposes_for_half_a_second():
+    """One frame per image reads as noise on a DE camera: a frame is sparse by design."""
+    from de_twin.faces import deapi_server as face_mod
+    from de_twin.twin import DigitalTwin
+
+    with TwinDeapiServer(DigitalTwin(camera="DESim"), port=0, pace=False) as srv:
+        c = deapi.Client()
+        c.usingMmf = False
+        c.connect(port=srv.port)
+        exposure = float(c["Exposure Time (seconds)"])
+        c.disconnect()
+    assert exposure == pytest.approx(face_mod.DEFAULT_EXPOSURE_S, rel=0.05)
