@@ -17,6 +17,7 @@ Caches
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
 from collections import OrderedDict
 from typing import Optional
@@ -102,8 +103,72 @@ class Renderer:
             self._fieldmaps.popitem(last=False)
         return fm, token
 
+    def _render_tem_panned(self, optics, time_s: float) -> np.ndarray:
+        """TEM imaging through a padded raster, cropped to the view.
+
+        The raster is rendered ``pan_margin`` of the field larger on every side and kept,
+        keyed by everything about the view EXCEPT where it is; a later view at the same
+        magnification, focus and so on whose centre is within the margin is a crop of it,
+        to the nearest raster pixel. The illumination disc and the upsampling are applied
+        after the crop — they are fixed on the detector, not the specimen.
+        """
+        from .tem import finish_tem, render_tem_raster
+
+        tq = self.config.time_quantum_s
+        tkey = round(time_s / tq) if (self._time_dependent() and tq > 0) else 0
+        gen = getattr(self.specimen, "generation", 0)
+        last = getattr(self, "_pan_out", None)
+        if last is not None and last[0] == optics and last[1] == (tkey, gen):
+            self.frames_from_cache += 1
+            return last[2]  # the same view again: every frame of an exposure
+        view = optics.view
+        base = dataclasses.replace(optics, view=dataclasses.replace(view, center_um=(0.0, 0.0)))
+        key = (base, self.config.tem_model, gen, tkey)
+        ny, nx = view.shape
+        img = self._crop_pan(key, view)
+        if img is None:
+            m = self.config.pan_margin
+            py, px = ny + 2 * int(round(m * ny)), nx + 2 * int(round(m * nx))
+            pview = dataclasses.replace(view, shape=(py, px))
+            d = max(1, optics.raster_downsample)
+            poptics = dataclasses.replace(optics, view=pview, output_shape=(py * d, px * d))
+            fm, token = self.field_map(poptics, TEM_LAYERS, time_s)
+            raster = render_tem_raster(fm, poptics, self.grains, self.crystallinity, self.config,
+                                       self.seed, self._tem_cache, token)
+            self.rasters_built += 0  # counted by field_map
+            self._pan = (key, view.center_um, raster)
+            img = self._crop_pan(key, view)
+        else:
+            self.frames_from_cache += 1
+        out = finish_tem(img, optics, self.config)
+        out.flags.writeable = False  # shared by every frame of an exposure; see render()
+        self._pan_out = (optics, (tkey, gen), out)
+        return out
+
+    def _crop_pan(self, key, view):
+        pan = getattr(self, "_pan", None)
+        if pan is None or pan[0] != key:
+            return None
+        _, (cx0, cy0), raster = pan
+        ny, nx = view.shape
+        py, px = raster.shape
+        pu = view.pixel_um
+        # ViewWindow pixel (row, col) centres sit at centre + ((i + 0.5) - n / 2) * pixel,
+        # divided by the tilt foreshortening along each axis.
+        sx = -1.0 if getattr(view, "flip_x", False) else 1.0
+        sy = -1.0 if getattr(view, "flip_y", False) else 1.0
+        dc = sx * (view.center_um[0] - cx0) * max(view.cos_beta, 0.1) / pu
+        dr = sy * (view.center_um[1] - cy0) * max(view.cos_alpha, 0.1) / pu
+        c0 = int(round((px - nx) / 2 + dc))
+        r0 = int(round((py - ny) / 2 + dr))
+        if r0 < 0 or c0 < 0 or r0 + ny > py or c0 + nx > px:
+            return None
+        return raster[r0:r0 + ny, c0:c0 + nx]
+
     def invalidate(self) -> None:
         """Drop every cached raster, frame and pattern (e.g. after the specimen changed)."""
+        self._pan = None
+        self._pan_out = None
         self._fieldmaps.clear()
         self._tem_cache = TransferCache()
         self._frame = None
@@ -124,6 +189,9 @@ class Renderer:
         if optics.beam_blanked:
             return np.zeros((h, w), np.float32)
         mode = optics.render_mode
+        if mode == RenderMode.TEM_IMAGING and self.config.pan_margin > 0 \
+                and optics.view.rotation_rad == 0.0:
+            return self._render_tem_panned(optics, time_s)
         if mode == RenderMode.TEM_IMAGING:
             fm, token = self.field_map(optics, TEM_LAYERS, time_s)
             fkey = (token, optics, self.config.tem_model)

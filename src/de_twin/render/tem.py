@@ -524,10 +524,22 @@ def render_physical(fm, optics, grains, crystallinity, cfg, seed: int, cache: Tr
 def render_tem(fm, optics, grains, crystallinity, cfg, seed: int, cache: TransferCache,
                fm_token) -> np.ndarray:
     """float32 electrons / detector pixel / s at ``optics.output_shape``."""
+    return finish_tem(render_tem_raster(fm, optics, grains, crystallinity, cfg, seed, cache,
+                                        fm_token), optics, cfg)
+
+
+def render_tem_raster(fm, optics, grains, crystallinity, cfg, seed: int, cache: TransferCache,
+                      fm_token) -> np.ndarray:
+    """The specimen's image in RASTER space, before the illumination disc and upsampling —
+    what moves rigidly with the stage (see `Renderer` panning)."""
     if cfg.tem_model == "legacy":
-        img = render_legacy(fm, optics, grains, crystallinity, cfg)
-    else:
-        img = render_physical(fm, optics, grains, crystallinity, cfg, seed, cache, fm_token)
+        return render_legacy(fm, optics, grains, crystallinity, cfg)
+    return render_physical(fm, optics, grains, crystallinity, cfg, seed, cache, fm_token)
+
+
+def finish_tem(img, optics, cfg) -> np.ndarray:
+    """The illumination disc (fixed on the detector, not the specimen) and the upsampling
+    to ``optics.output_shape``."""
     view = optics.view
     if cfg.illumination_profile and optics.illuminated_diameter_um > 0:
         ny, nx = view.shape
