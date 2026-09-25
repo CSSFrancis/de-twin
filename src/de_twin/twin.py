@@ -136,10 +136,19 @@ class DigitalTwin:
         # position that puts it on axis is not the point itself.
         x, y = stage_for_view_center(self.specimen.home_um(), self.column.state(), self.optics_config)
         self.column.move_stage(x=x, y=y)
-        self.column.set_defocus_um(float(opts.start_defocus_um))
+        self.column.set_defocus_um(self._start_defocus_um(opts))
         target = float(opts.start_dose_e_per_px_s) or self.safe_dose_e_per_px_s()
         if target > 0:
             self.column.set("Intensity", self._intensity_for_dose(target))
+
+    def _start_defocus_um(self, opts) -> float:
+        """The preset's start defocus; for unstained proteins in ice with none set,
+        1.5 um underfocus — a phase object shows almost nothing in focus, and that is
+        how cryo is imaged."""
+        df = float(opts.start_defocus_um)
+        if df == 0.0 and getattr(self.specimen.config, "preparation", "") == "proteins"                 and float(getattr(opts, "negative_stain_fraction", 0.0)) < 0.5:
+            return -1.5
+        return df
 
     def safe_dose_e_per_px_s(self, fps: float = 40.0) -> float:
         """A dose rate the detector takes without saturating a frame at *fps*.

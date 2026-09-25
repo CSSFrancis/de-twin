@@ -194,7 +194,7 @@ def bucket_patterns(mats, gids, t_nm, cryst, grains, optics,
             direct[sel] = 1.0 - halo[sel]
             has = (gids[sel] >= 0) & (gids[sel] < n_grains)
             lib = library_for(int(mid), options.max_g_inv_nm)
-            if has.any():
+            if has.any() and lib is not None:  # an amorphous material scatters no Bragg beams
                 own = sel[has]
                 owner, gx, gy, inten, total = _excite_buckets(lib, grains, gids[own], t_nm[own], optics)
                 bragg = cryst[own] * bragg_fraction(total)

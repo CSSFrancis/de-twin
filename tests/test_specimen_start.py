@@ -69,3 +69,24 @@ def test_the_start_can_be_skipped():
                      start_on_specimen=False)
     st = tw.column.state()
     assert (st.stage.x_um, st.stage.y_um) == (0.0, 0.0)
+
+
+@pytest.mark.parametrize("name", sorted(options.PATTERNS))
+def test_every_pattern_starts_over_specimen_too(name):
+    """The generic patterns (the picker lists them beside the presets) start the same way;
+    unstained proteins underfocus."""
+    tw = DigitalTwin(name, camera="DESim", clock=ManualClock(), seed=3)
+    assert tw.flux(tw.request()).mean() > 1.0
+    subtle = any(k in name for k in ("Proteins", "FIB", "Waffle", "PNJunction", "Strain"))
+    assert _repeat_corr(tw) > (0.15 if subtle else 0.45)
+
+
+def test_a_lamella_of_an_amorphous_material_renders_in_both_projections():
+    """The FIB-liftout pattern's "auto" post can be amorphous: no crystal library, so no
+    Bragg beams — it used to raise instead."""
+    from de_twin.state import Projection
+
+    tw = DigitalTwin("Virtual Specimen - FIB Liftout", camera="DESim", clock=ManualClock(), seed=3)
+    assert np.isfinite(tw.flux(tw.request())).all()
+    tw.column.set_projection(Projection.DIFFRACTION)
+    assert np.isfinite(tw.flux(tw.request())).all()
