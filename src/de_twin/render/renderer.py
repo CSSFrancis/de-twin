@@ -129,11 +129,15 @@ class Renderer:
             fkey = (token, optics, self.config.tem_model)
             if self._frame is not None and self._frame[0] == fkey:
                 self.frames_from_cache += 1
-                return self._frame[1].copy()
+                return self._frame[1]
             img = render_tem(fm, optics, self.grains, self.crystallinity, self.config, self.seed,
                              self._tem_cache, token)
+            # Shared, not copied: every frame of an exposure is the SAME array (a 4096² copy
+            # per frame was 20 ms, and it defeated the detector's per-exposure cache).
+            # Read-only, so a caller that would scribble on the cache fails loudly instead.
+            img.flags.writeable = False
             self._frame = (fkey, img)
-            return img.copy()
+            return img
         if mode == RenderMode.TEM_DIFFRACTION:
             fm, token = self.field_map(optics, SAED_LAYERS, time_s)
             return self._saed.render(fm, token, optics, self.grains, self.crystallinity)
