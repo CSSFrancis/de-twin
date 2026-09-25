@@ -53,3 +53,29 @@ def test_new_request_preempts_live_stream(served):
     frame, info = consumer.read(timeout=10)
     assert info["request_id"] == rid and info["frame_index"] == 0
     assert frame.shape == (512, 512)
+
+
+def test_the_face_warms_the_twin_up_before_serving():
+    """DE-Server gives up on an acquisition about a second after its first frame is due, far
+    less than a fresh twin's first render: the face renders one frame before it attaches."""
+    twin = DigitalTwin("Dense Au on holey C", camera="DESim", clock=ManualClock())
+    rendered = []
+    frames = twin.frames
+    twin.frames = lambda *a, **k: (rendered.append(1), frames(*a, **k))[1]
+    name = f"DE_ExternalFramesWarm_{os.getpid()}_{uuid.uuid4().hex[:6]}"
+    face = ShmFace(twin, name=name, pace=False).start()  # no mapping yet: nothing to serve
+    try:
+        assert face.ready.wait(60)
+        assert rendered == [1] and face.producer is None
+    finally:
+        face.stop()
+
+
+def test_warm_up_can_be_skipped():
+    twin = DigitalTwin("Dense Au on holey C", camera="DESim", clock=ManualClock())
+    twin.frames = lambda *a, **k: pytest.fail("rendered without a request")
+    face = ShmFace(twin, name=f"DE_ExternalFramesCold_{uuid.uuid4().hex[:6]}", pace=False, warm_up=False).start()
+    try:
+        assert face.ready.wait(5)
+    finally:
+        face.stop()

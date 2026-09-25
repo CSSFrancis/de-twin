@@ -20,10 +20,20 @@ log = logging.getLogger(__name__)
 
 
 class ShmFace:
-    def __init__(self, twin, name: str = L.DEFAULT_NAME, pace: bool = True):
+    """Serve DE-Server's requests from ``twin``.
+
+    ``warm_up`` renders one frame before attaching: a fresh twin spends seconds on its
+    first frame (imports, GPU start-up, building the specimen), while DE-Server waits about
+    one frame time plus a second before it gives up on the acquisition. ``ready`` is set
+    once the face is warm and serving.
+    """
+
+    def __init__(self, twin, name: str = L.DEFAULT_NAME, pace: bool = True, warm_up: bool = True):
         self.twin = twin
         self.name = name
         self.pace = pace
+        self.warm_up = warm_up
+        self.ready = threading.Event()
         self.producer = None
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -59,7 +69,17 @@ class ShmFace:
         except FileNotFoundError:
             return False
 
+    def _warm_up(self) -> None:
+        try:
+            req = self.twin.request(frame_time_s=0.01, total_frames=1)
+            next(iter(self.twin.frames(req)))
+        except Exception:  # a failed warm-up only costs the first request its speed
+            log.exception("warm-up render failed")
+
     def _run(self) -> None:
+        if self.warm_up:
+            self._warm_up()
+        self.ready.set()
         pending = None
         while not self._stop.is_set():
             if self.producer is None:
