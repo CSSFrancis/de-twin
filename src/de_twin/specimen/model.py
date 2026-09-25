@@ -100,6 +100,37 @@ class Specimen:
         self.scene = Scene(self.config, self.options)
         self.grains: GrainTable = _grain_table(int(self.config.seed) & 0xFFFFFFFF, *grain_textures(self.scene))
 
+    # -- where to start looking ------------------------------------------------------------------
+    def home_um(self) -> tuple[float, float]:
+        """Stage position (µm) a twin starts at: somewhere there is specimen to see.
+
+        The stage origin is often not: on a waffle grid it is a bar, on a heating chip the
+        frame, on a sparse grid a bare patch of film. So: the placement area (grid square,
+        well, lamella, chip window) nearest the origin whose film is intact where the holder
+        has a film, and inside it the largest particle cluster when the preparation clusters,
+        else the area's centre.
+        """
+        scene = self.scene
+        areas = list(scene.holder.areas)
+        if not areas:
+            return (0.0, 0.0)
+        filmed = self.config.holder in ("mesh_grid", "waffle_grid") and scene.film not in ("none",)
+
+        def usable(a) -> bool:
+            return (a.film_covered and not a.film_broken) if filmed else True
+
+        ordered = sorted(areas, key=lambda a: math.hypot(a.center[0], a.center[1]))
+        area = next((a for a in ordered if usable(a)), ordered[0])
+        try:
+            clusters = list(scene._clusters(area, resident_ok=False))
+        except Exception:  # noqa: BLE001 - a preparation without clusters
+            clusters = []
+        if clusters:
+            best = max(clusters, key=lambda c: (c.count, -math.hypot(c.center[0] - area.center[0],
+                                                                     c.center[1] - area.center[1])))
+            return (float(best.center[0]), float(best.center[1]))
+        return (float(area.center[0]), float(area.center[1]))
+
     # -- options --------------------------------------------------------------------------------
     def set_options(self, **kw) -> None:
         """Change options live. World-changing options regenerate the scene (and reset the
