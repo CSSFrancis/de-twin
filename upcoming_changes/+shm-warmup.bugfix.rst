@@ -1,0 +1,1 @@
+The shared-memory face renders one frame to warm the twin up before it attaches, so DE-Server's first acquisition no longer times out while a fresh twin starts (about 15 s on first use); ``ShmFace.ready`` is set once it is serving.
