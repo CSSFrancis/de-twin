@@ -1,0 +1,1 @@
+Pinned acquisitions: ``AcquisitionRequest(seed=...)`` (and ``snap(seed=...)``) seeds frame *i* of an acquisition by ``(seed, i)`` whatever the twin exposed before; ``DigitalTwin.reset_serial()`` restarts the running frame count.

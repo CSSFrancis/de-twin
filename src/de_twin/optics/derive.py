@@ -32,10 +32,11 @@ from .aberrations import Aberrations, uncorrected
 from .physics import electron_wavelength_nm, focal_spread_nm
 from .state import OpticsState
 
-#: The largest raster a TEM image is rendered at; a bigger camera frame is upsampled from
-#: it. 1024² keeps a re-render (every stage move and focus step) well under a second on a
-#: 4096² camera, at the cost of detail finer than a quarter of its pixels, which the
-#: detector's own charge spreading and the dose already blur.
+#: The default of `OpticsConfig.max_raster_pixels`: the largest raster a TEM image is
+#: rendered at; a bigger camera frame is upsampled from it. 1024² keeps a re-render (every
+#: stage move and focus step) well under a second on a 4096² camera, at the cost of detail
+#: finer than a quarter of its pixels. ``OpticsConfig(max_raster_pixels=0)`` renders at
+#: the frame's own sampling.
 MAX_RASTER_PIXELS = 1024 * 1024
 MIN_RASTER_SIDE = 32
 SAED_RASTER_SIDE = 256
@@ -171,7 +172,8 @@ def derive_optics(state: MicroscopeState, request: AcquisitionRequest, camera,
         raster_nm = max(1e-6, d_sa_um) * 1000.0 / SAED_RASTER_SIDE
     else:
         d = 1
-        while (ow * oh) / float(d * d) > MAX_RASTER_PIXELS:
+        cap = int(getattr(cfg, "max_raster_pixels", MAX_RASTER_PIXELS))
+        while cap > 0 and (ow * oh) / float(d * d) > cap:
             d *= 2
         downsample = d
         rx = max(MIN_RASTER_SIDE, ow // d)

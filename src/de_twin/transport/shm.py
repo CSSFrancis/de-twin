@@ -154,7 +154,9 @@ class FrameProducer(_Mapping):
         s = self.slot(n)
         s.frame_number = 0  # not ready while being written
         off = self.payload(n)
-        self.mm[off:off + frame.nbytes] = frame.tobytes()
+        dst = np.frombuffer(self.mm, np.uint8, frame.nbytes, off)
+        np.copyto(dst, frame.reshape(-1).view(np.uint8))  # one copy, no bytes object
+        del dst  # a live view would keep the mapping from closing
         s.request_id = request_id
         s.frame_index = frame_index
         s.height, s.width = frame.shape
@@ -227,8 +229,10 @@ class FrameConsumer(_Mapping):
         h.request_id = self.request_id
         return self.request_id
 
-    def read(self, timeout: float = 1.0) -> tuple[np.ndarray, dict]:
-        """The next frame of the current request, as ``(pixels, slot header)``."""
+    def read(self, timeout: float = 1.0, out: Optional[np.ndarray] = None) -> tuple[np.ndarray, dict]:
+        """The next frame of the current request, as ``(pixels, slot header)``. With *out*
+        (of the frame's size and dtype) the pixels are copied into it, as DE-Server copies
+        into its own buffers, instead of into a new array."""
         deadline = time.monotonic() + timeout
         h = self.hdr
         while True:
@@ -241,8 +245,13 @@ class FrameConsumer(_Mapping):
                     count = info["width"] * info["height"]
                     off = self.payload(n)
                     dtype = _dtype(info["bytes_per_pixel"])
-                    px = np.frombuffer(self.mm, dtype=dtype, count=count, offset=off).copy()
-                    px = px.reshape(info["height"], info["width"])
+                    src = np.frombuffer(self.mm, dtype=dtype, count=count, offset=off)
+                    if out is not None and out.size == count and out.dtype == dtype:
+                        np.copyto(out.reshape(-1), src)
+                        px = out.reshape(info["height"], info["width"])
+                    else:
+                        px = src.copy().reshape(info["height"], info["width"])
+                    del src
                 h.read_count = n + 1
                 if current:
                     return px, info

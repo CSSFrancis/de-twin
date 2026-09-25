@@ -29,6 +29,12 @@ class OpticsConfig:
     flip_x: bool = False
     flip_y: bool = False
     render_mode_override: Optional[RenderMode] = None  # None = Auto
+    #: The largest raster a TEM image is rendered at (pixels); a bigger frame is upsampled
+    #: from it (`OpticsState.raster_downsample` says by how much). 0 renders at the
+    #: frame's own sampling: what a CTF or MTF measurement needs, since an upsampled frame
+    #: carries its contrast transfer only up to the raster's Nyquist. The default keeps a
+    #: re-render (every stage move and focus step) well under a second on a 4096² camera.
+    max_raster_pixels: int = 1024 * 1024
 
     # ---- illumination (C++: Illumination Semi-Angle TEM, SA Aperture, TEM Illuminated Area)
     # 0 = derive from the beam spread (brightness conservation, see beam.py);

@@ -337,3 +337,14 @@ def test_track_live_view():
     o2 = track_live_view(o, s)
     assert o2.view.center_um == pytest.approx((-0.5, 0.0))
     assert o2.view.shape == o.view.shape
+
+
+def test_max_raster_pixels_zero_renders_at_the_frame_sampling():
+    capped = _derive(_state(magnification=20000))
+    assert capped.raster_downsample == 4 and "upsampled 4x" in capped.resolution_warning
+    native = _derive(_state(magnification=20000), cfg=OpticsConfig(max_raster_pixels=0))
+    assert native.raster_downsample == 1 and native.view.shape == (4096, 4096)
+    assert native.resolution_warning == ""
+    assert native.view.pixel_um == pytest.approx(0.325e-3)
+    mid = _derive(_state(magnification=20000), cfg=OpticsConfig(max_raster_pixels=2048 * 2048))
+    assert mid.raster_downsample == 2

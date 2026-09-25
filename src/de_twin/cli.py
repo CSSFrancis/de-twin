@@ -86,7 +86,7 @@ def cmd_serve(args) -> int:
     if args.shm is not None:
         from .faces.shm_face import ShmFace
 
-        face = ShmFace(twin, name=args.shm).start()
+        face = ShmFace(twin, name=args.shm, reuse=args.reuse, threads=args.threads).start()
         stoppers.append(face.stop)
         print(f"shared-memory frame source '{args.shm}' ({twin.detector.model.name})")
     if args.deapi:
@@ -172,6 +172,12 @@ def main(argv=None) -> int:
                    help="serve a deapi-compatible fake DE-Server (default port 13240)")
     p.add_argument("--shm", nargs="?", const="DE_ExternalFrames", default=None, metavar="NAME",
                    help="publish frames into the shared-memory ring for DE-Server")
+    p.add_argument("--reuse", type=int, default=1, metavar="N",
+                   help="shared memory: publish each rendered frame up to N times, so the stream "
+                        "keeps up with fast frame rates (a real camera's GB/s); 1 = every frame unique")
+    p.add_argument("--threads", type=int, default=None, metavar="N",
+                   help="shared memory: cores the detector physics may use (leave the rest for "
+                        "DE-Server's processing)")
     p.set_defaults(func=cmd_serve)
 
     p = sub.add_parser("snap", help="render one frame to a file")

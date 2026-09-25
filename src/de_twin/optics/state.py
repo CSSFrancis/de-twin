@@ -97,6 +97,18 @@ class OpticsState:
 
     extras: dict = field(default_factory=dict, compare=False, hash=False)
 
+    @property
+    def resolution_warning(self) -> str:
+        """Why a TEM frame does not carry detail at its own pixel size ("" when it does):
+        it is upsampled from a coarser raster (`OpticsConfig.max_raster_pixels`), so its
+        contrast transfer stops at the raster's Nyquist, not the frame's."""
+        d = int(self.raster_downsample)
+        if d <= 1:
+            return ""
+        return (f"TEM frame upsampled {d}x from a {self.view.shape[1]}x{self.view.shape[0]} raster: "
+                f"no detail finer than {2 * d} frame pixels; OpticsConfig(max_raster_pixels=0) "
+                f"renders at the frame's sampling")
+
 
 def image_aberrations_of(optics: OpticsState) -> Aberrations:
     """TEM objective aberrations incl. focus and stigmation (fallback for hand-built optics)."""

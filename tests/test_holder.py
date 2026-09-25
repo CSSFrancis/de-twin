@@ -246,3 +246,32 @@ def _autopilot_on_path() -> bool:
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+def test_a_hanging_impulsepy_import_times_out(monkeypatch):
+    """impulsePy connects to Impulse at import and blocks for good when it is not running."""
+    import threading
+
+    from de_twin.holder import impulse as imp
+
+    release = threading.Event()
+
+    class Hang:
+        def find_spec(self, name, path=None, target=None):
+            if name == "impulsePy":
+                release.wait(10)
+            return None
+
+    finder = Hang()
+    monkeypatch.setattr(sys, "meta_path", [finder] + sys.meta_path)
+    monkeypatch.delitem(sys.modules, "impulsePy", raising=False)
+    monkeypatch.setattr(imp, "_IMPORT", {})
+    try:
+        with pytest.raises(TimeoutError):
+            imp.import_impulse(timeout_s=0.2)
+        with pytest.raises(TimeoutError):  # still stuck: fails at once
+            imp.import_impulse(timeout_s=5)
+        holder = connect_holder("impulse")
+        assert not getattr(holder, "real", False) and "did not answer" in holder.reason
+    finally:
+        release.set()

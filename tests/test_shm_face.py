@@ -108,3 +108,67 @@ def test_a_slow_render_does_not_starve_the_consumer(served, monkeypatch):
         t = now
     assert max(gaps[1:]) < 0.5, gaps
     assert face.keepalives >= 3
+
+
+def _served_with(**kw):
+    name = f"DE_ExternalFramesPool_{os.getpid()}_{uuid.uuid4().hex[:6]}"
+    twin = DigitalTwin("Dense Au on holey C", camera="DESim", clock=ManualClock())
+    consumer = FrameConsumer(name, max_frame_bytes=1024 * 1024 * 2)
+    face = ShmFace(twin, name=name, pace=False, **kw).start()
+    return twin, face, consumer
+
+
+def test_recycling_publishes_faster_than_the_twin_renders(monkeypatch):
+    import time
+
+    twin, face, consumer = _served_with(reuse=4, pool_size=4)
+    real = twin.frames
+
+    def slow_frames(request, **kw):
+        for item in real(request, **kw):
+            time.sleep(0.05)  # the physics: 20 frames a second
+            yield item
+
+    monkeypatch.setattr(twin, "frames", slow_frames)
+    try:
+        consumer.begin(frame_shape=(1024, 1024), frame_time_s=0.001, total_frames=0)
+        buf = np.empty((1024, 1024), np.uint16)
+        consumer.read(timeout=10, out=buf)
+        t0, n = time.monotonic(), 0
+        while time.monotonic() - t0 < 1.0:
+            consumer.read(timeout=10, out=buf)
+            n += 1
+        assert n > 40, n  # more than twice the rendered rate
+        assert face.frames_reused > 0
+        rendered = face.frames_published - face.frames_reused
+        assert face.frames_reused <= 3 * rendered + 4 * face.pool_size  # at most `reuse` uses each
+    finally:
+        face.stop()
+        consumer.close()
+
+
+def test_a_view_change_drops_recycled_frames():
+    """A recycled frame never shows a view the column has left."""
+    from de_twin.faces.shm_face import _FramePool
+
+    twin = DigitalTwin("Dense Au on holey C", camera="DESim", clock=ManualClock())
+    pool = _FramePool(twin, twin.request(total_frames=0, frame_time_s=0.01), size=4, reuse=100,
+                      pace=False)
+    try:
+        (item, fresh) = pool.take(10)
+        x0 = item[1].microscope.stage.x_um
+        twin.column.move_stage(x=x0 + 1.0)
+        twin.column.state()  # the stage settles on the manual clock
+        import time
+
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            (item, fresh) = pool.take(10)
+            if item[1].microscope.stage.x_um != x0:
+                break
+        # from here on, only the new view comes back, fresh or recycled
+        for _ in range(20):
+            (item, _) = pool.take(10)
+            assert item[1].microscope.stage.x_um != x0
+    finally:
+        pool.close()
