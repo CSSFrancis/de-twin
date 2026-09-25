@@ -126,6 +126,18 @@ class Renderer:
         key = (base, self.config.tem_model, gen, tkey)
         ny, nx = view.shape
         img = self._crop_pan(key, view)
+        if img is None and self.config.interactive:
+            import time as _time
+
+            state = (optics, tkey, gen)
+            now = _time.monotonic()
+            last = getattr(self, "_last_req", None)
+            if last is None:
+                self._last_req, self._changed_at = state, -1e9  # first view: full
+            elif last != state:
+                self._last_req, self._changed_at = state, now
+            if now - self._changed_at < self.config.settle_s:
+                return self._render_preview(optics, time_s, tkey, gen)
         if img is None:
             m = self.config.pan_margin
             py, px = ny + 2 * int(round(m * ny)), nx + 2 * int(round(m * nx))
@@ -145,8 +157,45 @@ class Renderer:
         self._pan_out = (optics, (tkey, gen), out)
         return out
 
-    def _crop_pan(self, key, view):
-        pan = getattr(self, "_pan", None)
+    def _render_preview(self, optics, time_s: float, tkey, gen) -> np.ndarray:
+        """The view at up to ``preview_side``² — the frame shown while it is still
+        moving — with its own padded crop cache, so a drag between previews is a crop."""
+        from .tem import finish_tem, render_tem_raster
+
+        view = optics.view
+        ny, nx = view.shape
+        f = 1
+        while (ny // (2 * f)) * (nx // (2 * f)) >= self.config.preview_side ** 2                 and ny % (2 * f) == 0 and nx % (2 * f) == 0:
+            f *= 2
+        if f == 1:
+            self._changed_at = -1e9  # already small: the full render is the preview
+            return self._render_tem_panned(optics, time_s)
+        pview = dataclasses.replace(view, shape=(ny // f, nx // f), pixel_um=view.pixel_um * f)
+        poptics = dataclasses.replace(
+            optics, view=pview, raster_downsample=max(1, optics.raster_downsample) * f,
+            blur_sigma_px=optics.blur_sigma_px / f, fresnel_sigma_px=optics.fresnel_sigma_px / f)
+        pbase = dataclasses.replace(poptics, view=dataclasses.replace(pview, center_um=(0.0, 0.0)))
+        pkey = ("preview", pbase, self.config.tem_model, gen, tkey)
+        img = self._crop_pan(pkey, pview, "_pan_preview")
+        if img is None:
+            m = self.config.pan_margin
+            qy, qx = pview.shape
+            py, px = qy + 2 * int(round(m * qy)), qx + 2 * int(round(m * qx))
+            padded = dataclasses.replace(pview, shape=(py, px))
+            d = poptics.raster_downsample
+            pad_optics = dataclasses.replace(poptics, view=padded, output_shape=(py * d, px * d))
+            fm, token = self.field_map(pad_optics, TEM_LAYERS, time_s)
+            raster = render_tem_raster(fm, pad_optics, self.grains, self.crystallinity,
+                                       self.config, self.seed, self._tem_cache, token)
+            self._pan_preview = (pkey, pview.center_um, raster)
+            img = self._crop_pan(pkey, pview, "_pan_preview")
+        self.previews_rendered = getattr(self, "previews_rendered", 0) + 1
+        out = finish_tem(img, poptics, self.config)
+        out.flags.writeable = False
+        return out
+
+    def _crop_pan(self, key, view, slot: str = "_pan"):
+        pan = getattr(self, slot, None)
         if pan is None or pan[0] != key:
             return None
         _, (cx0, cy0), raster = pan
@@ -169,6 +218,8 @@ class Renderer:
         """Drop every cached raster, frame and pattern (e.g. after the specimen changed)."""
         self._pan = None
         self._pan_out = None
+        self._pan_preview = None
+        self._last_req = None
         self._fieldmaps.clear()
         self._tem_cache = TransferCache()
         self._frame = None

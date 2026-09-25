@@ -66,3 +66,34 @@ def test_an_exposure_renders_once_on_a_running_clock():
     before = tw.renderer.frames_from_cache
     list(tw.frames(req))
     assert tw.renderer.frames_from_cache - before >= 9
+
+
+def test_interactive_previews_while_moving_and_renders_in_full_once_settled():
+    tw = DigitalTwin("Dense Au on holey C", camera="DESim", clock=ManualClock(), seed=3,
+                     render_config=RenderConfig(interactive=True, settle_s=0.05))
+    ref = DigitalTwin("Dense Au on holey C", camera="DESim", clock=ManualClock(), seed=3)
+    req = tw.request()
+    tw.flux(req)
+    assert getattr(tw.renderer, "previews_rendered", 0) == 0, "the first view is in full"
+    px = tw.optics(req).specimen_pixel_nm / 1000.0
+    _move((tw, ref), 3000 * px)  # beyond the margin: not a crop
+    moving = tw.flux(req)
+    assert tw.renderer.previews_rendered == 1
+    full = ref.flux(req)
+    assert moving.shape == full.shape
+    assert moving.mean() == pytest.approx(full.mean(), rel=0.05)
+    import time
+    time.sleep(0.06)
+    settled = tw.flux(req)
+    assert tw.renderer.previews_rendered == 1, "settled: the full render, not a preview"
+    np.testing.assert_allclose(settled, full, rtol=1e-5, atol=1e-6)
+
+
+def test_interactive_is_off_by_default():
+    tw, _ = _pair()
+    req = tw.request()
+    tw.flux(req)
+    px = tw.optics(req).specimen_pixel_nm / 1000.0
+    _move((tw,), 3000 * px)
+    tw.flux(req)
+    assert getattr(tw.renderer, "previews_rendered", 0) == 0
