@@ -262,6 +262,11 @@ def radius_map(shape: tuple[int, int], cx: float, cy: float) -> np.ndarray:
     return r
 
 
+#: Disks at least this large are drawn over the detector only (`disks.draw_disks`) rather
+#: than stamped: a STEM probe's disks can outgrow the detector.
+DRAW_DISKS_ABOVE_PX = 24.0
+
+
 def stamp_disks(out: np.ndarray, x, y, w, radius: float, sigma: float) -> None:
     """Add soft disks (uniform disk ~convolved with a Gaussian PSF), each integrating to its
     weight over the infinite plane (what falls off the detector is lost). Vectorised."""
@@ -271,6 +276,12 @@ def stamp_disks(out: np.ndarray, x, y, w, radius: float, sigma: float) -> None:
     x, y, w = (np.asarray(v, np.float64) for v in (x, y, w))
     on = (w != 0) & (x + half > 0) & (y + half > 0) & (x - half < wd) & (y - half < h)
     x, y, w = x[on], y[on], w[on]
+    if radius >= DRAW_DISKS_ABOVE_PX and radius >= sigma:
+        from . import disks
+
+        if disks.AVAILABLE:
+            disks.draw_disks(out, x, y, w, radius, sigma)
+            return
     step = max(1, (1 << 22) // (n * n))
     ar = np.arange(n)
     for c0 in range(0, len(x), step):
