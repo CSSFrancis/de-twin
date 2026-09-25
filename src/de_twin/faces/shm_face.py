@@ -9,6 +9,7 @@ frame time and throttled by DE-Server's reads.
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 from typing import Optional
 
@@ -17,6 +18,13 @@ import numpy as np
 from ..transport import shm_layout as L
 
 log = logging.getLogger(__name__)
+
+#: DE-Server gives up on the producer when a frame is ~1 s late (GrabberSim: two frame
+#: times + 1000 ms) and stops the acquisition. A render can take longer than that — the
+#: first view of a new magnification, the full render after a drag — so when no new
+#: frame is ready after this long, the last one is published again.
+KEEPALIVE_S = 0.5
+_DONE = object()
 
 
 class ShmFace:
@@ -38,6 +46,7 @@ class ShmFace:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.frames_published = 0
+        self.keepalives = 0
         self.requests_served = 0
 
     def start(self) -> "ShmFace":
@@ -97,23 +106,68 @@ class ShmFace:
                 log.exception("failed serving request %d", got[0])
 
     def _serve(self, request_id: int, request):
-        """Publish frames for one request; returns a newer request if one pre-empts it."""
+        """Publish frames for one request; returns a newer request if one pre-empts it.
+
+        The twin renders on a thread of its own, so a slow render does not starve
+        DE-Server: while it runs, the last frame is republished every `KEEPALIVE_S`.
+        """
         p = self.producer
         h = p.hdr
         shape = (h.frame_height, h.frame_width)
         dtype = np.uint8 if h.bytes_per_pixel == 1 else np.uint16
         stop = threading.Event()
-        for raw, meta in self.twin.frames(request, pace=self.pace, stop=stop):
-            while not p.wait_slot_free(timeout=0.05):
+        frames: "queue.Queue" = queue.Queue(maxsize=2)
+
+        def put(item) -> bool:
+            while not stop.is_set():
+                try:
+                    frames.put(item, timeout=0.05)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def render() -> None:
+            try:
+                for item in self.twin.frames(request, pace=self.pace, stop=stop):
+                    if not put(item):
+                        return
+            except Exception as e:  # noqa: BLE001 - raised on the serving thread
+                put(e)
+                return
+            put(_DONE)
+
+        worker = threading.Thread(target=render, name="de-twin-shm-render", daemon=True)
+        worker.start()
+        last = None
+        try:
+            while True:
+                try:
+                    item = frames.get(timeout=KEEPALIVE_S)
+                except queue.Empty:
+                    if self._stop.is_set() or p.request_changed(request_id):
+                        return p.poll_request()
+                    if last is None:
+                        continue
+                    item = last
+                    self.keepalives += 1
+                if item is _DONE:
+                    return None
+                if isinstance(item, BaseException):
+                    raise item
+                raw, meta = item
+                while not p.wait_slot_free(timeout=0.05):
+                    if self._stop.is_set() or p.request_changed(request_id):
+                        return p.poll_request()
+                p.publish(_fit(raw, shape, dtype), request_id=request_id,
+                          frame_index=meta.frame_index,
+                          flags=L.FLAG_BLANKED if meta.blanked else 0)
+                self.frames_published += 1
+                last = item
                 if self._stop.is_set() or p.request_changed(request_id):
                     return p.poll_request()
-            p.publish(_fit(raw, shape, dtype), request_id=request_id, frame_index=meta.frame_index,
-                      flags=L.FLAG_BLANKED if meta.blanked else 0)
-            self.frames_published += 1
-            if self._stop.is_set() or p.request_changed(request_id):
-                return p.poll_request()
-        return None
-
+        finally:
+            stop.set()  # the renderer stops at its next frame; the twin's lock orders them
 
 def _fit(frame: np.ndarray, shape: tuple[int, int], dtype) -> np.ndarray:
     """Crop or zero-pad to exactly the hw_frame DE-Server asked for."""
