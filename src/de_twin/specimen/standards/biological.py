@@ -91,9 +91,10 @@ class CatalaseStructure(StandardStructure):
                         un = u[inside] * NM_PER_UM + pu
                         vn = v[inside] * NM_PER_UM + pv
                         # protein density: molecules on the lattice; stain fills around them
-                        # the 8.75 nm planes dominate (Ted Pella's image: fringes mostly one way)
-                        prot = (0.75 * 0.5 * (1 + np.cos(2 * math.pi * un / self.a))
-                                + 0.25 * 0.5 * (1 + np.cos(2 * math.pi * vn / self.b)))
+                        # both plane sets, the 8.75 nm a little stronger (Ted Pella's image:
+                        # fringe amplitudes 2.8 % and 2.4 %, at right angles)
+                        prot = (0.55 * 0.5 * (1 + np.cos(2 * math.pi * un / self.a))
+                                + 0.45 * 0.5 * (1 + np.cos(2 * math.pi * vn / self.b)))
                         # the stain penetrates unevenly: the lattice fades in and out
                         depth = 0.55 + 0.45 * fbm(seed ^ 0xE3, lx[inside], ly[inside], 0.12, 2)
                         t += self.lattice * np.clip(depth, 0.1, 1.0) * (1.0 - prot)

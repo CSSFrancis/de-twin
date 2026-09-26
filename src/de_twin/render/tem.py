@@ -74,6 +74,7 @@ class BraggContrast:
     # typical thickness ``t_typ[gid]``, scaled by t / t_typ
     phase_grating: bool = False
     t_typ: dict = None
+    kinematic: bool = False  # fringe amplitudes are kinematic (a phase grating scaled by t / t_typ)
 
 
 def bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max: float = 0.0) -> BraggContrast:
@@ -149,16 +150,22 @@ def bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max: float
                 k = np.flatnonzero(ok & (ex.owner == j))
                 f = ex.intensity[k, typical[gi]] * frac[j, typical[gi]]
                 waves: list = []
+                kin = cfg.lattice_fringe_model == "kinematic"
                 for i, fi in zip(k[np.argsort(-f)], np.sort(f)[::-1]):
                     if len(waves) == MAX_FRINGE_BEAMS:
                         break
                     if not any(abs(ex.gx[i] + wx) < 1e-6 and abs(ex.gy[i] + wy) < 1e-6 for wx, wy, _ in waves):
-                        waves.append((ex.gx[i], ex.gy[i], min(1.0, math.sqrt(fi / FRINGE_BEAM_FRACTION)) * cr[gi]))
+                        # the Friedel pair (g, -g) carries 2 f: a phase grating 2 sqrt(f) cos(g r)
+                        a = (cfg.lattice_fringe_efficiency * math.sqrt(2.0 * 2.0 * fi) if kin
+                             else min(1.0, math.sqrt(fi / FRINGE_BEAM_FRACTION)))
+                        waves.append((ex.gx[i], ex.gy[i], a * cr[gi]))
                 if waves:
                     w = np.array(waves)
                     fringes[int(g_u[gi])] = (2 * math.pi * w[:, 0], 2 * math.pi * w[:, 1], w[:, 2])
+                    t_typ[int(g_u[gi])] = max(float(tb_u[typical[gi]]) * THICKNESS_BIN_NM, THICKNESS_BIN_NM)
     loss[rows, cols] = (cfg.diffraction_contrast_scale * table[g_inv, t_inv]).astype(np.float32)
-    return BraggContrast(loss, gid, fringes, coherent, t_typ)
+    kinematic = coherent or (cfg.lattice_fringes and cfg.lattice_fringe_model == "kinematic")
+    return BraggContrast(loss, gid, fringes, coherent, t_typ, kinematic)
 
 
 def amplitude_rows(fm, optics, r0, r1, loss) -> tuple:
@@ -188,7 +195,7 @@ def lattice_field(fm, optics, bc: BraggContrast, t, gold_only: bool = False):
     g = bc.gid[rows, cols]
     acc = np.zeros(len(rows))
     raw = np.zeros(len(rows))
-    grating = bool(getattr(bc, "phase_grating", False))
+    grating = bool(getattr(bc, "phase_grating", False) or getattr(bc, "kinematic", False))
     weight = np.zeros(len(rows)) if grating else np.minimum(1.0, t[rows, cols] / 10.0)
     for gg in gids:
         sel = g == gg
@@ -510,11 +517,11 @@ def transmission_function(fm, optics, grains, crystallinity, cfg, seed: int, *,
         phi_d = diffuse_phase(fm, optics, cfg, seed, weights, coherent_k_max)
         if phi_d is not None:
             psi *= np.exp(1j * phi_d).astype(np.complex64)
-    if bc.phase_grating or (cfg.lattice_fringes and cfg.lattice_phase_rad > 0):
+    if bc.phase_grating or bc.kinematic or (cfg.lattice_fringes and cfg.lattice_phase_rad > 0):
         lat = lattice_field(fm, optics, bc, t_full)
         if lat is not None:
             (rows, cols), val, _ = lat
-            scale = 1.0 if bc.phase_grating else cfg.lattice_phase_rad
+            scale = 1.0 if (bc.phase_grating or bc.kinematic) else cfg.lattice_phase_rad
             psi[rows, cols] *= np.exp(1j * np.float32(scale) * val).astype(np.complex64)
     return (psi, bc) if return_contrast else psi
 
@@ -533,7 +540,7 @@ def render_physical(fm, optics, grains, crystallinity, cfg, seed: int, cache: Tr
             optics.beta_rad, optics.objective_aperture_mrad, optics.convergence_mrad, cfg.max_g_inv_nm,
             cfg.diffraction_contrast_scale, cfg.mip_phase, cfg.edge_taper_nm, cfg.refraction_loss, cfg.phase_texture_scale,
             cfg.texture_bandlimit_nm, cfg.amplitude_contrast, cfg.lattice_fringes,
-            cfg.lattice_phase_rad, seed)
+            cfg.lattice_phase_rad, cfg.lattice_fringe_model, cfg.lattice_fringe_efficiency, seed)
     spec = cache.spectra.get(skey)
     if spec is None:
         psi = exit_wave(fm, optics, grains, crystallinity, cfg, seed)

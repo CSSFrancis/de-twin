@@ -472,7 +472,8 @@ class CoherentStem:
                 c.coherent_focal_samples, c.coherent_focal_spread, c.coherent_source_size, c.coherent_beam_tilt,
                 c.coherent_incoherent_scattering, c.diffuse_scattering, c.max_g_inv_nm, c.mip_phase,
                 c.edge_taper_nm, c.refraction_loss, c.phase_texture_scale, c.texture_bandlimit_nm,
-                c.amplitude_contrast, c.lattice_fringes, c.lattice_phase_rad, c.diffraction_contrast_scale,
+                c.amplitude_contrast, c.lattice_fringes, c.lattice_phase_rad, c.lattice_fringe_model, c.lattice_fringe_efficiency,
+                c.diffraction_contrast_scale,
                 c.add_descan, c.descan_ramp_scale, tuple(c.descan_ramp_px), c.film_halo,
                 c.coherent_object_bandwidth_inv_nm)
 

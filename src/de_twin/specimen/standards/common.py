@@ -120,7 +120,7 @@ class HoleyFilm:
     Shapes are phase-separation stamps (:mod:`..stamps`) at three scales, united."""
 
     #: (feature spacing um, coverage) of the big, medium and small holes
-    SCALES = ((1.3, 0.24), (0.6, 0.24), (0.28, 0.22), (0.12, 0.2))  # round droplet holes, polydisperse
+    SCALES = ((1.3, 0.13), (0.6, 0.13), (0.28, 0.12), (0.12, 0.1))  # round droplet holes, polydisperse (~40 % open)
 
     def __init__(self, thickness_nm: float = 15.0, foam_fraction: float = 0.15, membrane_fraction: float = 0.15,
                  membrane_nm: float = 4.0, rim_nm: float = 4.0):

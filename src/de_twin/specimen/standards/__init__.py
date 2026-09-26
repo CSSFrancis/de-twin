@@ -209,7 +209,7 @@ def build_structure(number: str) -> StandardStructure:
     if number == "625":
         return MoO3LathsStructure()
     if number == "646":
-        return OrientedFoilStructure(MaterialId.GOLD, 15.0)
+        return OrientedFoilStructure(MaterialId.GOLD, 11.0)  # "approximately 11nm thick" (tech note)
     if number == "645":
         return HoleyCarbonStructure(HoleyFilm(12.0), extra=CarbonBlackParticles())
     if number == "675":
@@ -222,8 +222,9 @@ def build_structure(number: str) -> StandardStructure:
         return HoleyCarbonStructure(HoleyFilm(15.0), MaterialId.GOLD, deposit_nm=4.0, island_nm=7.0,
                                     coverage=0.76, grain_nm=5.0)
     if number == "611":
-        return HoleyCarbonStructure(HoleyFilm(12.0), MaterialId.PLATINUM, deposit_nm=0.6, island_nm=1.4,
-                                    coverage=0.24, grain_nm=1.4)
+        # a thin support (6 nm): the particles, not the carbon's texture, dominate the image
+        return HoleyCarbonStructure(HoleyFilm(6.0), MaterialId.PLATINUM, deposit_nm=0.35, island_nm=1.4,
+                                    coverage=0.14, grain_nm=1.4)  # sparse discrete grains (~13 %, Ted Pella)
     if number == "609":
         return HoleyCarbonStructure(HoleyFilm(25.0))
     if number == "638":

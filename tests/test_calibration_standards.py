@@ -242,3 +242,29 @@ def test_magical_marker_sets_are_at_the_calibrated_depths():
     tw = _twin("675", 2000)
     fm = tw.specimen.rasterize(ViewWindow(center_um=tw.specimen.home_um(), pixel_um=0.01, shape=(1024, 1024)))
     assert (fm.material_id == int(MaterialId.SILICON_GERMANIUM)).any()
+
+
+def test_lattice_fringes_are_as_strong_as_on_a_real_microscope():
+    """Kinematic fringe amplitudes (times the calibrated efficiency): Si <011> in MAG*I*CAL
+    shows {111} fringes of ~34 % contrast, as in Ted Pella's lattice image (not the few
+    percent a fixed phase amplitude gave)."""
+    from de_twin.optics import OpticsConfig
+
+    tw = DigitalTwin(preset_name("675"), camera="DESim", clock=ManualClock(), seed=1,
+                     optics_config=OpticsConfig(objective_aperture_mrad=25.0))
+    tw.column.set("Magnification", 800000)
+    tw.column.set("Intensity", 0.95)
+    tw.column.set_defocus_um(-0.066)
+    home = tw.specimen.home_um()
+    from de_twin.optics.derive import stage_for_view_center
+
+    # in the silicon, 0.6 um below the surface: above the first marker set
+    x, y = stage_for_view_center((home[0], home[1] + 0.6), tw.column.state(), tw.optics_config)
+    tw.column.set_stage(x=x, y=y)
+    tw.clock.advance(30.0)
+    gt = tw.ground_truth(as_arrays=True)
+    assert (gt["material_id"] == int(MaterialId.SILICON)).mean() > 0.99
+    img = tw.flux(tw.request()).astype(float)
+    c = img[256:768, 256:768]
+    assert 0.2 < c.std() / c.mean() < 0.6
+    assert _spectrum_peak_nm(img, tw.optics(tw.request()).specimen_pixel_nm, 0.25, 0.4) == pytest.approx(0.3135, rel=0.03)
