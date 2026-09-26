@@ -878,7 +878,9 @@ def _set_low_dose(c: Column, value) -> None:
     if on:
         if not ld.areas:
             ld.seed_from(c, L.LOWMAG_MAGS + L.MAG1_MAGS)
-        else:
+        else:  # what was set while low dose was off becomes Record
+            ld.area = "Record"
+            ld.store(c)
             ld.apply(c, "Record", _SETTERS)
         ld.enabled = True
     else:
@@ -909,20 +911,40 @@ def _set_low_dose_areas(c: Column, value) -> None:
     value = dict(value)
     if not value:
         return
-    if not ld.areas:
-        ld.seed_from(c, L.LOWMAG_MAGS + L.MAG1_MAGS)
+    # validate everything before changing anything
+    updates = {}
     for key, params in value.items():
         name = normalise_area(key)
         if name is None:
             raise ColumnRefused(f"unknown low-dose area {key!r}")
-        a = ld.areas.get(name) or area_from_state(c._s)
+        clean = {}
         for f, v in dict(params).items():
             if f not in LowDoseArea.__dataclass_fields__:
                 raise ColumnRefused(f"unknown low-dose area setting {f!r}")
-            if f in ("image_shift", "beam_shift"):
-                setattr(a, f, tuple(float(x) for x in v))
-            else:
-                setattr(a, f, type(getattr(a, f))(v))
+            try:
+                if f in ("image_shift", "beam_shift"):
+                    pair = tuple(float(x) for x in v)
+                    if len(pair) != 2:
+                        raise ValueError("needs (x, y)")
+                    clean[f] = pair
+                elif f == "spot_size":
+                    clean[f] = int(v)
+                else:
+                    clean[f] = float(v)
+            except (TypeError, ValueError) as e:
+                raise ColumnRefused(f"low-dose {name} {f}: {v!r} ({e})") from None
+            vals = clean[f] if isinstance(clean[f], tuple) else (clean[f],)
+            if not all(math.isfinite(x) for x in vals):
+                raise ColumnRefused(f"low-dose {name} {f} must be finite")
+        updates[name] = clean
+    if not ld.areas:
+        ld.seed_from(c, L.LOWMAG_MAGS + L.MAG1_MAGS)
+    if ld.enabled and ld.area in updates:  # keep what was set live in the area being edited
+        ld.store(c)
+    for name, clean in updates.items():
+        a = ld.areas.get(name) or area_from_state(c._s)
+        for f, v in clean.items():
+            setattr(a, f, v)
         ld.areas[name] = a
         if ld.enabled and name == ld.area:
             ld.apply(c, name, _SETTERS)
