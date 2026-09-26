@@ -96,11 +96,12 @@ def _shift_terms(state: MicroscopeState, cfg: OpticsConfig) -> tuple[float, floa
     bsx, bsy = (0.0, 0.0) if _tem_imaging(state) else _beam_shift_world(state, cfg)
     x = isx + bsx
     y = isy + bsy
-    # a specimen dz above the eucentric plane moves by dz sin(tilt) across the tilt axis
+    # a specimen dz above the eucentric plane puts the point dz tan(tilt) away (specimen
+    # coordinates) on axis, which the foreshortened view images dz sin(tilt) across the axis
     dz = state.stage.z_um + cfg.stage_offset_um[2] - cfg.eucentric_height_um
     if dz:
-        x += dz * math.sin(math.radians(state.stage.beta_deg))
-        y += dz * math.sin(math.radians(state.stage.alpha_deg))
+        x += dz * math.tan(math.radians(state.stage.beta_deg))
+        y += dz * math.tan(math.radians(state.stage.alpha_deg))
     if r is not None and _tem_imaging(state):
         ox, oy = r.mag_offset_um(state.mag_mode, state.magnification)
         x, y = x + ox, y + oy

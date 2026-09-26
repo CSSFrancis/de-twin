@@ -161,7 +161,9 @@ def tilt_samples(optics, n_cone: int = 24) -> list:
     """The beam tilts one exposure averages over, as ``(tilt_rad, weight, shift_inv_nm)``:
     the static beam tilt, or with precession `n_cone` tilts on the cone swept during the
     frame (its arc, from its phase). ``shift`` is where the pattern lands relative to the
-    static diffraction centre: nothing with descan, the tilt itself without."""
+    static diffraction centre: nothing with descan, the tilt itself without. (Without
+    descan only the Bragg spots and the direct beam sweep; rings and the diffuse
+    background stay centred, a simplification.)"""
     bx, by = (v * 1e-3 for v in getattr(optics, "beam_tilt_mrad", (0.0, 0.0)))
     theta = float(getattr(optics, "precession_mrad", 0.0)) * 1e-3
     if theta <= 0.0:
@@ -212,8 +214,24 @@ def bucket_patterns(mats, gids, t_nm, cryst, grains, optics,
     samples = tilt_samples(optics)
     if len(samples) == 1 and samples[0][2] == (0.0, 0.0):
         return _bucket_patterns_at(mats, gids, t_nm, cryst, grains, optics, options, samples[0][0])
-    parts = [(_bucket_patterns_at(mats, gids, t_nm, cryst, grains, optics, options, tilt), w, sh)
-             for tilt, w, sh in samples]
+    base = (np.asarray(mats, np.int64).tobytes(), np.asarray(gids, np.int64).tobytes(),
+            np.asarray(t_nm, float).tobytes(), np.asarray(cryst, float).tobytes(), id(grains),
+            float(optics.alpha_rad), float(optics.beta_rad), float(optics.wavelength_nm),
+            float(optics.ht_kv), float(optics.convergence_mrad), options)
+
+    def at(tilt):
+        key = (base, round(tilt[0], 12), round(tilt[1], 12))
+        hit = _CONE_CACHE.get(key)
+        if hit is not None and hit[0] is grains:
+            _CONE_CACHE.move_to_end(key)
+            return hit[1]
+        ps = _bucket_patterns_at(mats, gids, t_nm, cryst, grains, optics, options, tilt)
+        _CONE_CACHE[key] = (grains, ps)
+        while len(_CONE_CACHE) > CONE_CACHE_SIZE:
+            _CONE_CACHE.popitem(last=False)
+        return ps
+
+    parts = [(at(tilt), w, sh) for tilt, w, sh in samples]
     n = parts[0][0].n
     spots = np.concatenate([p.spots * [1.0, 1.0, w] + [sh[0], sh[1], 0.0] for p, w, sh in parts])
     s_own = np.concatenate([p.spot_owner for p, _, _ in parts])
@@ -221,6 +239,12 @@ def bucket_patterns(mats, gids, t_nm, cryst, grains, optics,
     r_own = np.concatenate([p.ring_owner for p, _, _ in parts])
     si, ri = np.argsort(s_own, kind="stable"), np.argsort(r_own, kind="stable")
     return PatternSet(n, spots[si], s_own[si], rings[ri], r_own[ri])
+
+
+#: Pattern sets per precession tilt, so a frame that covers part of the cone re-weights
+#: cached tilts instead of exciting every grain again (two full cones' worth).
+CONE_CACHE_SIZE = 48
+_CONE_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
 
 
 def _bucket_patterns_at(mats, gids, t_nm, cryst, grains, optics, options, tilt_rad) -> PatternSet:
