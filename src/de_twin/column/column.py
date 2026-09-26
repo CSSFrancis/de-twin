@@ -47,6 +47,10 @@ Precession              [twin] bool: drive the beam-tilt coils round a cone
 PrecessionAngle         [twin] cone half-angle, mrad
 PrecessionFrequency     [twin] Hz
 PrecessionDescan        [twin] bool: descan brings the pattern back (default on)
+LowDose                 bool: the Search / View / Focus / Record areas (see column.lowdose)
+LowDoseArea             "Search" | "View" | "Focus" | "Record" (switching stores the one left)
+LowDoseAreas            dict per area: magnification, spot_size, intensity,
+                        defocus_offset_um (from Record's focus), image_shift, beam_shift
 ObjectiveStig,
 CondenserStig           (x, y) normalised units
 StagePosition           dict x, y, z (um), a, b (deg); set any subset
@@ -280,6 +284,9 @@ class Column:
         self._stage_now = list(pos)
         self._move_t0 = self._now()
         # [twin] stage backlash (um) and each of x/y's last approach direction (+1 / -1 / 0)
+        from .lowdose import LowDose
+
+        self.low_dose = LowDose()
         self.backlash_um = 0.0
         self._approach = [0.0, 0.0]
         self._last_op_state = 0  # DE-TEM-Channel OperationState of the last set
@@ -863,6 +870,64 @@ def _set_vec(attr: str, scale: float = 1.0):
     return setter
 
 
+def _set_low_dose(c: Column, value) -> None:
+    on = value.strip().lower() in ("1", "true", "on", "yes") if isinstance(value, str) else bool(value)
+    ld = c.low_dose
+    if on == ld.enabled:
+        return
+    if on:
+        if not ld.areas:
+            ld.seed_from(c, L.LOWMAG_MAGS + L.MAG1_MAGS)
+        else:
+            ld.apply(c, "Record", _SETTERS)
+        ld.enabled = True
+    else:
+        ld.store(c)
+        ld.apply(c, "Record", _SETTERS)
+        ld.enabled = False
+
+
+def _set_low_dose_area(c: Column, value) -> None:
+    from .lowdose import normalise_area
+
+    ld = c.low_dose
+    if not ld.enabled:
+        raise ColumnRefused("low dose is off (set LowDose first)")
+    name = normalise_area(value)
+    if name is None:
+        raise ColumnRefused(f"unknown low-dose area {value!r} (Search, View, Focus, Record)")
+    if name == ld.area:
+        return
+    ld.store(c)
+    ld.apply(c, name, _SETTERS)
+
+
+def _set_low_dose_areas(c: Column, value) -> None:
+    from .lowdose import LowDoseArea, area_from_state, normalise_area
+
+    ld = c.low_dose
+    value = dict(value)
+    if not value:
+        return
+    if not ld.areas:
+        ld.seed_from(c, L.LOWMAG_MAGS + L.MAG1_MAGS)
+    for key, params in value.items():
+        name = normalise_area(key)
+        if name is None:
+            raise ColumnRefused(f"unknown low-dose area {key!r}")
+        a = ld.areas.get(name) or area_from_state(c._s)
+        for f, v in dict(params).items():
+            if f not in LowDoseArea.__dataclass_fields__:
+                raise ColumnRefused(f"unknown low-dose area setting {f!r}")
+            if f in ("image_shift", "beam_shift"):
+                setattr(a, f, tuple(float(x) for x in v))
+            else:
+                setattr(a, f, type(getattr(a, f))(v))
+        ld.areas[name] = a
+        if ld.enabled and name == ld.area:
+            ld.apply(c, name, _SETTERS)
+
+
 def _set_flag(attr: str):
     def setter(col: Column, value) -> None:
         v = value.strip().lower() in ("1", "true", "on", "yes") if isinstance(value, str) else bool(value)
@@ -922,6 +987,9 @@ _GETTERS: dict[str, Callable[[Column], Any]] = {
     "BeamTilt": lambda c: _v2(c._s.beam_tilt_mrad, BEAM_TILT_MRAD_PER_UNIT),
     "DiffractionShift": lambda c: _v2(c._s.diffraction_shift_mrad, DIFF_SHIFT_MRAD_PER_UNIT),
     "Precession": lambda c: bool(c._s.precession_on),
+    "LowDose": lambda c: bool(c.low_dose.enabled),
+    "LowDoseArea": lambda c: c.low_dose.area if c.low_dose.enabled else "",
+    "LowDoseAreas": lambda c: {k: a.as_dict() for k, a in c.low_dose.areas.items()},
     "PrecessionAngle": lambda c: float(c._s.precession_mrad),
     "PrecessionFrequency": lambda c: float(c._s.precession_hz),
     "PrecessionDescan": lambda c: bool(c._s.precession_descan),
@@ -1018,6 +1086,9 @@ _SETTERS: dict[str, Callable[[Column, Any], None]] = {
     "BeamTilt": _set_vec("beam_tilt_mrad", BEAM_TILT_MRAD_PER_UNIT),
     "DiffractionShift": _set_vec("diffraction_shift_mrad", DIFF_SHIFT_MRAD_PER_UNIT),
     "Precession": _set_flag("precession_on"),
+    "LowDose": lambda c, v: _set_low_dose(c, v),
+    "LowDoseArea": lambda c, v: _set_low_dose_area(c, v),
+    "LowDoseAreas": lambda c, v: _set_low_dose_areas(c, v),
     "PrecessionAngle": _set_float("precession_mrad", 0.0, 100.0),
     "PrecessionFrequency": _set_float("precession_hz", 0.0, 1.0e5),
     "PrecessionDescan": _set_flag("precession_descan"),
