@@ -179,3 +179,18 @@ def test_a_tilted_specimen_off_eucentric_height_moves():
     c = _img(tw)
     tw.column.move_stage(alpha=2.0)
     assert np.abs(_shift_px(c, _img(tw))).max() < 0.5, "at eucentric height tilting does not move it"
+
+
+def test_texture_moves_with_the_specimen_when_the_view_is_rotated():
+    """A texture-dominated specimen (no particles to lean on): an image-shift or stage move
+    that re-renders must move the carbon texture the way the specimen moves."""
+    tw = _twin("Negative stain on carbon", mag=100000.0)
+    tw.column.set("Intensity", 0.95)
+    truth = tw.calibration_truth()
+    assert abs(truth["image_rotation_deg"]) > 1.0
+    a = _img(tw)
+    s = tw.column.state().stage
+    tw.column.move_stage(x=s.x_um + 0.02)  # beyond the pan margin: a full re-render
+    got = _shift_px(a, _img(tw))
+    want = _predicted_px(truth, (-0.02, 0.0))
+    assert got == pytest.approx(want, abs=1.0)
