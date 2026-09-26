@@ -76,10 +76,14 @@ class LowDose:
         self.area = "Record"
 
     def store(self, col) -> None:
-        """The live settings into the current area."""
+        """The live settings into the current area (in diffraction the area keeps its
+        imaging magnification)."""
+        from . import ladders as L
+
         s = col._s
         a = self.areas[self.area]
-        a.magnification = float(s.magnification)
+        if col._fm != L.FM_DIFF:
+            a.magnification = float(s.magnification)
         a.spot_size = int(s.spot_size)
         a.intensity = float(s.intensity)
         a.image_shift = (float(s.image_shift_um.x), float(s.image_shift_um.y))
@@ -91,14 +95,25 @@ class LowDose:
             a.defocus_offset_um = float(s.defocus_um) - self.base_focus_um
 
     def apply(self, col, name: str, setters) -> None:
-        """Enter area *name* (the live settings are NOT stored: call `store` first)."""
+        """Enter area *name* (the live settings are NOT stored: call `store` first). All or
+        nothing: if a setting is refused the column is left as it was."""
+        from . import ladders as L
+
         a = self.areas[name]
-        setters["Magnification"](col, a.magnification)
-        setters["SpotSize"](col, a.spot_size)
-        setters["Intensity"](col, a.intensity)
-        setters["Defocus"](col, self.base_focus_um + (0.0 if name == "Record" else a.defocus_offset_um))
-        setters["ImageShift"](col, a.image_shift)
-        setters["BeamShift"](col, a.beam_shift)
+        saved = (col._s.copy(), col._fm, getattr(col, "_last_imaging_fm", None))
+        try:
+            if col._fm != L.FM_DIFF:  # diffraction has no magnification to set
+                setters["Magnification"](col, a.magnification)
+            setters["SpotSize"](col, a.spot_size)
+            setters["Intensity"](col, a.intensity)
+            setters["Defocus"](col, self.base_focus_um + (0.0 if name == "Record" else a.defocus_offset_um))
+            setters["ImageShift"](col, a.image_shift)
+            setters["BeamShift"](col, a.beam_shift)
+        except Exception:
+            col._s, col._fm = saved[0], saved[1]
+            if saved[2] is not None:
+                col._last_imaging_fm = saved[2]
+            raise
         self.area = name
 
 

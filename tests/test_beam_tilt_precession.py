@@ -115,3 +115,60 @@ def test_column_precession_properties():
 
     with pytest.raises(ColumnRefused):
         c.set("PrecessionAngle", -1)
+
+
+def test_precession_leaves_the_tem_image_cache_alone():
+    """Precession changes diffraction, not the image: TEM frames still come from the cache."""
+    from de_twin.render.testing import StubCamera
+
+    from test_render_diffraction import _gold_specimen
+
+    r = Renderer(_gold_specimen())
+    from de_twin.optics import Calibration, OpticsConfig, derive_optics
+    from de_twin.state import AcquisitionRequest, MicroscopeState
+
+    s = MicroscopeState()
+    s.precession_on, s.precession_mrad, s.precession_hz = True, 10.0, 100.0
+    o = derive_optics(s, AcquisitionRequest(frame_time_s=0.0025), StubCamera(sensor_shape=(512, 512)),
+                      Calibration.default(), OpticsConfig())
+    r.render(o, time_s=0.0)
+    before = r.frames_from_cache
+    for k in range(1, 6):
+        r.render(o, time_s=k * 0.0025)
+    assert r.frames_from_cache - before == 5
+
+
+def test_a_partial_cone_reuses_the_cached_tilts(monkeypatch):
+    import de_twin.render.diffraction as D
+
+    D._CONE_CACHE.clear()
+    calls = []
+    real = D._bucket_patterns_at
+    monkeypatch.setattr(D, "_bucket_patterns_at", lambda *a, **k: calls.append(1) or real(*a, **k))
+    gid = AU0 + 1
+    grains = on_zone_grains(gid, (0, 0, 1))  # one specimen, as a renderer holds it
+    step = 2 * math.pi / 24
+    for j in range(24):  # a frame of 1/8 cone, starting at each phase in turn
+        bucket_patterns([MaterialId.GOLD], [gid], [20.0], [1.0], grains,
+                        _optics(precession_mrad=10.0, precession_arc_rad=3 * step, precession_phase_rad=j * step))
+    assert len(calls) == 24, "each of the cone's 24 tilts excited once"
+
+
+def test_stem_tables_are_not_rebuilt_as_the_precession_phase_moves(monkeypatch):
+    import de_twin.render.stem as st
+    from de_twin.clock import ManualClock as MC
+    from de_twin.state import TemStem
+    from de_twin.twin import DigitalTwin
+
+    builds = []
+    real = st.build_tables
+    monkeypatch.setattr(st, "build_tables", lambda *a, **k: builds.append(1) or real(*a, **k))
+    tw = DigitalTwin("Dense Au on holey C", camera="DESim", clock=MC(), seed=3)
+    tw.column.set_tem_stem(TemStem.STEM)
+    tw.column.set("Precession", True)
+    req = tw.request(frame_time_s=0.001)
+    req.scan.enabled = True
+    req.scan.size = (16, 16)
+    for i in range(12):
+        tw.flux(req, frame_index=i, time_s=i * 0.001)
+    assert len(builds) == 1

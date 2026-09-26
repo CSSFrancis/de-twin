@@ -105,3 +105,65 @@ def test_view_to_record_alignment_finds_the_true_area_offset():
     ny, nx = cc.shape
     got = np.array([ix - nx if ix > nx // 2 else ix, iy - ny if iy > ny // 2 else iy], float)
     assert got == pytest.approx(want, abs=1.5)
+
+
+def test_editing_the_current_area_keeps_its_live_changes():
+    c = _col()
+    c.set("LowDose", True)
+    c.set("LowDoseArea", "View")
+    c.set("SpotSize", 5)
+    c.set("LowDoseAreas", {"View": {"intensity": 0.6}})
+    s = c.state()
+    assert s.spot_size == 5 and s.intensity == pytest.approx(0.6)
+
+
+def test_a_bad_area_setting_is_refused_and_changes_nothing():
+    c = _col()
+    c.set("LowDose", True)
+    before = c.get("LowDoseAreas")
+    for bad in ({"View": {"image_shift": (1.0,)}}, {"View": {"intensity": "lots"}},
+                {"View": {"defocus_offset_um": float("nan")}}):
+        with pytest.raises(ColumnRefused):
+            c.set("LowDoseAreas", bad)
+    assert c.get("LowDoseAreas") == before
+
+
+def test_a_refused_switch_leaves_the_column_as_it_was(monkeypatch):
+    import de_twin.column.column as colmod
+
+    c = _col()
+    c.set("LowDose", True)
+    s0 = c.state()
+    real = colmod._SETTERS["ImageShift"]
+
+    def refuse(col, v):
+        raise ColumnRefused("no")
+
+    monkeypatch.setitem(colmod._SETTERS, "ImageShift", refuse)
+    with pytest.raises(ColumnRefused):
+        c.set("LowDoseArea", "View")
+    monkeypatch.setitem(colmod._SETTERS, "ImageShift", real)
+    s1 = c.state()
+    assert c.get("LowDoseArea") == "Record"
+    assert (s1.magnification, s1.defocus_um, s1.spot_size) == (s0.magnification, s0.defocus_um, s0.spot_size)
+
+
+def test_low_dose_switches_in_diffraction():
+    c = _col()
+    c.set("LowDose", True)
+    c.set("ProjectionMode", 2)  # diffraction
+    c.set("LowDoseArea", "View")
+    c.set("LowDoseArea", "Record")
+    c.set("LowDose", False)
+    assert c.get("LowDoseAreas")["Record"]["magnification"] == 25000
+
+
+def test_re_enabling_keeps_what_was_set_while_off():
+    c = _col()
+    c.set("LowDose", True)
+    c.set("LowDose", False)
+    c.set("Defocus", -3.0)
+    c.set("Magnification", 40000)
+    c.set("LowDose", True)
+    s = c.state()
+    assert (s.magnification, s.defocus_um) == (40000, -3.0)

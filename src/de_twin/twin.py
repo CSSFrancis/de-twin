@@ -432,7 +432,10 @@ class DigitalTwin:
         pixel size against the nominal one, the image rotation on the camera, the image-shift
         matrix, the magnification's image offset, the stage's backlash error and how far the
         specimen is off eucentric height. For closed-loop tests: calibrate the twin, then
-        compare. An ideal column (no ``OpticsConfig.realism``) reports the identities."""
+        compare. An ideal column (no ``OpticsConfig.realism``) reports the identities.
+
+        ``image_rotation_deg`` is the view's world -> camera rotation: image features turn by
+        minus it in (x right, y down) pixel coordinates."""
         request = request or self.request()
         state = self.column.state()
         o = self.optics(request, state)

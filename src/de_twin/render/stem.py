@@ -45,7 +45,7 @@ class StemTables:
     key_index: np.ndarray  # (ny, nx) index into keys
     keys: np.ndarray  # (K, 4) int64: material, grain, thickness bin, crystallinity bin
     jitter: np.ndarray  # (ny, nx) float32 fluctuation factor (1 when disabled)
-    all_specs: object = None  # PatternSet of every key, built on first use
+    all_specs: dict = None  # _tilt_key -> PatternSet of every key, built on first use
 
 
 def build_tables(fm, optics, grains, crystallinity, cfg, seed: int) -> StemTables:
@@ -117,8 +117,7 @@ class StemRenderer:
 
     def tables(self, fm, fm_token, optics, grains, crystallinity) -> StemTables:
         key = (fm_token, optics.ht_kv, optics.thickness_tilt_factor, optics.alpha_rad, optics.beta_rad,
-               optics.convergence_mrad, self.cfg.diffuse_scattering, self.cfg.intensity_jitter,
-               _tilt_key(optics))
+               optics.convergence_mrad, self.cfg.diffuse_scattering, self.cfg.intensity_jitter)
         t = self._tables.get(key)
         if t is None:
             t = build_tables(fm, optics, grains, crystallinity, self.cfg, self.seed)
@@ -136,12 +135,18 @@ class StemRenderer:
     def all_specs(self, tab: StemTables, optics, grains):
         """PatternSet of every key of the table (one vectorised batch, then kept)."""
         if tab.all_specs is None:
-            tab.all_specs = self._bucket(tab.keys, optics, grains)
-        return tab.all_specs
+            tab.all_specs = {}
+        tk = _tilt_key(optics)
+        if tk not in tab.all_specs:
+            if len(tab.all_specs) >= 48:
+                tab.all_specs.pop(next(iter(tab.all_specs)))
+            tab.all_specs[tk] = self._bucket(tab.keys, optics, grains)
+        return tab.all_specs[tk]
 
     def spec(self, tab: StemTables, i: int, optics, grains):
-        if tab.all_specs is not None:
-            return tab.all_specs[i]
+        specs = (tab.all_specs or {}).get(_tilt_key(optics))
+        if specs is not None:
+            return specs[i]
         return self._bucket(tab.keys[i:i + 1], optics, grains)[0]
 
     def _pattern(self, tab, i, optics, grains) -> np.ndarray:
