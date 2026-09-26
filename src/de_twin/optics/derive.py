@@ -91,8 +91,11 @@ def _shift_terms(state: MicroscopeState, cfg: OpticsConfig) -> tuple[float, floa
     r = cfg.realism
     if r is not None and _tem_imaging(state):
         isx, isy = (float(v) for v in r.is_matrix(state.mag_mode, state.magnification) @ (isx, isy))
-    x = isx + state.beam_shift_um.x
-    y = isy + state.beam_shift_um.y
+    # beam shift moves the image only where the beam IS the image (STEM probe, diffraction's
+    # illuminated area); in TEM imaging it moves the illuminated disc (`beam_offset_px`)
+    bsx, bsy = (0.0, 0.0) if _tem_imaging(state) else _beam_shift_world(state, cfg)
+    x = isx + bsx
+    y = isy + bsy
     # a specimen dz above the eucentric plane moves by dz sin(tilt) across the tilt axis
     dz = state.stage.z_um + cfg.stage_offset_um[2] - cfg.eucentric_height_um
     if dz:
@@ -102,6 +105,14 @@ def _shift_terms(state: MicroscopeState, cfg: OpticsConfig) -> tuple[float, floa
         ox, oy = r.mag_offset_um(state.mag_mode, state.magnification)
         x, y = x + ox, y + oy
     return x, y
+
+
+def _beam_shift_world(state: MicroscopeState, cfg: OpticsConfig) -> tuple[float, float]:
+    """Beam shift in specimen micrometres (through the column's beam-shift matrix)."""
+    bx, by = state.beam_shift_um.x, state.beam_shift_um.y
+    if cfg.realism is not None:
+        bx, by = (float(v) for v in cfg.realism.bs_matrix() @ (bx, by))
+    return bx, by
 
 
 def view_center_um(state: MicroscopeState, cfg: OpticsConfig) -> tuple[float, float]:
@@ -226,6 +237,15 @@ def derive_optics(state: MicroscopeState, request: AcquisitionRequest, camera,
         rotation = cfg.realism.rotation_rad(state.mag_mode, state.magnification)
     view = ViewWindow(center_um=(cx, cy), pixel_um=raster_nm / 1000.0, shape=(int(ry), int(rx)),
                       rotation_rad=rotation, cos_alpha=cos_y, cos_beta=cos_x)
+    # TEM imaging: where beam shift has put the illuminated disc, raster pixels from centre
+    beam_offset_px = (0.0, 0.0)
+    if mode == RenderMode.TEM_IMAGING and (state.beam_shift_um.x or state.beam_shift_um.y):
+        bwx, bwy = _beam_shift_world(state, cfg)
+        sgx = -1.0 if cfg.flip_x else 1.0
+        sgy = -1.0 if cfg.flip_y else 1.0
+        r0, c0 = view.world_to_pixel(cx, cy)
+        r1, c1 = view.world_to_pixel(cx + sgx * bwx, cy + sgy * bwy)
+        beam_offset_px = (float(c1 - c0), float(r1 - r0))
 
     # Focus
     ox, oy, oz = cfg.stage_offset_um
@@ -367,6 +387,7 @@ def derive_optics(state: MicroscopeState, request: AcquisitionRequest, camera,
         fresnel_sigma_px=float(fresnel_sigma),
         objective_stig=(float(stig.x), float(stig.y)),
         beam_tilt_mrad=(float(state.beam_tilt_mrad.x), float(state.beam_tilt_mrad.y)),
+        beam_offset_px=beam_offset_px,
         precession_mrad=float(state.precession_mrad) if state.precession_on else 0.0,
         precession_hz=float(state.precession_hz),
         precession_descan=bool(state.precession_descan),

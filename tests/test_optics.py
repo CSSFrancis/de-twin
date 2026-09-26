@@ -152,7 +152,8 @@ def test_view_centre_sign_convention():
     assert o.view.center_um == pytest.approx((-1.0, 2.0))
     s = _state(image_shift_um=Vec2(0.5, 0.25), beam_shift_um=Vec2(0.1, 0.0))
     o = _derive(s)
-    assert o.view.center_um == pytest.approx((0.6, 0.25))
+    assert o.view.center_um == pytest.approx((0.5, 0.25)), "beam shift moves the beam, not the image"
+    assert o.beam_offset_px == pytest.approx((0.1 / o.view.pixel_um, 0.0), rel=1e-6)
     s = _state()
     s.stage.x_um = 1.0
     o = _derive(s, cfg=OpticsConfig(flip_x=True, stage_offset_um=(0.5, 0.0, 0.0)))

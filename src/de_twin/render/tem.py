@@ -548,8 +548,9 @@ def finish_tem(img, optics, cfg) -> np.ndarray:
         ny, nx = view.shape
         d = max(1, optics.raster_downsample)
         off = optics.extras.get("roi_offset_px", (0.0, 0.0))
-        cx = (nx - 1) / 2.0 - off[0] / d
-        cy = (ny - 1) / 2.0 - off[1] / d
+        bo = getattr(optics, "beam_offset_px", (0.0, 0.0))
+        cx = (nx - 1) / 2.0 - off[0] / d + bo[0]
+        cy = (ny - 1) / 2.0 - off[1] / d + bo[1]
         radius = optics.illuminated_diameter_um * 1000.0 / 2.0 / (view.pixel_um * 1000.0)
         prof = disk_profile(view.shape, cx, cy, radius, max(0.5, 0.01 * radius))
         if prof is not None:

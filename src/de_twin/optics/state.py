@@ -58,6 +58,8 @@ class OpticsState:
     fresnel_sigma_px: float
     objective_stig: tuple[float, float] = (0.0, 0.0)
     beam_tilt_mrad: tuple[float, float] = (0.0, 0.0)
+    # TEM imaging: where beam shift puts the illuminated disc, raster px from the centre
+    beam_offset_px: tuple[float, float] = (0.0, 0.0)
     # Precession: cone half-angle (0 = off), frequency, descan; and, per frame, the
     # phase the sweep starts at and the arc it covers (2 pi or more: the whole cone).
     precession_mrad: float = 0.0

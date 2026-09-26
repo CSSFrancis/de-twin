@@ -84,7 +84,14 @@ def illuminated_diameter_um(state: MicroscopeState, cfg: OpticsConfig | None = N
         spot = state.spot_size if state.spot_size > 0 else cfg.reference_spot
         return cfg.nanoprobe_illuminated_um * spot / cfg.reference_spot
     x = float(np.clip(state.intensity, 0.0, 1.0))
-    d = cfg.illum_min_diameter_um * (cfg.illum_max_diameter_um / cfg.illum_min_diameter_um) ** x
+    r = getattr(cfg, "realism", None)
+    if r is not None:
+        # a real C2: the beam converges to a crossover and spreads again past it
+        x0 = r.crossover(int(state.spot_size), int(state.probe_mode))
+        span = max(x0, 1.0 - x0)
+        d = math.hypot(cfg.illum_min_diameter_um, cfg.illum_max_diameter_um * (x - x0) / span)
+    else:
+        d = cfg.illum_min_diameter_um * (cfg.illum_max_diameter_um / cfg.illum_min_diameter_um) ** x
     if _intensity_zoom(state, cfg):
         # the condenser tracks the field of view (LowMAG included: no separate spread)
         return float(d * cfg.intensity_zoom_reference_mag / float(state.magnification))

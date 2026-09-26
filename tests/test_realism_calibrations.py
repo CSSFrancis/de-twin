@@ -179,3 +179,52 @@ def test_a_tilted_specimen_off_eucentric_height_moves():
     c = _img(tw)
     tw.column.move_stage(alpha=2.0)
     assert np.abs(_shift_px(c, _img(tw))).max() < 0.5, "at eucentric height tilting does not move it"
+
+
+# ------------------------------------------------------------------ illumination (phase 2)
+def _disc(img: np.ndarray):
+    """Centroid (x, y) and equivalent diameter (px) of the illuminated disc: pixels brighter
+    than half the brightest."""
+    m = img > 0.5 * np.percentile(img, 99.5)
+    y, x = np.nonzero(m)
+    return np.array([x.mean(), y.mean()]), 2.0 * math.sqrt(m.sum() / math.pi)
+
+
+def test_beam_crossover_is_where_the_beam_is_smallest():
+    tw = _twin("Cross grating 2160 l/mm", mag=2000.0)
+    x0 = tw.calibration_truth()["crossover_intensity"]
+    xs = np.round(np.linspace(x0 - 0.03, x0 + 0.03, 13), 4)
+    peak = []
+    for x in xs:
+        tw.column.set("Intensity", float(x))
+        peak.append(float(np.percentile(_img(tw), 99.9)))
+    best = xs[int(np.argmax(peak))]
+    assert best == pytest.approx(x0, abs=0.006), "SerialEM's Beam Crossover finds it"
+    # and the beam spreads on both sides of it
+    assert peak[0] < max(peak) and peak[-1] < max(peak)
+
+
+def test_beam_shift_calibration_follows_the_disc():
+    tw = _twin("Cross grating 2160 l/mm", mag=2000.0)
+    truth = tw.calibration_truth()
+    x0 = truth["crossover_intensity"]
+    tw.column.set("Intensity", x0 + 0.012)  # a ~1.5 um disc inside a 5 um field
+    a = _img(tw)
+    ca, da = _disc(a)
+    assert 50 < da < 900, "the disc is inside the field"
+    B = np.asarray(truth["bs_matrix_um_per_unit"])
+    for e in ((0.5, 0.0), (0.0, 0.5)):
+        tw.column.set("BeamShift", e)
+        cb, _ = _disc(_img(tw))
+        tw.column.set("BeamShift", (0.0, 0.0))
+        want = -_predicted_px(truth, B @ e)  # the disc moves WITH the beam
+        assert cb - ca == pytest.approx(want, abs=2.0)
+
+
+def test_beam_shift_moves_the_beam_not_the_image():
+    tw = _twin(realistic=False, mag=20000.0)
+    a = _img(tw)
+    tw.column.set("BeamShift", (0.01, 0.0))
+    b = _img(tw)
+    # the specimen does not move (only the illumination edge, far outside this field)
+    assert np.abs(_shift_px(a, b)).max() < 0.1

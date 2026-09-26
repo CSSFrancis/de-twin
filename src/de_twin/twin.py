@@ -176,6 +176,9 @@ class DigitalTwin:
         req = self.request()
         state = self.column.state()
         lo, hi = 0.02, 0.98
+        r = self.optics_config.realism
+        if r is not None:  # past the C2 crossover, where spreading is monotonic
+            lo = max(lo, r.crossover(int(state.spot_size), int(state.probe_mode)) + 1e-3)
 
         def dose(v: float) -> float:
             return float(self.optics(req, dataclasses.replace(state, intensity=v)).dose_e_per_px_s)
@@ -449,6 +452,11 @@ class DigitalTwin:
             "eucentric_offset_um": float(state.stage.z_um + cfg.stage_offset_um[2] - cfg.eucentric_height_um),
             "flip": (bool(cfg.flip_x), bool(cfg.flip_y)),
         }
+        out["bs_matrix_um_per_unit"] = [[1.0, 0.0], [0.0, 1.0]]
+        out["crossover_intensity"] = None
+        if r is not None:
+            out["bs_matrix_um_per_unit"] = r.bs_matrix().tolist()
+            out["crossover_intensity"] = r.crossover(int(state.spot_size), int(state.probe_mode))
         if r is not None and imaging:
             t = r.truth(state.mag_mode, state.magnification)
             out["is_matrix_um_per_unit"] = t["is_matrix_um_per_unit"]
