@@ -165,14 +165,15 @@ def test_backlash_depends_on_the_approach_direction():
 
 def test_a_tilted_specimen_off_eucentric_height_moves():
     tw = _twin(realistic=False)
-    tw.column.move_stage(z=0.5)  # 0.5 um above eucentric
-    tw.column.move_stage(alpha=-2.0)
+    tw.column.move_stage(z=0.1)  # 0.1 um above eucentric
+    tw.column.move_stage(alpha=-20.0)
     a = _img(tw)
-    tw.column.move_stage(alpha=2.0)
+    tw.column.move_stage(alpha=20.0)
     got = _shift_px(a, _img(tw))
-    dy_um = 0.5 * (math.sin(math.radians(2.0)) - math.sin(math.radians(-2.0)))
+    # the image moves by dz sin(tilt) (not dz sin cos: 6 % less at 20 deg)
+    dy_um = 0.1 * (math.sin(math.radians(20.0)) - math.sin(math.radians(-20.0)))
     px = tw.calibration_truth()["true_pixel_nm"]
-    assert abs(got[1]) == pytest.approx(dy_um * 1000.0 / px * math.cos(math.radians(2.0)), rel=0.05)
+    assert abs(got[1]) == pytest.approx(dy_um * 1000.0 / px, rel=0.02)
     assert abs(got[0]) < 0.5, "across the tilt axis only"
     tw.column.move_stage(z=0.0)
     tw.column.move_stage(alpha=-2.0)
