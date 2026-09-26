@@ -101,6 +101,13 @@ def _blend_samples(optics, ix, iy, enabled: bool):
     return [(int(np.clip(x, 0, nx - 1)), int(np.clip(y, 0, ny - 1)), wt) for x, y, wt in pts]
 
 
+def _tilt_key(optics) -> tuple:
+    """What of the beam tilt and precession a pattern depends on."""
+    return (tuple(optics.beam_tilt_mrad), getattr(optics, "precession_mrad", 0.0),
+            getattr(optics, "precession_descan", True), getattr(optics, "precession_phase_rad", 0.0),
+            getattr(optics, "precession_arc_rad", 0.0))
+
+
 class StemRenderer:
     def __init__(self, cache: DiffractionCache, cfg, seed: int):
         self.cache = cache
@@ -110,7 +117,8 @@ class StemRenderer:
 
     def tables(self, fm, fm_token, optics, grains, crystallinity) -> StemTables:
         key = (fm_token, optics.ht_kv, optics.thickness_tilt_factor, optics.alpha_rad, optics.beta_rad,
-               optics.convergence_mrad, self.cfg.diffuse_scattering, self.cfg.intensity_jitter)
+               optics.convergence_mrad, self.cfg.diffuse_scattering, self.cfg.intensity_jitter,
+               _tilt_key(optics))
         t = self._tables.get(key)
         if t is None:
             t = build_tables(fm, optics, grains, crystallinity, self.cfg, self.seed)
@@ -140,7 +148,7 @@ class StemRenderer:
         h, w = optics.output_shape
         key = ("dp", tuple(int(v) for v in tab.keys[i]), (h, w), optics.recip_pixel_inv_nm, optics.disk_radius_px,
                optics.convergence_mrad, optics.alpha_rad, optics.beta_rad, optics.ht_kv,
-               PatternOptions.from_config(self.cfg))
+               PatternOptions.from_config(self.cfg), _tilt_key(optics))
         return self.cache.get(key, lambda _k: render_pattern(self.spec(tab, i, optics, grains), (h, w),
                                                              optics.recip_pixel_inv_nm, optics.disk_radius_px))
 
