@@ -244,6 +244,24 @@ def _kgrid(shape, pitch_nm):
     return kx, ky
 
 
+def _raster_tilt(optics) -> tuple[float, float]:
+    """The beam tilt (1/nm) in the raster's frame: the tilt coils sit above the specimen, so
+    a tilt is a specimen-plane (world) direction, turned by the view's rotation and flips
+    like everything else on the camera."""
+    lam = optics.wavelength_nm
+    wx, wy = (v / 1000.0 / lam for v in optics.beam_tilt_mrad)
+    view = optics.view
+    rot = float(getattr(view, "rotation_rad", 0.0))
+    if rot:
+        c, s = math.cos(rot), math.sin(rot)
+        wx, wy = c * wx + s * wy, -s * wx + c * wy
+    if getattr(view, "flip_x", False):
+        wx = -wx
+    if getattr(view, "flip_y", False):
+        wy = -wy
+    return wx, wy
+
+
 def transfer_function(shape, pitch_nm, optics) -> np.ndarray | None:
     """Objective transfer H(k) (complex64, FFT layout) or None when it is ~identity.
 
@@ -252,7 +270,7 @@ def transfer_function(shape, pitch_nm, optics) -> np.ndarray | None:
     ``chi(k + k_t) - chi(k_t)`` and the envelopes use ``grad chi(k + k_t) - grad chi(k_t)``."""
     lam = optics.wavelength_nm
     ab = image_aberrations_of(optics)
-    tx, ty = (v / 1000.0 / lam for v in optics.beam_tilt_mrad)
+    tx, ty = _raster_tilt(optics)
     alpha = optics.illumination_mrad / 1000.0
     delta = optics.focal_spread_nm
     kap = optics.objective_aperture_mrad / 1000.0 / lam if optics.objective_aperture_mrad > 0 else 0.0
@@ -510,7 +528,7 @@ def render_physical(fm, optics, grains, crystallinity, cfg, seed: int, cache: Tr
         cache._put(cache.spectra, skey, spec)
     else:
         cache.spectra.move_to_end(skey)
-    hkey = (shape, p_nm, optics.wavelength_nm, image_aberrations_of(optics).key(), optics.beam_tilt_mrad,
+    hkey = (shape, p_nm, optics.wavelength_nm, image_aberrations_of(optics).key(), _raster_tilt(optics),
             optics.illumination_mrad, optics.focal_spread_nm, optics.objective_aperture_mrad)
     if hkey in cache.transfer:
         H = cache.transfer[hkey]

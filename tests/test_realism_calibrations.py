@@ -323,6 +323,8 @@ def test_image_shift_brings_coma_which_the_coma_vs_is_calibration_measures():
     s = focus_step(is_units)
     want_px = 1000.0 * np.hypot(*tau) * 1e-3 / truth["true_pixel_nm"]  # 1 um of defocus change
     assert np.hypot(*s) == pytest.approx(want_px, rel=0.15)
+    d = _camera_vec(truth, tau)  # along the induced tilt, in the camera frame
+    assert abs(float(s @ d)) / (np.hypot(*s) * np.hypot(*d)) > 0.95
 
 
 def test_high_defocus_changes_magnification_and_rotation():
@@ -339,7 +341,8 @@ def test_high_defocus_changes_magnification_and_rotation():
     assert p1 / p0 > 1.025, "the 4 % change is measured"
     turn = (a1 - a0 + 45.0) % 90.0 - 45.0  # a square grating: its orders repeat every 90 deg
     want = (t1["image_rotation_deg"] - t0["image_rotation_deg"] + 45.0) % 90.0 - 45.0
-    assert abs(want) > 1.0 and abs(turn) == pytest.approx(abs(want), abs=0.3)
+    # image features turn by MINUS the reported rotation (world -> camera, rows down)
+    assert abs(want) > 1.0 and turn == pytest.approx(-want, abs=0.3)
 
 
 def test_texture_moves_with_the_specimen_when_the_view_is_rotated():
