@@ -49,6 +49,51 @@ def _shift_px(a: np.ndarray, b: np.ndarray, up: int = 20) -> np.ndarray:
     return np.array([xs[i], ys[j]])
 
 
+def _grating(tw, lines_per_mm: float = 2160.0) -> tuple[float, float]:
+    """(pixel size nm, first-order angle deg) from a cross-grating image, as Find Pixel Size
+    does: a spread beam, a Hann window against edge streaks, the first order searched near
+    where the nominal pixel puts it, and its centroid in a 4x zero-padded FFT."""
+    tw.column.set("Intensity", 0.95)
+    img = _img(tw)
+    ny, nx = img.shape
+    win = np.hanning(ny)[:, None] * np.hanning(nx)[None, :]
+    n = 4 * max(ny, nx)
+    F = np.abs(np.fft.fft2((img - img.mean()) * win, s=(n, n)))
+    fy = np.broadcast_to(np.fft.fftfreq(n)[:, None] * n, (n, n))
+    fx = np.broadcast_to(np.fft.fftfreq(n)[None, :] * n, (n, n))
+    r = np.hypot(fx, fy)
+    expect = n * tw.calibration_truth()["nominal_pixel_nm"] / (1e6 / lines_per_mm)
+    G = np.where((r > 0.85 * expect) & (r < 1.15 * expect) & (fy >= 0), F, 0.0)
+    ky, kx = np.unravel_index(np.argmax(G), G.shape)
+    rows = (ky + np.arange(-3, 4)) % n
+    cols = (kx + np.arange(-3, 4)) % n
+    w = F[np.ix_(rows, cols)] ** 2
+    gy = np.fft.fftfreq(n)[rows] * n
+    gx = np.fft.fftfreq(n)[cols] * n
+    cy = float((gy[:, None] * w).sum() / w.sum())
+    cx = float((gx[None, :] * w).sum() / w.sum())
+    return (1e6 / lines_per_mm) / (n / math.hypot(cx, cy)), math.degrees(math.atan2(cy, cx))
+
+
+def _xcorr_shift(a: np.ndarray, b: np.ndarray, sigma: float = 4.0) -> np.ndarray:
+    """(dx, dy) px of b against a from a plain (unwhitened) cross-correlation of low-passed
+    images, parabola-refined: follows the large features when the fine contrast differs."""
+    from scipy.ndimage import gaussian_filter
+
+    a = gaussian_filter(a, sigma)
+    b = gaussian_filter(b, sigma)
+    c = np.fft.ifft2(np.fft.fft2(b - b.mean()) * np.conj(np.fft.fft2(a - a.mean()))).real
+    ny, nx = c.shape
+    iy, ix = np.unravel_index(np.argmax(c), c.shape)
+
+    def par(m, z, p):
+        return 0.5 * (m - p) / (m - 2 * z + p)
+
+    dy = par(c[iy - 1, ix], c[iy, ix], c[(iy + 1) % ny, ix])
+    dx = par(c[iy, ix - 1], c[iy, ix], c[iy, (ix + 1) % nx])
+    return np.array([(ix - nx if ix > nx // 2 else ix) + dx, (iy - ny if iy > ny // 2 else iy) + dy])
+
+
 def _img(tw, req=None):
     return tw.flux(req or tw.request()).astype(np.float64)
 
@@ -74,25 +119,9 @@ def test_the_ideal_twin_reports_an_ideal_column():
 def test_find_pixel_size_on_a_cross_grating():
     tw = _twin("Cross grating 2160 l/mm", mag=2000.0)
     truth = tw.calibration_truth()
-    img = _img(tw)
-    n = 4096  # zero-padded FFT: sub-bin period
-    F = np.abs(np.fft.fft2(img - img.mean(), s=(n, n)))
-    # SerialEM looks for the grating's first order near where the nominal pixel puts it
-    fy = np.fft.fftfreq(n)[:, None] * n
-    fx = np.fft.fftfreq(n)[None, :] * n
-    r = np.hypot(fx, fy)
-    expect = n * truth["nominal_pixel_nm"] / (1e6 / 2160.0)
-    F[(r < 0.8 * expect) | (r > 1.2 * expect)] = 0
-    ky, kx = np.unravel_index(np.argmax(F), F.shape)
-    win = np.s_[ky - 3:ky + 4, kx - 3:kx + 4]  # centroid of the first-order peak
-    w = F[win] ** 2
-    k = float((r[win] * w).sum() / w.sum())
-    period_px = n / k
-    measured_nm = 1e6 / 2160.0 / period_px
-    assert measured_nm == pytest.approx(truth["true_pixel_nm"], rel=0.01)
-    assert abs(measured_nm - truth["true_pixel_nm"]) < 0.5 * abs(truth["nominal_pixel_nm"] - truth["true_pixel_nm"])
+    measured_nm, _ = _grating(tw)
+    assert measured_nm == pytest.approx(truth["true_pixel_nm"], rel=0.005)
     assert abs(truth["true_pixel_nm"] / truth["nominal_pixel_nm"] - 1) > 0.002, "the calibration had something to find"
-
 
 def test_image_shift_calibration_recovers_the_matrix_and_rotation():
     tw = _twin()
@@ -228,3 +257,85 @@ def test_beam_shift_moves_the_beam_not_the_image():
     b = _img(tw)
     # the specimen does not move (only the illumination edge, far outside this field)
     assert np.abs(_shift_px(a, b)).max() < 0.1
+
+
+# ------------------------------------------------------------------ focus and coma (phase 3)
+def _camera_vec(truth: dict, world_nm) -> np.ndarray:
+    """A specimen-plane displacement (nm) as a camera-pixel vector, in the camera's rotated
+    frame (sign as the image moves with the specimen feature)."""
+    return -_predicted_px(truth, (world_nm[0] / 1000.0, world_nm[1] / 1000.0))
+
+
+def _tilt_pair_shift(tw, tau_mrad: float) -> np.ndarray:
+    tw.column.set_beam_tilt_mrad(tau_mrad, 0.0)
+    a = _img(tw)
+    tw.column.set_beam_tilt_mrad(-tau_mrad, 0.0)
+    b = _img(tw)
+    tw.column.set_beam_tilt_mrad(0.0, 0.0)
+    return _shift_px(a, b)
+
+
+def test_autofocus_calibration_tilt_pairs_measure_the_defocus():
+    """SerialEM's autofocus: the image displacement between +tau and -tau beam tilt is
+    2 * defocus * tau, so a calibration of it reads the defocus back."""
+    tw = _twin()
+    px_nm = tw.calibration_truth()["true_pixel_nm"]
+    tau = 3.0  # mrad
+    shifts = {}
+    for df in (-0.5, -1.0, -2.0):
+        tw.column.set_defocus_um(df)
+        shifts[df] = _tilt_pair_shift(tw, tau)
+    for df, s in shifts.items():
+        want_px = 2.0 * abs(df) * 1000.0 * tau * 1e-3 / px_nm
+        assert np.hypot(*s) == pytest.approx(want_px, rel=0.05, abs=0.3)
+    # linear in defocus, and along one line (the tilt direction in the camera frame)
+    ratio = np.hypot(*shifts[-2.0]) / np.hypot(*shifts[-1.0])
+    assert ratio == pytest.approx(2.0, rel=0.05)
+    u, v = shifts[-1.0] / np.hypot(*shifts[-1.0]), shifts[-2.0] / np.hypot(*shifts[-2.0])
+    assert abs(float(u @ v)) > 0.99
+
+
+def test_image_shift_brings_coma_which_the_coma_vs_is_calibration_measures():
+    """Off the coma-free axis a defocus change moves the image by (defocus change) * (the
+    effective tilt of the image shift): SerialEM's ComaVsIS measures that tilt."""
+    tw = _twin()
+    truth = tw.calibration_truth()
+    K = np.asarray(truth["is_coma_mrad_per_is_um"]).T  # mrad per specimen um of image shift
+    M = np.asarray(truth["is_matrix_um_per_unit"])
+
+    tw.column.set("Intensity", 0.95)  # a spread beam: no disc edge in the field
+
+    def focus_step(is_units):
+        # a small focus step: the fine contrast changes, so follow the large features
+        tw.column.set("ImageShift", is_units)
+        tw.column.set_defocus_um(-0.5)
+        a = _img(tw)
+        tw.column.set_defocus_um(-1.5)
+        b = _img(tw)
+        tw.column.set_defocus_um(0.0)
+        tw.column.set("ImageShift", (0.0, 0.0))
+        return _xcorr_shift(a, b)
+
+    assert np.abs(focus_step((0.0, 0.0))).max() < 0.1, "on axis, focus does not move the image"
+    is_units = (4.0, 0.0)
+    tau = K @ (M @ is_units)  # mrad
+    s = focus_step(is_units)
+    want_px = 1000.0 * np.hypot(*tau) * 1e-3 / truth["true_pixel_nm"]  # 1 um of defocus change
+    assert np.hypot(*s) == pytest.approx(want_px, rel=0.15)
+
+
+def test_high_defocus_changes_magnification_and_rotation():
+    tw = _twin("Cross grating 2160 l/mm", mag=2000.0)
+    p0, a0 = _grating(tw)
+    t0 = tw.calibration_truth()
+    tw.column.set_defocus_um(-200.0)
+    p1, a1 = _grating(tw)
+    t1 = tw.calibration_truth()
+    assert t1["true_pixel_nm"] / t0["true_pixel_nm"] == pytest.approx(1.04, rel=1e-6)
+    # the defocus envelope falls steeply across the first order at -200 um and skews its
+    # centroid a little: ~1 %, as SerialEM's own high-defocus calibration
+    assert p1 / p0 == pytest.approx(t1["true_pixel_nm"] / t0["true_pixel_nm"], rel=0.01)
+    assert p1 / p0 > 1.025, "the 4 % change is measured"
+    turn = (a1 - a0 + 45.0) % 90.0 - 45.0  # a square grating: its orders repeat every 90 deg
+    want = (t1["image_rotation_deg"] - t0["image_rotation_deg"] + 45.0) % 90.0 - 45.0
+    assert abs(want) > 1.0 and abs(turn) == pytest.approx(abs(want), abs=0.3)

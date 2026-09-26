@@ -81,6 +81,17 @@ class ColumnRealism:
     #: sizes and probe modes (SerialEM's Beam Crossover calibration).
     crossover_intensity: float = 0.35
     crossover_sigma: float = 0.02
+    #: Image shift images the specimen off the objective's coma-free axis: an effective beam
+    #: tilt of this many mrad per micrometre of image shift (~1 / f_obj, f_obj ~ 2.3 mm), at
+    #: a small seeded angle, and an axial astigmatism of this many nm per micrometre. What
+    #: SerialEM's coma-vs-image-shift calibration measures.
+    is_coma_mrad_per_um: float = 0.43
+    is_astig_nm_per_um: float = 15.0
+    #: High defocus weakens the objective: the magnification changes by this fraction and
+    #: the image rotates by this many degrees per micrometre of defocus (SerialEM's
+    #: high-defocus magnification / image-shift calibrations; -200 um: ~4 %, ~2 deg).
+    hd_scale_per_um: float = 2.0e-4
+    hd_rotation_deg_per_um: float = 0.01
 
     def _key(self, mag_mode, mag: float) -> tuple[int, int]:
         return _mode_id(mag_mode), int(round(float(mag)))
@@ -128,6 +139,25 @@ class ColumnRealism:
         """The Intensity at the C2 crossover for this spot size and probe mode."""
         x = self.crossover_intensity + self.crossover_sigma * _n(self.seed, 61, int(spot), int(probe_mode))
         return float(min(max(x, 0.05), 0.95))
+
+    def is_tilt_mrad(self, isx_um: float, isy_um: float) -> tuple[float, float]:
+        """The effective beam tilt (mrad) of an image shift of (x, y) specimen micrometres."""
+        a = math.radians(10.0) * _n(self.seed, 71)
+        c, s = math.cos(a), math.sin(a)
+        k = self.is_coma_mrad_per_um
+        return k * (c * isx_um - s * isy_um), k * (s * isx_um + c * isy_um)
+
+    def is_astig_nm(self, isx_um: float, isy_um: float) -> complex:
+        """The axial astigmatism A1 (complex nm) an image shift of (x, y) um adds."""
+        phase = 2.0 * math.pi * _u(self.seed, 72)
+        return self.is_astig_nm_per_um * complex(math.cos(phase), math.sin(phase)) * complex(isx_um, isy_um)
+
+    def defocus_scale(self, defocus_um: float) -> float:
+        """True pixel size factor at this defocus (the magnification drops as it grows)."""
+        return 1.0 + self.hd_scale_per_um * abs(float(defocus_um))
+
+    def defocus_rotation_rad(self, defocus_um: float) -> float:
+        return math.radians(self.hd_rotation_deg_per_um * float(defocus_um))
 
     def truth(self, mag_mode, mag: float) -> dict:
         """Every value at one magnification, for tests that calibrate against the twin."""

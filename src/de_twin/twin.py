@@ -457,10 +457,16 @@ class DigitalTwin:
         if r is not None:
             out["bs_matrix_um_per_unit"] = r.bs_matrix().tolist()
             out["crossover_intensity"] = r.crossover(int(state.spot_size), int(state.probe_mode))
+        out["is_coma_mrad_per_is_um"] = [[0.0, 0.0], [0.0, 0.0]]
+        out["is_astig_nm_per_is_um"] = (0.0, 0.0)
         if r is not None and imaging:
             t = r.truth(state.mag_mode, state.magnification)
             out["is_matrix_um_per_unit"] = t["is_matrix_um_per_unit"]
             out["mag_offset_um"] = tuple(t["mag_offset_um"])
+            # per micrometre of image shift at the SPECIMEN (IS matrix applied)
+            out["is_coma_mrad_per_is_um"] = [list(r.is_tilt_mrad(1.0, 0.0)), list(r.is_tilt_mrad(0.0, 1.0))]
+            a = r.is_astig_nm(1.0, 0.0)
+            out["is_astig_nm_per_is_um"] = (a.real, a.imag)
         return out
 
     def ground_truth(self, request: Optional[AcquisitionRequest] = None, *, as_arrays: bool = False):

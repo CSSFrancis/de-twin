@@ -169,6 +169,7 @@ def derive_optics(state: MicroscopeState, request: AcquisitionRequest, camera,
     nominal_nm_per_px = nm_per_px
     if cfg.realism is not None and _tem_imaging(state) and cfg.pixel_size_override_nm <= 0:
         nm_per_px = nm_per_px * cfg.realism.pixel_scale(state.mag_mode, state.magnification)
+        nm_per_px *= cfg.realism.defocus_scale(state.defocus_um + cfg.defocus_offset_um)
 
     # Reciprocal space
     cl_mm = state.camera_length_mm if state.camera_length_mm > 0 else cfg.default_camera_length_mm
@@ -235,6 +236,7 @@ def derive_optics(state: MicroscopeState, request: AcquisitionRequest, camera,
     rotation = math.radians(scan.rotation_deg) if scanning else 0.0
     if cfg.realism is not None and mode == RenderMode.TEM_IMAGING and not scanning:
         rotation = cfg.realism.rotation_rad(state.mag_mode, state.magnification)
+        rotation += cfg.realism.defocus_rotation_rad(state.defocus_um + cfg.defocus_offset_um)
     view = ViewWindow(center_um=(cx, cy), pixel_um=raster_nm / 1000.0, shape=(int(ry), int(rx)),
                       rotation_rad=rotation, cos_alpha=cos_y, cos_beta=cos_x)
     # TEM imaging: where beam shift has put the illuminated disc, raster pixels from centre
@@ -334,6 +336,15 @@ def derive_optics(state: MicroscopeState, request: AcquisitionRequest, camera,
     prb_d = getattr(state, "probe_aberrations", None) or {}
     image_ab = Aberrations(img_d) if img_d else uncorrected(cfg.cs_mm)
     image_ab = image_ab + {"C1": c1_nm, "A1": complex(a1[0], a1[1])}
+    # [realism] an image shift images the specimen off the coma-free axis: an effective beam
+    # tilt (axial coma, a defocus-dependent image shift) and axial astigmatism
+    img_tilt = (float(state.beam_tilt_mrad.x), float(state.beam_tilt_mrad.y))
+    if cfg.realism is not None and _tem_imaging(state):
+        isw = cfg.realism.is_matrix(state.mag_mode, state.magnification) @ (
+            state.image_shift_um.x, state.image_shift_um.y)
+        tx, ty = cfg.realism.is_tilt_mrad(float(isw[0]), float(isw[1]))
+        img_tilt = (img_tilt[0] + tx, img_tilt[1] + ty)
+        image_ab = image_ab + {"A1": cfg.realism.is_astig_nm(float(isw[0]), float(isw[1]))}
     probe_ab = Aberrations(prb_d) if prb_d else uncorrected(cfg.cs_mm)
     probe_ab = probe_ab + {"C1": c1_nm, "A1": complex(a1_probe[0], a1_probe[1])}
     spot = state.spot_size if state.spot_size > 0 else cfg.reference_spot
@@ -386,7 +397,7 @@ def derive_optics(state: MicroscopeState, request: AcquisitionRequest, camera,
         fresnel_sign=float(fresnel_sign),
         fresnel_sigma_px=float(fresnel_sigma),
         objective_stig=(float(stig.x), float(stig.y)),
-        beam_tilt_mrad=(float(state.beam_tilt_mrad.x), float(state.beam_tilt_mrad.y)),
+        beam_tilt_mrad=img_tilt,
         beam_offset_px=beam_offset_px,
         precession_mrad=float(state.precession_mrad) if state.precession_on else 0.0,
         precession_hz=float(state.precession_hz),
