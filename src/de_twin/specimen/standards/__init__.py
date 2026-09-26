@@ -167,19 +167,30 @@ def build_structure(number: str) -> StandardStructure:
     au = dict(metal=MaterialId.GOLD)  # Au/Pd: gold stands in for the alloy
     old, new = dict(edge_nm=10.0, edge_corr_nm=60.0, wavy_nm=40.0, wavy_um=1.2), dict(
         edge_nm=3.0, edge_corr_nm=80.0, wavy_nm=6.0, wavy_um=3.0)
-    if number in ("607", "607-A", "603", "603-A"):
-        g = WaffleGrating(P2160, depth_nm=20.0, line_fraction=0.18, ramp_nm=45.0, **(old if number.endswith("A") else new))
-        sph = LatexSpheres(261.0, 0.15) if number.startswith("603") else None
-        return ShadowedReplicaStructure(g, rough_nm=7.0 if number.endswith("A") else 4.5, rough_um=0.1, spheres=sph,
+    # The current gratings (607, 603, 677, 673; Ted Pella's images): square wells between
+    # narrow raised lines, steep walls, shadowed along the diagonal at a low angle, so each
+    # well floor has a bare L-shaped shadow ~1/4 of it wide and the rest a grainy coat.
+    # The older style (607-A, 603-A): a softer, rougher, wavier embossed relief.
+    if number in ("607", "603"):
+        g = WaffleGrating(P2160, depth_nm=45.0, line_fraction=0.14, ramp_nm=12.0, **new)
+        sph = LatexSpheres(262.0, 0.15) if number == "603" else None
+        return ShadowedReplicaStructure(g, rough_nm=2.5, rough_um=0.1, crumple_nm=6.0, metal_nm=8.0,
+                                        elevation_deg=20.0, spheres=sph, spheres_shadowed=False, **au)
+    if number in ("607-A", "603-A"):
+        g = WaffleGrating(P2160, depth_nm=25.0, line_fraction=0.18, ramp_nm=45.0, **old)
+        sph = LatexSpheres(262.0, 0.15) if number == "603-A" else None
+        return ShadowedReplicaStructure(g, rough_nm=7.0, rough_um=0.1, elevation_deg=20.0, spheres=sph,
                                         spheres_shadowed=False, **au)
     if number == "606":
-        return ShadowedReplicaStructure(WaffleGrating(P2160, depth_nm=20.0, line_fraction=0.3, ramp_nm=45.0, both=False,
-                                                      **new), rough_um=0.1, **au)
+        return ShadowedReplicaStructure(WaffleGrating(P2160, depth_nm=45.0, line_fraction=0.14, ramp_nm=12.0,
+                                                      both=False, **new),
+                                        rough_nm=2.5, rough_um=0.1, crumple_nm=6.0, metal_nm=8.0,
+                                        elevation_deg=20.0, **au)
     if number in ("677", "673"):
-        # trench-type grooves: narrow grooves between raised square plateaus
-        g = WaffleGrating(0.5, depth_nm=40.0, line_fraction=0.2, ramp_nm=15.0, trench=True, **new)
-        sph = LatexSpheres(261.0, 0.15) if number == "673" else None
-        return ShadowedReplicaStructure(g, rough_nm=2.0, spheres=sph, spheres_shadowed=False, **au)
+        g = WaffleGrating(0.5, depth_nm=45.0, line_fraction=0.12, ramp_nm=12.0, **new)
+        sph = LatexSpheres(262.0, 0.15) if number == "673" else None
+        return ShadowedReplicaStructure(g, rough_nm=2.0, rough_um=0.1, crumple_nm=6.0, metal_nm=8.0,
+                                        elevation_deg=20.0, spheres=sph, spheres_shadowed=False, **au)
     if number == "628-B":
         # a heavy, low-angle gold shadow: shadows ~3.5 diameters long
         return ShadowedReplicaStructure(None, base_nm=15.0, rough_nm=1.5, crumple_nm=4.0, metal_nm=15.0,
@@ -206,17 +217,17 @@ def build_structure(number: str) -> StandardStructure:
     if number == "608":
         return FerritinStructure()
     if number == "613":
-        return HoleyCarbonStructure(HoleyFilm(15.0), MaterialId.GOLD, deposit_nm=3.0, island_nm=7.0,
-                                    coverage=0.62, grain_nm=5.0)
+        return HoleyCarbonStructure(HoleyFilm(15.0), MaterialId.GOLD, deposit_nm=4.0, island_nm=7.0,
+                                    coverage=0.76, grain_nm=5.0)
     if number == "611":
-        return HoleyCarbonStructure(HoleyFilm(12.0), MaterialId.PLATINUM, deposit_nm=0.25, island_nm=1.3,
-                                    coverage=0.22, grain_nm=1.3)
+        return HoleyCarbonStructure(HoleyFilm(12.0), MaterialId.PLATINUM, deposit_nm=0.6, island_nm=1.4,
+                                    coverage=0.24, grain_nm=1.4)
     if number == "609":
-        return HoleyCarbonStructure(HoleyFilm(15.0))
+        return HoleyCarbonStructure(HoleyFilm(25.0))
     if number == "638":
         return HoleyCarbonStructure(HoleyFilm(15.0), MaterialId.GOLD, deposit_nm=1.5, island_nm=8.0, coverage=0.55,
                                     grain_nm=6.0, extra=CarbonBlackParticles(cluster_cell_um=1.5, cluster_fraction=0.5,
-                                                                             per_cluster=60.0))
+                                                                             per_cluster=120.0))
     raise KeyError(f"no structure for product {number!r}")
 
 

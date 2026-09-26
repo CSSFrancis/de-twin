@@ -407,9 +407,18 @@ def build_tile(fm, optics, grains, crystallinity, cfg, seed: int, bandwidth: flo
         t = band_limit(t, fm.view.pixel_um * 1000.0, bandwidth)
     thick = fm.thickness_nm.astype(np.float32) * np.float32(optics.thickness_tilt_factor)
     mat = fm.material_id
-    lam_px = absorption_lengths_nm(optics.ht_kv)[mat]
+    lam_all = absorption_lengths_nm(optics.ht_kv)
+    lam_px = lam_all[mat]
     T = np.exp(-thick / lam_px).astype(np.float32)
     dw = ((1.0 - T) * np.exp(-thick / (DIFFUSE_CUTOFF_LENGTHS * lam_px))).astype(np.float32)
+    under = None
+    if fm.under_thickness_nm is not None:  # absorbed with the primary; its diffuse part added below
+        umat = fm.under_material
+        tu = fm.under_thickness_nm.astype(np.float32) * np.float32(optics.thickness_tilt_factor)
+        Tu = np.exp(-tu / lam_all[umat]).astype(np.float32)
+        under = (umat, ((1.0 - Tu) * np.exp(-tu / (DIFFUSE_CUTOFF_LENGTHS * lam_all[umat]))).astype(np.float32))
+        T = T * Tu
+        dw = dw * Tu
     theta_c = 1000.0 * optics.wavelength_nm * kmax
     fb = np.array([diffuse_beyond_fraction(m, optics.wavelength_nm, theta_c) if kmax > 0 else (1.0 if m else 0.0)
                    for m in range(len(MATERIALS))], np.float32)
@@ -426,6 +435,13 @@ def build_tile(fm, optics, grains, crystallinity, cfg, seed: int, bandwidth: flo
             sel = mat == m
             if dwb[sel].max() > 0:
                 diffuse[int(m)] = np.where(sel, dwb, np.float32(0.0))
+        if under is not None:
+            umat, uw = under
+            for m in np.unique(umat):
+                if m == 0:
+                    continue
+                add = np.where(umat == m, uw * fb[m], np.float32(0.0))
+                diffuse[int(m)] = diffuse[int(m)] + add if int(m) in diffuse else add
     return Tile(fm.view, t, bragg if cfg.coherent_incoherent_scattering else None, bc.gid,
                 thickness_bin_for(thick), mat, diffuse)
 

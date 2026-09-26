@@ -38,6 +38,9 @@ def buckets(fm, optics, grains, crystallinity, cfg):
     weight = np.bincount(inv, weights=s.T[disk].astype(np.float64), minlength=len(uniq)) / n
     cryst = np.bincount(inv, weights=s.crystallinity[disk], minlength=len(uniq)) / counts
     diffuse = np.bincount(mat, weights=s.diffuse_w[disk].astype(np.float64), minlength=len(MATERIALS)) / n
+    if s.under_mat is not None:
+        diffuse = diffuse + np.bincount(s.under_mat[disk].astype(np.int64), weights=s.under_w[disk].astype(np.float64),
+                                        minlength=len(MATERIALS)) / n
     return (uniq >> 40, ((uniq >> 12) & 0x0FFFFFFF) - 1, (uniq & 0xFFF) * THICKNESS_BIN_NM, cryst, weight), diffuse
 
 

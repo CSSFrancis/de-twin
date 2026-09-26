@@ -173,6 +173,9 @@ class StemRenderer:
             if s.diffuse_w[y, x] > 0:
                 m = int(s.mat[y, x])
                 dterms[m] = dterms.get(m, 0.0) + wt * float(s.diffuse_w[y, x])
+            if s.under_mat is not None and s.under_w[y, x] > 0:
+                m = int(s.under_mat[y, x])
+                dterms[m] = dterms.get(m, 0.0) + wt * float(s.under_w[y, x])
         out = np.zeros((h, w), np.float32)
         for k, wt in terms.items():
             out += np.float32(wt) * self._pattern(tab, k, optics, grains)
@@ -214,7 +217,10 @@ class StemRenderer:
         frac = annulus_fractions(self.all_specs(tab, optics, grains), optics.convergence_mrad,
                                  lam, inner_mrad, outer_mrad)
         dfrac = np.array([diffuse_annulus_fraction(m, lam, inner_mrad, outer_mrad) for m in range(len(MATERIALS))])
-        sig = (s.T * frac[tab.key_index] + s.diffuse_w * dfrac[s.mat]).astype(np.float32)
+        sig = s.T * frac[tab.key_index] + s.diffuse_w * dfrac[s.mat]
+        if s.under_mat is not None:
+            sig = sig + s.under_w * dfrac[s.under_mat]
+        sig = sig.astype(np.float32)
         if len(_blend_samples(optics, 0, 0, self.cfg.probe_footprint_blend)) > 1:
             o = int(round(float(optics.extras.get("probe_blend_offset_px", 0.0))))
             p = np.pad(sig, o, mode="edge")

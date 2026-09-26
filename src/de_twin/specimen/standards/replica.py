@@ -32,7 +32,7 @@ from ...hashing import SeedKind, hash_seed, normal_from_hash, splitmix64, unifor
 from ..fieldmap import grain_id_from_hash
 from ..geometry import NM_PER_UM, JitteredLattice
 from ..materials import MaterialId, absorption_lengths_nm
-from ..noise import cells, fbm
+from ..noise import FastLattice, cells, fbm
 from ..structures import _claim, _owner_pixels, _resolved
 from .common import StandardStructure
 
@@ -45,29 +45,24 @@ def island_film(seed: int, X_um, Y_um, deposit_nm, mean_deposit_nm: float, islan
     """An evaporated island film on the pixels (X, Y) (um) with local *deposit_nm*: (inside
     island, island thickness nm, grain id of each inside pixel).
 
-    Islands grow from nucleation sites `island_nm` apart (a warped jittered grid, so their
-    outlines are rounded and irregular). Where the deposit is low an island is a round
-    droplet; as it rises the droplets grow until only narrow channels separate them, and
-    neighbours coalesce into worm-like islands. The local coverage follows the deposit
-    (``coverage`` at the mean) and the metal is conserved (island thickness = deposit /
-    local coverage). Each island is nanocrystalline (grains of `grain_nm`)."""
+    The shapes are phase-separation stamps (:mod:`..stamps`): round droplets where the
+    deposit is low, worms and a percolating labyrinth near half coverage, a film with holes
+    above; features `island_nm` apart. The local coverage follows the deposit (``coverage``
+    at the mean) and the metal is conserved (island thickness = deposit / local coverage).
+    Each island is nanocrystalline (grains of `grain_nm`)."""
+    from .. import stamps
+
     dep = np.asarray(deposit_nm, float)
     rel = dep / max(mean_deposit_nm, 1e-9)
-    c = np.clip(coverage * rel ** 0.8, 0.0, 0.85)
-    L = island_nm / NM_PER_UM
-    wx = X_um + 0.28 * L * fbm(seed ^ 0xA1, X_um, Y_um, 1.1 * L, 2)
-    wy = Y_um + 0.28 * L * fbm(seed ^ 0xA2, X_um, Y_um, 1.1 * L, 2)
-    merge = np.clip(1.6 * (c - 0.35), 0.0, 0.7)  # coalescence past ~35% coverage
-    d1, gap, _ = cells(seed, wx / L, wy / L, merge)
-    # droplet radius and channel half-width (cell units) that give coverage c
-    r = np.sqrt(np.minimum(c, 0.6) / math.pi) * 1.05
-    half = (1.0 - c) / (3.8 * (1.0 - merge))  # the channels' area is ~3.8 x half-width per cell
-    inside = (dep > 0) & (((c < 0.45) & (d1 < r)) | ((c >= 0.45) & (gap > half)))
+    c = np.clip(coverage * rel ** 0.8, 0.0, 0.9)
+    f = stamps.field(seed, X_um, Y_um, island_nm / NM_PER_UM, c)
+    inside = (f > 0.0) & (dep > 0)
     t = np.where(inside, dep / np.maximum(c, 1e-3), 0.0)
     grain = np.zeros(0, np.int32)
-    if inside.any():
-        hit = JitteredLattice(grain_nm / NM_PER_UM, seed, 0x1F).nearest(wx[inside], wy[inside])
-        grain = grain_id_from_hash(metal, hit.h)
+    if inside.any():  # nanocrystalline: the nearest of jittered sites `grain_nm` apart
+        G = grain_nm / NM_PER_UM
+        _, _, h = cells(seed ^ 0x1F, X_um[inside] / G, Y_um[inside] / G, 0.0)
+        grain = grain_id_from_hash(metal, h)
     return inside, t, grain
 
 
@@ -102,13 +97,18 @@ class WaffleGrating:
         return self.depth * (1.0 - f if self.trench else f)
 
     def warp(self, seed, lx, ly):
-        if self.wavy <= 0:
-            return lx, ly
-        # lines wiggle sideways: the displacement varies along a line and only slowly across
-        # lines, so the pitch (and the calibration it carries) stays exact
+        """Where (lx, ly) falls on the ideal grating: lines wiggle sideways (waviness that
+        varies along a line and only slowly across lines, so the pitch stays exact) and their
+        edges are rough (a short-range sideways jitter)."""
+        u, v = lx, ly
         a = WAVY_ACROSS
-        return (lx + self.wavy * fbm(seed ^ 0x51, a * lx, ly, self.wavy_um, 2),
-                ly + self.wavy * fbm(seed ^ 0x52, lx, a * ly, self.wavy_um, 2))
+        if self.wavy > 0:
+            u = u + self.wavy * fbm(seed ^ 0x51, a * lx, ly, self.wavy_um, 2)
+            v = v + self.wavy * fbm(seed ^ 0x52, lx, a * ly, self.wavy_um, 2)
+        if self.edge > 0:
+            u = u + self.edge * fbm(seed ^ 0x61, 0.3 * lx, ly, self.edge_corr, 2)
+            v = v + self.edge * fbm(seed ^ 0x62, lx, 0.3 * ly, self.edge_corr, 2)
+        return u, v
 
     def height_nm(self, seed, u, v, rough: bool = True) -> np.ndarray:
         """Relief height (nm) at warped owner-local (u, v) um."""
@@ -134,6 +134,45 @@ class WaffleGrating:
             out = r if out is None else np.maximum(out, r)
         h = self.depth * out
         return self.depth - h if self.trench else h
+
+
+class ReliefTile:
+    """One period of a grating's shadowed relief, computed once: height, slope and the lit
+    fraction (cast shadows with the source's penumbra) on an N x N grid over the period.
+    The relief is periodic, so its shadows are too; a pixel only looks them up."""
+
+    N = 384
+
+    def __init__(self, relief: "WaffleGrating", elev: float, to_source: tuple, penumbra: float):
+        from scipy import ndimage
+
+        n, P = self.N, relief.P
+        self.P = P
+        c = (np.arange(n) + 0.5) * P / n
+        U, V = np.meshgrid(c, c)  # [row = v, col = u]
+        h = relief.height_nm(0, U, V, rough=False).astype(np.float64)
+        d = P / n * NM_PER_UM  # nm per tile pixel
+        gx = (np.roll(h, -1, axis=1) - np.roll(h, 1, axis=1)) / (2 * d)
+        gy = (np.roll(h, -1, axis=0) - np.roll(h, 1, axis=0)) / (2 * d)
+        ux, uy = to_source
+        tan_lo = math.tan(max(elev - 0.5 * penumbra, 0.02))
+        tan_hi = math.tan(elev + 0.5 * penumbra)
+        reach = relief.depth / tan_lo  # nm
+        worst = np.full(h.shape, -np.inf)
+        rows, cols = np.mgrid[0:n, 0:n].astype(np.float64)
+        for s_nm in np.arange(d, reach + 2 * d, 1.5 * d):
+            hs = ndimage.map_coordinates(h, [rows + uy * s_nm / d, cols + ux * s_nm / d], order=1, mode="grid-wrap")
+            np.maximum(worst, (hs - h - 0.5) / s_nm, out=worst)
+        lit = np.clip((tan_hi - worst) / (tan_hi - tan_lo), 0.0, 1.0)
+        self.h, self.gx, self.gy, self.lit = (np.ascontiguousarray(a, np.float32) for a in (h, gx, gy, lit))
+
+    def sample(self, u, v):
+        """(h nm, dh/dx, dh/dy, lit) at relief coordinates (u, v) um, bilinear and periodic."""
+        from ..stamps import sample_periodic
+
+        if getattr(self, "_stack", None) is None:
+            self._stack = np.stack([self.h, self.gx, self.gy, self.lit])
+        return list(sample_periodic(self._stack, np.asarray(u) / self.P, np.asarray(v) / self.P))
 
 
 @dataclass
@@ -173,7 +212,9 @@ class LatexSpheres:
         """A lattice finer than the mean spacing, sparsely occupied, so the spheres lie at
         random rather than on a grid (but never overlap)."""
         spacing = 1.0 / math.sqrt(max(self.density_per_um2, 1e-6))
-        return max(0.5 * spacing, 1.3 * self.diameter_nm * (1.0 + 3.0 * self.sigma_frac) / NM_PER_UM)
+        # sites stay within 0.2 cells of their cell centre (FastLattice jitter 0.4), so they are
+        # >= 0.6 cells apart: a sphere up to 0.6 cells across never overlaps its neighbours
+        return max(0.5 * spacing, 1.7 * self.diameter_nm * (1.0 + 3.0 * self.sigma_frac) / NM_PER_UM)
 
     def spheres(self, seed, lattice, hit):
         """(present, radius um, centre x, centre y) at the nearest lattice sites of *hit*."""
@@ -265,36 +306,52 @@ class ShadowedReplicaStructure(StandardStructure):
             h = h + self.rough_nm * fbm(seed ^ 0x91, x, y, self.rough_um, 4, 0.6)
         return h
 
-    def _sphere_top(self, seed, lat, X, Y):
-        """(top height nm, chord nm) of the latex spheres at owner-local (X, Y) um."""
-        if self.spheres.cluster > 0:
-            return self._cluster_top(seed, X, Y)
-        hit = lat.nearest(X, Y)
-        present, R, sx, sy = self.spheres.spheres(seed, lat, hit)
-        d2 = (X - sx) ** 2 + (Y - sy) ** 2
-        inside = present & (d2 < R * R)
-        half = np.where(inside, np.sqrt(np.maximum(R * R - d2, 0.0)), 0.0) * NM_PER_UM
-        return np.where(inside, R * NM_PER_UM + half, 0.0), 2.0 * half
-
-    def _cluster_top(self, seed, X, Y):
+    def _sphere_set(self, seed, lx, ly):
+        """Every latex sphere that can touch (or shade) the pixels at (lx, ly): lattice sites
+        or dried clusters, as a binned :class:`..spheres.SphereSet` (um)."""
+        from ..spheres import SphereSet, lattice_sites
         from .common import cells_near
 
         sp = self.spheres
-        cell = sp.cluster_cell_um()
-        reach = 0.5 * cell + (4.0 * sp.cluster + 4.0) * sp.diameter_nm / NM_PER_UM
-        top = np.zeros(np.shape(X))
-        chord = np.zeros(np.shape(X))
-        if np.size(X) == 0:
-            return top, chord
-        for i, j in cells_near(X, Y, cell, reach):
-            for sx, sy, R in sp.clusters(seed, i, j, cell):
-                d2 = (X - sx) ** 2 + (Y - sy) ** 2
-                inside = d2 < R * R
-                if inside.any():
-                    half = np.sqrt(np.maximum(R * R - d2[inside], 0.0)) * NM_PER_UM
-                    top[inside] = np.maximum(top[inside], R * NM_PER_UM + half)
-                    chord[inside] = chord[inside] + 2.0 * half
-        return top, chord
+        R0 = 0.5 * sp.diameter_nm / NM_PER_UM
+        shade = 2.0 * R0 * (1.0 + 3 * sp.sigma_frac) / max(math.tan(self.elev), 1e-3) if self.spheres_shadowed else 0.0
+        reach = 2.0 * R0 + shade
+        x0, x1 = float(np.min(lx)) - reach, float(np.max(lx)) + reach
+        y0, y1 = float(np.min(ly)) - reach, float(np.max(ly)) + reach
+        if sp.cluster > 0:
+            cell = sp.cluster_cell_um()
+            extent = (4.0 * sp.cluster + 4.0) * 2.0 * R0
+            cx, cy, r = [], [], []
+            for i, j in cells_near(np.array([x0, x1]), np.array([y0, y1]), cell, extent):
+                for x, y, R in sp.clusters(seed, i, j, cell):
+                    cx.append(x), cy.append(y), r.append(R)
+            return SphereSet(np.array(cx), np.array(cy), np.array(r))
+        cell = sp.cell_um()
+        xs, ys, hs = lattice_sites(seed ^ 0x2F, cell, x0, y0, x1, y1, 0.4)
+        present = uniform_from_hash(hs ^ U64(0x71)) < min(1.0, sp.density_per_um2 * cell * cell)
+        rj = 1.0 + sp.sigma_frac * np.clip(normal_from_hash(hs[present]), -3.0, 3.0)
+        return SphereSet(xs[present], ys[present], R0 * rj)
+
+    def tile(self) -> Optional[ReliefTile]:
+        if self.relief is None:
+            return None
+        if getattr(self, "_tile", None) is None:
+            self._tile = ReliefTile(self.relief, self.elev, self.u, SHADOW_PENUMBRA_RAD)
+        return self._tile
+
+    def _texture(self, seed, x, y, rough: bool):
+        """The replica's own surface (the crumple and the fine roughness): its slope (nm/nm)
+        by finite differences of the noise."""
+        e = 0.002  # um
+        def h(xx, yy):
+            out = np.zeros(np.shape(xx))
+            if self.crumple_nm > 0:
+                out = out + self.crumple_nm * fbm(seed ^ 0x93, xx, yy, self.crumple_um, 2)
+            if rough and self.rough_nm > 0:
+                out = out + self.rough_nm * fbm(seed ^ 0x91, xx, yy, self.rough_um, 4, 0.6)
+            return out
+        h0 = h(x, y)
+        return h0, (h(x + e, y) - h0) / (e * NM_PER_UM), (h(x, y + e) - h0) / (e * NM_PER_UM)
 
     def fill(self, ctx, owner):
         seed = int(hash_seed(owner.seed, SeedKind.STRUCTURE, 0)) & 0xFFFFFFFF
@@ -306,27 +363,34 @@ class ShadowedReplicaStructure(StandardStructure):
             return  # the owner carries the mean
         mean_c = self.mean_carbon_nm()
         flat = self.flat_deposit_nm()
-        eq = carbon_equivalent(self.metal)
-        rough = self.rough_nm > 0 and _resolved(self.rough_um / 2.0, ctx)
+        rough = (self.rough_nm > 0 or self.crumple_nm > 0) and _resolved(min(self.rough_um, self.crumple_um) / 2.0, ctx)
         islands = self.metal_nm > 0 and _resolved(self.island_nm / NM_PER_UM, ctx)
-        lat = JitteredLattice(self.spheres.cell_um(), seed, 0x2F) if self.spheres is not None else None
+        tile = self.tile()
         ux, uy = self.u
         sin_e, cos_e, tan_e = math.sin(self.elev), math.cos(self.elev), math.tan(self.elev)
-        step = max(px, 1.0 / NM_PER_UM)
-        dn = step * NM_PER_UM
         for B in _owner_pixels(ctx, owner):
             lx, ly = B.lx, B.ly
-            h = self._surface(seed, lx, ly, rough)
-            gx = (self._surface(seed, lx + step, ly, rough) - h) / dn
-            gy = (self._surface(seed, lx, ly + step, rough) - h) / dn
+            # the relief (looked up) and the replica's own crumpled surface (noise)
+            if tile is not None:
+                u, v = self.relief.warp(seed, lx, ly)
+                h, gx, gy, lit = tile.sample(u, v)
+            else:
+                h = gx = gy = np.zeros(lx.shape, np.float32)
+                lit = np.ones(lx.shape, np.float32)
+            if rough or self.crumple_nm > 0:
+                hn, nx_, ny_ = self._texture(seed, lx, ly, rough)
+                h, gx, gy = h + hn, gx + nx_, gy + ny_
             carbon = self.base * np.sqrt(1.0 + gx * gx + gy * gy)
-            chord = np.zeros_like(h)
-            if lat is not None:
-                top, chord = self._sphere_top(seed, lat, lx, ly)
+            chord = np.zeros(lx.shape)
+            ss = self._sphere_set(seed, lx, ly) if self.spheres is not None else None
+            if ss is not None:
+                top, chord = (a * NM_PER_UM for a in ss.top_chord(lx, ly))
                 on = top > 0
                 if on.any() and self.spheres_shadowed:
-                    tx = self._sphere_top(seed, lat, lx + step, ly)[0]
-                    ty = self._sphere_top(seed, lat, lx, ly + step)[0]
+                    step = max(px, 1.0 / NM_PER_UM)
+                    dn = step * NM_PER_UM
+                    tx = ss.top_chord(lx + step, ly)[0] * NM_PER_UM
+                    ty = ss.top_chord(lx, ly + step)[0] * NM_PER_UM
                     # the sphere's own surface, its slope capped where the rim is vertical
                     gx = np.where(on, np.clip((tx - top) / dn, -8.0, 8.0), gx)
                     gy = np.where(on, np.clip((ty - top) / dn, -8.0, 8.0), gy)
@@ -334,72 +398,37 @@ class ShadowedReplicaStructure(StandardStructure):
             if self.metal_nm > 0:
                 dep = self.metal_nm * np.maximum(sin_e - cos_e * (gx * ux + gy * uy), 0.0)
                 dep = np.minimum(dep, 2.5 * flat)
-                lit = 1.0 - self._shadow(seed, lx, ly, B, h, lat if self.spheres_shadowed else None, px, tan_e)
+                if ss is not None and self.spheres_shadowed:
+                    occ = ss.occlusion(lx, ly, h / NM_PER_UM, self.u, self.elev, SHADOW_PENUMBRA_RAD)
+                    lit = np.minimum(lit, 1.0 - occ)
                 dep = dep * lit + self.shadow_leak * flat * (1.0 - lit)
             else:
-                dep = np.zeros_like(h)
-            solid = carbon + chord
-            latex = chord > carbon
-            if not islands:
-                ctx.add_thickness(B.flat, solid + dep * eq - mean_c)
-                if latex.any():
-                    ctx.material[B.sub(latex)] = self.sphere_material
+                dep = np.zeros(lx.shape)
+            # layers: the replica film (carbon) with latex on it, and the metal on top. A pixel
+            # with metal holds the metal, the film and latex go under it.
+            latex = chord > 0
+            ctx.add_thickness(B.flat, carbon - mean_c)
+            if latex.any():  # latex on the film: latex on top, the film under it
+                fl = B.sub(latex)
+                ctx.add_thickness(fl, chord[latex] - carbon[latex])
+                ctx.material[fl] = self.sphere_material
+                ctx.add_under(fl, MaterialId.AMORPHOUS_CARBON, carbon[latex])
+            if self.metal_nm <= 0:
                 continue
-            ctx.add_thickness(B.flat, solid - mean_c)
-            if latex.any():
-                ctx.material[B.sub(latex)] = self.sphere_material
-            inside, t_isl, grain = island_film(seed, lx, ly, dep, flat, self.island_nm, self.coverage,
-                                               self.metal, self.grain_nm)
+            if islands:
+                inside, t_m, grain = island_film(seed, lx, ly, dep, flat, self.island_nm, self.coverage,
+                                                 self.metal, self.grain_nm)
+            else:  # islands too fine to see: the deposit as a continuous metal layer
+                inside, t_m, grain = dep > 0, dep, np.full(int((dep > 0).sum()), -1, np.int32)
             if inside.any():
                 f = B.sub(inside)
-                # the island is metal; the carbon (or latex) under it becomes metal-equivalent
-                ctx.add_thickness(f, t_isl[inside] + solid[inside] / eq - solid[inside])
+                # the metal on top; whatever was there (film, or latex on film) goes under
+                below = ctx.thick[f].astype(np.float64)
+                on_latex = latex[inside]
+                ctx.add_thickness(f, t_m[inside] - below)
+                if (~on_latex).any():
+                    ctx.add_under(f[~on_latex], MaterialId.AMORPHOUS_CARBON, below[~on_latex])
+                if on_latex.any():  # the film under the latex counted as latex
+                    tl = chord[inside][on_latex] + carbon[inside][on_latex] * carbon_equivalent(self.sphere_material)
+                    ctx.add_under(f[on_latex], self.sphere_material, tl)
                 _claim(ctx, f, grain, self.metal)
-
-    def _shadow(self, seed, lx, ly, B, h0, lat, px: float, tan_e: float):
-        """How much of the source the coarse relief (grating, undulation, spheres) hides from
-        each pixel, 0..1: a penumbra `SHADOW_PENUMBRA_RAD` wide (the source's angular size)."""
-        ux, uy = self.u
-        hmax = (self.relief.depth if self.relief is not None else 0.0) + 2.0 * self.crumple_nm
-        tan_lo = math.tan(max(self.elev - 0.5 * SHADOW_PENUMBRA_RAD, 0.02))
-        reach = hmax / tan_lo
-        dstep = max(10.0, px * NM_PER_UM)
-        occl = np.zeros(h0.shape)
-        if reach >= 2.0 * dstep:
-            tan_hi = math.tan(self.elev + 0.5 * SHADOW_PENUMBRA_RAD)
-            worst = np.full(h0.shape, -np.inf)  # steepest elevation of the horizon towards the source
-            for s_nm in np.arange(dstep, reach + dstep, dstep):
-                s = s_nm / NM_PER_UM
-                hs = self._surface(seed, lx + ux * s, ly + uy * s, False, coarse=True)
-                np.maximum(worst, (hs - h0 - 1.0) / s_nm, out=worst)
-            occl = np.clip((worst - tan_lo) / (tan_hi - tan_lo), 0.0, 1.0)
-        if lat is not None:
-            occl = np.maximum(occl, self._sphere_shadow(seed, lat, lx, ly, h0))
-        return occl
-
-    def _sphere_shadow(self, seed, lat, lx, ly, h0):
-        """Occlusion by the latex spheres, exactly: the ray from each pixel towards the source
-        against the few spheres it can pass (those nearest to points along its reach)."""
-        ux, uy = self.u
-        ce, se = math.cos(self.elev), math.sin(self.elev)
-        dx, dy, dz = ux * ce, uy * ce, se  # unit ray towards the source (um, um, um)
-        Rmax = 0.5 * self.spheres.diameter_nm * (1.0 + self.spheres.sigma_frac) / NM_PER_UM
-        reach = 2.0 * Rmax / max(math.tan(self.elev), 1e-3) + Rmax
-        cell = lat.cell_um
-        occl = np.zeros(np.shape(lx))
-        seen = []
-        for s in np.arange(0.0, reach + 0.5 * cell, 0.5 * cell):
-            hit = lat.nearest(lx + ux * s, ly + uy * s)
-            key = hit.h
-            if any(np.array_equal(key, k) for k in seen):
-                continue
-            seen.append(key)
-            present, R, sx, sy = self.spheres.spheres(seed, lat, hit)
-            # the sphere rests on the film: centre height R (um); the pixel at its surface h0
-            px_, py_, pz = sx - lx, sy - ly, R - h0 / NM_PER_UM
-            t = px_ * dx + py_ * dy + pz * dz  # along the ray to the closest approach
-            D = np.sqrt(np.maximum(px_ * px_ + py_ * py_ + pz * pz - t * t, 0.0))
-            w = np.maximum(t, 1e-6) * SHADOW_PENUMBRA_RAD
-            o = np.clip((R - D) / np.maximum(w, 1e-6) + 0.5, 0.0, 1.0)
-            occl = np.maximum(occl, np.where(present & (t > 0.5 * R), o, 0.0))
-        return occl

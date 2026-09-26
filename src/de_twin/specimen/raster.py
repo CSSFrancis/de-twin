@@ -217,6 +217,8 @@ class RasterContext:
         else:
             self.strain = None
         self.stats = {"considered": 0, "culled": 0, "dust": 0, "drawn": 0, "structures": 0}
+        self.under_material: Optional[np.ndarray] = None
+        self.under_thick: Optional[np.ndarray] = None
 
     # -- coordinates --------------------------------------------------------------------------
     def world(self, rows, cols):
@@ -331,6 +333,16 @@ class RasterContext:
         sel = claim if grain_with_claim else (g >= 0)
         self.grain[uniq[sel]] = g[sel]
 
+    def add_under(self, flat, material: int, nm) -> None:
+        """Add `nm` of amorphous `material` to the under layer of pixels `flat` (a support
+        film beneath what the pixel holds, stain around protein, ...)."""
+        if self.under_thick is None:
+            self.under_material = np.zeros(self.npix, np.uint8)
+            self.under_thick = np.zeros(self.npix, np.float32)
+        nm = np.broadcast_to(np.asarray(nm, np.float32), np.shape(self.under_thick[flat]))
+        self.under_thick[flat] = np.maximum(self.under_thick[flat] + nm, 0.0)
+        self.under_material[flat] = np.where(nm > 0, np.uint8(material), self.under_material[flat])
+
     def to_fieldmap(self, time_s: float = 0.0, generation: int = 0) -> FieldMap:
         shp = (self.ny, self.nx)
         fm = FieldMap(view=self.view, material_id=self.material.reshape(shp),
@@ -340,6 +352,9 @@ class RasterContext:
             fm.descan = self.descan.reshape((2,) + shp)
         if self.strain is not None:
             fm.strain = self.strain.reshape((3,) + shp)
+        if self.under_thick is not None:
+            fm.under_material = self.under_material.reshape(shp)
+            fm.under_thickness_nm = self.under_thick.reshape(shp)
         return fm
 
 

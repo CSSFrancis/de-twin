@@ -112,66 +112,76 @@ def angle_overrides(material: int, axis, inplane, spread_deg: float = 0.0) -> tu
 
 # ------------------------------------------------------------------ holey carbon
 class HoleyFilm:
-    """A perforated carbon film (Ted Pella 609 and the support of several standards): holes
-    from breath-figure casting, round but not perfectly, log-normal in size, crowded (big,
-    medium and small populations that overlap and merge). Some big holes keep a thin torn
-    membrane across them, itself full of small holes."""
+    """A perforated carbon film (Ted Pella 609, and the support of 611, 613, 638, 645, 646):
+    "holes of widely varying sizes" (~50 nm to ~1 um) densely packed, thin carbon webs
+    between them, clean edges with a slightly thicker rim, and here and there a foam-like
+    patch of tiny holes. Some big holes keep a torn membrane, itself full of tiny holes.
 
-    def __init__(self, thickness_nm: float = 15.0, big_cell_um: float = 0.8, big_median_um: float = 0.3,
-                 big_fraction: float = 1.0, small_cell_um: float = 0.28, small_median_um: float = 0.08,
-                 small_fraction: float = 0.9, sigma: float = 0.4, wobble: float = 0.06,
-                 tiny_cell_um: float = 0.15, tiny_median_um: float = 0.03, tiny_fraction: float = 0.3,
-                 membrane_fraction: float = 0.15, membrane_nm: float = 4.0):
+    Shapes are phase-separation stamps (:mod:`..stamps`) at three scales, united."""
+
+    #: (feature spacing um, coverage) of the big, medium and small holes
+    SCALES = ((1.3, 0.24), (0.6, 0.24), (0.28, 0.22), (0.12, 0.2))  # round droplet holes, polydisperse
+
+    def __init__(self, thickness_nm: float = 15.0, foam_fraction: float = 0.15, membrane_fraction: float = 0.15,
+                 membrane_nm: float = 4.0, rim_nm: float = 4.0):
         self.t = float(thickness_nm)
-        self.pop = ((big_cell_um, big_median_um, big_fraction, 0xB1), (small_cell_um, small_median_um, small_fraction, 0xB2),
-                    (tiny_cell_um, tiny_median_um, tiny_fraction, 0xB3))
-        self.sigma, self.wobble = float(sigma), float(wobble)
-        self.membrane_fraction, self.membrane_nm = float(membrane_fraction), float(membrane_nm)
+        self.foam, self.membrane_fraction = float(foam_fraction), float(membrane_fraction)
+        self.membrane_nm, self.rim_nm = float(membrane_nm), float(rim_nm)
+        self.min_feature_um = 0.04
 
     def hole_fraction(self) -> float:
-        f = 0.0
-        for cell, med, frac, _ in self.pop:
-            r2 = med * med * math.exp(2.0 * self.sigma ** 2)
-            f += frac * math.pi * min(r2, (0.5 * cell) ** 2) / cell ** 2
-        return min(f, 0.9)
+        keep = 1.0
+        for _, c in self.SCALES:
+            keep *= 1.0 - c
+        return 1.0 - keep * (1.0 - 0.45 * self.foam)
 
     def in_hole(self, seed: int, lx, ly) -> np.ndarray:
-        """Whether owner-local (lx, ly) um is in a hole (membranes ignored)."""
-        return self._holes(seed, lx, ly)[0]
+        return self.thickness(seed, lx, ly) <= 0.0
 
     def thickness(self, seed: int, lx, ly) -> np.ndarray:
-        """Film thickness (nm) at owner-local (lx, ly) um: `t`, 0 in a hole, a thin perforated
-        membrane across some big holes."""
-        hole, membrane = self._holes(seed, lx, ly)
-        t = np.where(hole, 0.0, self.t)
-        if membrane.any():
-            # a torn membrane: the high part of a smooth field is left, lacy holes in it
-            n = fbm(seed ^ 0xB9, lx[membrane], ly[membrane], 0.06, 3, 0.5)
-            t[membrane] = np.where(n > -0.05, self.membrane_nm * (1.0 + 0.3 * n), 0.0)
+        """Film thickness (nm) at owner-local (lx, ly) um: 0 in a hole."""
+        from .. import stamps
+
+        lx = np.asarray(lx, np.float64)
+        ly = np.asarray(ly, np.float64)
+        t = np.full(lx.shape, self.t)
+        rim = np.zeros(lx.shape, bool)
+        big = None
+        for k, (feat, cov) in enumerate(self.SCALES):
+            f = stamps.field(seed ^ (0xB1 + k), lx, ly, feat, cov)
+            if big is None:
+                big = f
+            rim |= (f > -0.45) & (f <= 0.0)  # carbon just outside a hole's edge
+            t = np.where(f > 0.0, 0.0, t)
+        t = np.where(rim & (t > 0), t + self.rim_nm, t)
+        # foam: patches of the film riddled with tiny holes
+        if self.foam > 0:
+            patch = fbm(seed ^ 0xB7, lx, ly, 1.5, 2) > _upper_tail(self.foam)
+            if patch.any():
+                tiny = stamps.field(seed ^ 0xB8, lx[patch], ly[patch], 0.045, 0.45) > 0.0
+                tp = t[patch]
+                tp[tiny] = 0.0
+                t[patch] = tp
+        # torn membranes across some big holes, full of tiny holes
+        if self.membrane_fraction > 0:
+            m = (big > 0.0) & (fbm(seed ^ 0xB9, lx, ly, 1.2, 2) > _upper_tail(self.membrane_fraction))
+            if m.any():
+                keep = stamps.field(seed ^ 0xBA, lx[m], ly[m], 0.06, 0.35) <= 0.0  # bubbles
+                t[m] = np.where(keep, self.membrane_nm, 0.0)
         return t
 
-    def _holes(self, seed: int, lx, ly):
-        from ..geometry import JitteredLattice
 
-        out = np.zeros(np.shape(lx), bool)
-        membrane = np.zeros(np.shape(lx), bool)
-        for cell, med, frac, salt in self.pop:
-            lat = JitteredLattice(cell, seed, salt, jitter_frac=0.5)
-            hit = lat.nearest(lx, ly)
-            h = hit.h
-            present = uniform_from_hash(h ^ U64(0x5A)) < frac
-            r = med * np.exp(self.sigma * normal_from_hash(h ^ U64(0x5B)))
-            r = np.minimum(r, 0.45 * cell)  # a hole stays inside its cell
-            ang = np.arctan2(ly - hit.sy, lx - hit.sx)
-            # a gently irregular rim: low harmonics of the angle
-            ph1 = 2 * math.pi * uniform_from_hash(h ^ U64(0x5C))
-            ph2 = 2 * math.pi * uniform_from_hash(h ^ U64(0x5D))
-            rr = r * (1.0 + self.wobble * (np.cos(2 * ang + ph1) + 0.6 * np.cos(3 * ang + ph2)))
-            h_in = present & (hit.d2 < rr * rr)
-            out |= h_in
-            if salt == 0xB1 and self.membrane_fraction > 0:
-                membrane |= h_in & (uniform_from_hash(h ^ U64(0x5E)) < self.membrane_fraction)
-        return out, membrane & out
+_TAILS: dict = {}
+
+
+def _upper_tail(fraction: float) -> float:
+    """The 2-octave fbm value exceeded on `fraction` of the plane."""
+    v = _TAILS.get(fraction)
+    if v is None:
+        rng = np.random.default_rng(3)
+        x, y = rng.uniform(0, 400, 20000), rng.uniform(0, 400, 20000)
+        v = _TAILS[fraction] = float(np.quantile(fbm(17, x, y, 1.0, 2), 1.0 - fraction))
+    return v
 
 
 def sphere_chord_nm(d2_um2, r_um) -> np.ndarray:

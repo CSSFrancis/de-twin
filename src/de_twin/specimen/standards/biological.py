@@ -39,7 +39,7 @@ class CatalaseStructure(StandardStructure):
     base_material = MaterialId.URANYL_STAIN
 
     def __init__(self, a_nm: float = 8.75, b_nm: float = 6.85, film_nm: float = 10.0, stain_nm: float = 5.0,
-                 crystal_nm: float = 30.0, lattice_stain_nm: float = 8.0, cell_um: float = 2.0,
+                 crystal_nm: float = 30.0, lattice_stain_nm: float = 20.0, cell_um: float = 2.0,
                  per_cell: float = 1.2, length_um: float = 1.2, aspect=(1.5, 4.0)):
         self.a, self.b = float(a_nm), float(b_nm)
         self.film, self.stain, self.crystal, self.lattice = float(film_nm), float(stain_nm), float(crystal_nm), float(lattice_stain_nm)
@@ -91,9 +91,13 @@ class CatalaseStructure(StandardStructure):
                         un = u[inside] * NM_PER_UM + pu
                         vn = v[inside] * NM_PER_UM + pv
                         # protein density: molecules on the lattice; stain fills around them
-                        prot = (0.55 * 0.5 * (1 + np.cos(2 * math.pi * un / self.a))
-                                + 0.45 * 0.5 * (1 + np.cos(2 * math.pi * vn / self.b)))
-                        t += self.lattice * (1.0 - prot)
+                        # the 8.75 nm planes dominate (Ted Pella's image: fringes mostly one way)
+                        prot = (0.75 * 0.5 * (1 + np.cos(2 * math.pi * un / self.a))
+                                + 0.25 * 0.5 * (1 + np.cos(2 * math.pi * vn / self.b)))
+                        # the stain penetrates unevenly: the lattice fades in and out
+                        depth = 0.55 + 0.45 * fbm(seed ^ 0xE3, lx[inside], ly[inside], 0.12, 2)
+                        t += self.lattice * np.clip(depth, 0.1, 1.0) * (1.0 - prot)
+                        t += 4.0 * fbm(seed ^ 0xE4, lx[inside], ly[inside], 0.25, 2)  # thicker, thinner stain
                     else:
                         t += 0.5 * self.lattice
                     ctx.add_thickness(f, t)
@@ -102,57 +106,82 @@ class CatalaseStructure(StandardStructure):
 
 class FerritinStructure(StandardStructure):
     """Ferritin on a formvar/carbon film (608): 12 nm protein shells (low contrast, unstained)
-    around ~7 nm iron cores. A core is four sub-units (the tetrad) with narrow gaps; seeing
-    them resolved indicates an instrument resolution better than 1.25 nm. About one
+    around ~7 nm iron cores made of four sub-units (the tetrad) with ~1.25 nm gaps: resolving
+    them indicates better than 1.25 nm. "Individual ferritin particles are scattered
+    throughout the specimen. Aggregates of particles are also present" (Ted Pella): here
+    diffusion-limited aggregates of touching molecules, and sparse singles. About one
     molecule in eight is apoferritin (no core)."""
 
-    def __init__(self, film_nm: float = 10.0, cell_nm: float = 16.0, fill: float = 0.35, shell_nm: float = 12.0,
-                 cavity_nm: float = 8.0, lobe_r_nm: float = 1.55, lobe_d_nm: float = 1.45, loaded: float = 0.88):
-        self.film, self.cell, self.fill_frac = float(film_nm), float(cell_nm), float(fill)
-        self.shell, self.cavity = float(shell_nm), float(cavity_nm)
+    def __init__(self, film_nm: float = 10.0, shell_nm: float = 12.0, cavity_nm: float = 8.0,
+                 lobe_r_nm: float = 1.55, lobe_d_nm: float = 1.45, loaded: float = 0.88,
+                 cluster_cell_um: float = 0.35, cluster_fraction: float = 0.5, per_cluster: float = 60.0,
+                 single_per_um2: float = 60.0):
+        self.film, self.shell, self.cavity = float(film_nm), float(shell_nm), float(cavity_nm)
         self.lobe_r, self.lobe_d, self.loaded = float(lobe_r_nm), float(lobe_d_nm), float(loaded)
+        self.cell, self.frac, self.per = float(cluster_cell_um), float(cluster_fraction), float(per_cluster)
+        self.singles = float(single_per_um2)
 
     def base_nm(self) -> float:
         return self.film
 
+    def molecules(self, seed, i, j):
+        """(x um, y um, hash) of the molecules of cell (i, j): an aggregate and singles."""
+        from .. import stamps
+
+        r = cell_rng(seed, 0x608, i, j)
+        out = []
+        if r.uniform() < self.frac:
+            shapes = stamps.aggregates()
+            pts = shapes[int(r.uniform(0, len(shapes)))]
+            n = int(min(len(pts), max(3, r.normal(self.per, 0.5 * self.per))))
+            a = r.uniform(0, 2 * math.pi)
+            c, s_ = math.cos(a), math.sin(a)
+            x0, y0 = (i + r.uniform()) * self.cell, (j + r.uniform()) * self.cell
+            R = 0.5 * self.shell / NM_PER_UM * 1.02  # touching shells
+            for px, py in pts[:n]:
+                out.append((x0 + R * (c * px - s_ * py), y0 + R * (s_ * px + c * py), r.hash()))
+        for _ in range(r.poisson(self.singles * self.cell * self.cell)):
+            out.append(((i + r.uniform()) * self.cell, (j + r.uniform()) * self.cell, r.hash()))
+        return out
+
     def fill(self, ctx, owner):
+        from ..spheres import SphereSet
+
         if not _resolved(self.shell / NM_PER_UM, ctx):
             return
         seed = _seed(owner)
-        lat = JitteredLattice(self.cell / NM_PER_UM, seed, 0x608, jitter_frac=0.7)
         pe = _eq(MaterialId.PROTEIN, MaterialId.AMORPHOUS_CARBON)
-        fe = _eq(MaterialId.AMORPHOUS_CARBON, MaterialId.FERRIHYDRITE)
+        reach = 0.5 * self.cell + 16.0 * 0.5 * self.shell / NM_PER_UM
         for B in _owner_pixels(ctx, owner):
-            hit = lat.nearest(B.lx, B.ly)
-            h = hit.h
-            # clustered: molecules gather in patches (a slow field; most of the film is bare)
-            p = self.fill_frac * np.clip(2.5 * fbm(seed ^ 0xF1, hit.sx, hit.sy, 0.15, 2), 0.0, 2.5)
-            present = uniform_from_hash(h ^ U64(0x61)) < p
-            dx = (B.lx - hit.sx) * NM_PER_UM
-            dy = (B.ly - hit.sy) * NM_PER_UM
-            d2 = dx * dx + dy * dy
-            R = 0.5 * self.shell
-            on = present & (d2 < R * R)
-            if not on.any():
+            lx, ly = B.lx, B.ly
+            mol = [m for i, j in cells_near(lx, ly, self.cell, reach) for m in self.molecules(seed, i, j)]
+            if not mol:
                 continue
-            rc = 0.5 * self.cavity
-            prot = 2.0 * (np.sqrt(np.maximum(R * R - d2, 0.0)) - np.sqrt(np.maximum(rc * rc - d2, 0.0)))
-            ctx.add_thickness(B.sub(on), (prot * pe)[on])
-            # the core: four lobes on a square, turned at random
-            loaded = on & (uniform_from_hash(h ^ U64(0x62)) < self.loaded)
-            if not loaded.any():
-                continue
-            phi = 2 * math.pi * uniform_from_hash(h ^ U64(0x63))
-            core = np.zeros(d2.shape)
+            M = np.array([(x, y) for x, y, _ in mol])
+            H = np.array([h for _, _, h in mol], np.uint64)
+            R, rc = 0.5 * self.shell / NM_PER_UM, 0.5 * self.cavity / NM_PER_UM
+            shell = SphereSet(M[:, 0], M[:, 1], np.full(len(M), R)).top_chord(lx, ly)[1]
+            cav = SphereSet(M[:, 0], M[:, 1], np.full(len(M), rc)).top_chord(lx, ly)[1]
+            prot = (shell - cav) * NM_PER_UM
+            on = prot > 0
+            if on.any():  # protein, as carbon that attenuates like it, on the film
+                ctx.add_thickness(B.sub(on), prot[on] * pe)
+            # the cores: four lobes on a square, turned at random, in loaded molecules
+            loaded = uniform_from_hash(H ^ U64(0x62)) < self.loaded
+            phi = 2 * math.pi * uniform_from_hash(H ^ U64(0x63))
+            lobes = []
             for k in range(4):
                 a = phi + 0.5 * math.pi * k
-                ex = dx - self.lobe_d * np.cos(a)
-                ey = dy - self.lobe_d * np.sin(a)
-                core = np.maximum(core, 2.0 * np.sqrt(np.maximum(self.lobe_r ** 2 - ex * ex - ey * ey, 0.0)))
-            iron = loaded & (core > 0)
+                lobes.append(np.stack([M[:, 0] + self.lobe_d / NM_PER_UM * np.cos(a),
+                                       M[:, 1] + self.lobe_d / NM_PER_UM * np.sin(a)], 1)[loaded])
+            L = np.concatenate(lobes)
+            if not len(L):
+                continue
+            core = SphereSet(L[:, 0], L[:, 1], np.full(len(L), self.lobe_r / NM_PER_UM)).top_chord(lx, ly)[1] * NM_PER_UM
+            iron = core > 0
             if iron.any():
                 f = B.sub(iron)
-                # the pixel becomes ferrihydrite: its carbon and protein as their equivalent
                 below = ctx.thick[f].astype(np.float64)
-                ctx.add_thickness(f, core[iron] + below * fe - below)
+                ctx.add_thickness(f, core[iron] - below)  # the core on top ...
+                ctx.add_under(f, MaterialId.AMORPHOUS_CARBON, below)  # ... film and protein under it
                 _claim(ctx, f, np.full(f.shape, -1, np.int32), MaterialId.FERRIHYDRITE)

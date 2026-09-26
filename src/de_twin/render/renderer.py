@@ -397,7 +397,11 @@ class Renderer:
         if len(uniq):
             m = effective_matrices(grains.matrices[uniq], optics.alpha_rad, optics.beta_rad)
             q[ok] = rotation_from_crystal_to_lab(m)[inv]
-        return {"material_id": fm.material_id.copy(), "grain_id": np.where(ok, gid, -1),
+        extra = {}
+        if fm.under_thickness_nm is not None:
+            extra = {"under_material": fm.under_material.copy(),
+                     "under_thickness_nm": fm.under_thickness_nm * np.float32(optics.thickness_tilt_factor)}
+        return {**extra, "material_id": fm.material_id.copy(), "grain_id": np.where(ok, gid, -1),
                 "quaternion": q, "thickness_nm": fm.thickness_nm * np.float32(optics.thickness_tilt_factor),
                 "view": fm.view}
 

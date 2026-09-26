@@ -191,3 +191,45 @@ def cells(seed: int, x, y, merge) -> tuple:
     sd = np.uint64((int(seed) * _KJ) & 0xFFFFFFFFFFFFFFFF)
     _cells_nb(x, y, sd, m, 0.8, d1, gap, h)  # without numba: the same loop, interpreted (slow)
     return d1.reshape(shape), gap.reshape(shape), h.reshape(shape)
+
+
+@_njit(parallel=True)
+def _nearest_nb(x, y, seed, jitter, sx, sy, d2o, ho):
+    for k in _prange(x.size):
+        xv, yv = x[k], y[k]
+        ci, cj = np.int64(math.floor(xv)), np.int64(math.floor(yv))
+        best, bx, by = 1e30, 0.0, 0.0
+        bh = np.uint64(0)
+        for di in range(-1, 2):
+            for dj in range(-1, 2):
+                px, py, h = _site(seed, ci + di, cj + dj, jitter)
+                d = (px - xv) ** 2 + (py - yv) ** 2
+                if d < best:
+                    best, bx, by, bh = d, px, py, h
+        sx[k], sy[k], d2o[k], ho[k] = bx, by, best, bh
+
+
+class FastLattice:
+    """A jittered lattice (`cell_um` apart, sites within `jitter` of their cell centre) whose
+    nearest-site query runs in numba: ``nearest(x, y)`` -> object with ``sx, sy`` (um),
+    ``d2`` (um^2) and ``h`` (uint64 site hash), like :class:`..geometry.JitteredLattice`."""
+
+    def __init__(self, cell_um: float, seed: int, salt: int = 0, jitter: float = 0.5):
+        self.cell_um = float(cell_um)
+        self.seed = np.uint64(((int(seed) * 0x9E3779B1 + int(salt) * 0x85EBCA77) * _KJ) & 0xFFFFFFFFFFFFFFFF)
+        self.jitter = float(min(max(jitter, 0.0), 0.9))
+
+    def nearest(self, x, y):
+        from types import SimpleNamespace
+
+        shape = np.shape(x)
+        c = self.cell_um
+        xs = np.ascontiguousarray(np.asarray(x, np.float64).ravel() / c)
+        ys = np.ascontiguousarray(np.asarray(y, np.float64).ravel() / c)
+        n = xs.size
+        sx, sy, d2 = np.empty(n), np.empty(n), np.empty(n)
+        h = np.empty(n, np.uint64)
+        if n:
+            _nearest_nb(xs, ys, self.seed, self.jitter, sx, sy, d2, h)
+        return SimpleNamespace(sx=(sx * c).reshape(shape), sy=(sy * c).reshape(shape),
+                               d2=(d2 * c * c).reshape(shape), h=h.reshape(shape))

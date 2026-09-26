@@ -92,15 +92,16 @@ def test_the_grating_period_is_the_published_one(number):
 @pytest.mark.parametrize("number", ["610-17", "610-61"])
 def test_latex_spheres_have_the_published_diameter(number):
     """Nominal 0.26 um (<= 3% uniformity) and certified 200 +/- 6 nm (sd 3.4 nm): the spheres'
-    chords (the support film under them removed) peak at the published size."""
+    chords peak at the published size, on a 15 nm carbon film (the layer under them)."""
     d = PRODUCTS[number].numbers["sphere_nm"]
     tw = _twin(number, 4000)
     _centre_on(tw, "latex", 0.004)
     gt = tw.ground_truth(as_arrays=True)
     latex = gt["material_id"] == int(MaterialId.PROTEIN)
     assert latex.mean() > 0.01
-    chord = gt["thickness_nm"][latex] - 15.0
+    chord = gt["thickness_nm"][latex]  # the sphere alone: its support film is the layer under it
     assert 0.94 * d < chord.max() < 1.12 * d
+    assert np.allclose(gt["under_thickness_nm"][latex], 15.0) and (gt["under_material"][latex] == 1).all()
 
 
 def test_the_island_film_coverage_follows_the_deposit():
@@ -120,22 +121,17 @@ def test_the_island_film_coverage_follows_the_deposit():
 
 def test_shadowing_coats_the_facing_side_and_leaves_a_shadow_behind_a_ridge():
     """Source along +x at 25 deg: behind a 20 nm ridge (x just below it) lies a shadow ~43 nm
-    long; the flank that faces the source catches more metal than the flat."""
+    long, with a soft edge; the ridge top and the open ground are lit."""
     g = WaffleGrating(1.0, depth_nm=20.0, line_fraction=0.2, ramp_nm=10.0, edge_nm=0.0, wavy_nm=0.0,
                       both=False)
     s = ShadowedReplicaStructure(g, rough_nm=0.0, crumple_nm=0.0, azimuth_deg=0.0, elevation_deg=25.0)
     x = np.linspace(0.0, 1.0, 2001)
-    y = np.zeros_like(x)
-    h = s._surface(0, x, y, False)
-
-    class _B:
-        X, Y = x, y
-
-    occl = s._shadow(0, x, y, _B, h, None, 0.0005, math.tan(s.elev))
+    h, gx, gy, lit = s.tile().sample(x, np.full_like(x, 0.3))
     # the ridge spans [0.4, 0.6] um; its shadow falls on x < 0.4 (the source is at +x)
-    assert np.all(occl[(x > 0.375) & (x < 0.395)] > 0.9)
-    assert np.all(occl[(x > 0.1) & (x < 0.3)] == 0.0)
-    assert np.all(occl[(x > 0.45) & (x < 0.55)] == 0.0), "the ridge top is lit"
+    assert np.all(lit[(x > 0.372) & (x < 0.393)] < 0.1)
+    assert np.all(lit[(x > 0.1) & (x < 0.3)] > 0.99)
+    assert np.all(lit[(x > 0.45) & (x < 0.55)] > 0.99), "the ridge top is lit"
+    assert gx[(x > 0.39) & (x < 0.41)].max() > 1.0 and gx[(x > 0.59) & (x < 0.61)].min() < -1.0
 
 
 def test_the_shadowed_replica_has_gold_islands_at_high_magnification():
@@ -175,7 +171,8 @@ def test_oriented_gold_foil_shows_the_published_lattice_spacings():
 
 def test_graphitized_carbon_black_shows_0_34_nm_fringes():
     img, p = _hrtem("645", 600000, "graphite", 0.001)
-    assert _spectrum_peak_nm(img, p, 0.25, 0.5) == pytest.approx(0.34, rel=0.02)
+    # published "0.34 nm": graphite (002), 0.3355 nm, to two figures
+    assert _spectrum_peak_nm(img, p, 0.25, 0.5) == pytest.approx(0.34, abs=0.0075)
 
 
 def test_catalase_shows_its_two_lattice_spacings():

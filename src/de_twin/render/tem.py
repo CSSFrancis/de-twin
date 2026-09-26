@@ -164,8 +164,13 @@ def bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max: float
 def amplitude_rows(fm, optics, r0, r1, loss) -> tuple:
     """(I_amp, t_eff) for raster rows r0:r1."""
     mat = fm.material_id[r0:r1]
-    t = fm.thickness_nm[r0:r1].astype(np.float32) * np.float32(optics.thickness_tilt_factor)
-    T = np.exp(-t / absorption_lengths_nm(optics.ht_kv)[mat])
+    f = np.float32(optics.thickness_tilt_factor)
+    t = fm.thickness_nm[r0:r1].astype(np.float32) * f
+    lam = absorption_lengths_nm(optics.ht_kv)
+    e = t / lam[mat]
+    if fm.under_thickness_nm is not None:  # the amorphous layer under it absorbs too
+        e = e + fm.under_thickness_nm[r0:r1] * f / lam[fm.under_material[r0:r1]]
+    T = np.exp(-e)
     return np.clip(T * (1.0 - loss[r0:r1]), 0.0, 1.0).astype(np.float32), t
 
 
@@ -427,7 +432,8 @@ def transmission_function(fm, optics, grains, crystallinity, cfg, seed: int, *,
         lam_abs = absorption_lengths_nm(optics.ht_kv)
         dkeep = {}
     mip_v = material_array("mean_inner_potential_v")
-    use_tex = cfg.phase_texture_scale > 0 and bool(amorphous[np.unique(fm.material_id[::7, ::7])].any())
+    use_tex = cfg.phase_texture_scale > 0 and (bool(amorphous[np.unique(fm.material_id[::7, ::7])].any())
+                                               or fm.under_thickness_nm is not None)
     noise = texture_noise(optics, cfg, seed) if use_tex else None
     tex_k = np.float32(sigma * cfg.phase_texture_scale / p_nm)
     w = cfg.amplitude_contrast
@@ -442,6 +448,9 @@ def transmission_function(fm, optics, grains, crystallinity, cfg, seed: int, *,
         # mean-inner-potential phase with rounded (not ideal-step) edges
         t_all = fm.thickness_nm.astype(np.float32) * np.float32(optics.thickness_tilt_factor)
         mip = sigma * mip_v[fm.material_id] * t_all
+        if fm.under_thickness_nm is not None:
+            mip = mip + sigma * mip_v[fm.under_material] * (
+                fm.under_thickness_nm * np.float32(optics.thickness_tilt_factor))
         if taper_px > 0.3:
             mip = ndimage.gaussian_filter(mip, min(taper_px, 16.0), mode="nearest", truncate=3.0)
         if cfg.refraction_loss:
@@ -474,13 +483,17 @@ def transmission_function(fm, optics, grains, crystallinity, cfg, seed: int, *,
         if mip is not None:
             phi = mip[r0:r1].copy()
         else:
-            phi = sigma * v0 * t if cfg.mip_phase else np.zeros_like(t)
+            phi = np.zeros_like(t)
         amp = np.sqrt(I)
         if loss is not None:
             amp *= loss[r0:r1]
         if noise is not None:
-            std = tex_k * v0 * np.sqrt(t * inv_dens[mat])
-            tex = np.where(amorphous[mat], std * noise[r0:r1], np.float32(0.0))
+            var = np.where(amorphous[mat], (tex_k * v0) ** 2 * t * inv_dens[mat], np.float32(0.0))
+            if fm.under_thickness_nm is not None:
+                um = fm.under_material[r0:r1]
+                tu = fm.under_thickness_nm[r0:r1] * np.float32(optics.thickness_tilt_factor)
+                var = var + (tex_k * mip_v[um]) ** 2 * tu * inv_dens[um]
+            tex = (np.sqrt(var) * noise[r0:r1]).astype(np.float32)
             phi += tex
             if kappa:
                 amp *= np.exp(-kappa * tex)

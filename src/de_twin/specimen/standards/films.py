@@ -54,7 +54,7 @@ class HoleyCarbonStructure(StandardStructure):
         return self.extra.grain_textures() if self.extra is not None else ((), ())
 
     def fill(self, ctx, owner):
-        if not _resolved(self.film.pop[1][1] * 2.0, ctx):
+        if not _resolved(self.film.min_feature_um, ctx):
             return  # the owner carries the mean
         seed = _seed(owner)
         base = self.film.t
@@ -65,20 +65,21 @@ class HoleyCarbonStructure(StandardStructure):
             t = self.film.thickness(seed, B.lx, B.ly)
             hole = t <= 0.0
             film = ~hole
-            if self.metal is not None and self.deposit > 0 and not islands:
-                # unresolved islands: their deposit as the carbon that attenuates like it
-                t = np.where(film, t + self.deposit * eq, 0.0)
             ctx.add_thickness(B.flat, t - base)
             if hole.any():
                 ctx.material[B.sub(hole)] = MaterialId.VACUUM
-            if islands:
+            if self.metal is not None and self.deposit > 0:
                 dep = np.where(film, self.deposit, 0.0)
-                inside, t, grain = island_film(seed, B.lx, B.ly, dep, self.deposit, self.island_nm, self.coverage,
-                                               self.metal, self.grain_nm)
+                if islands:
+                    inside, tm, grain = island_film(seed, B.lx, B.ly, dep, self.deposit, self.island_nm,
+                                                    self.coverage, self.metal, self.grain_nm)
+                else:  # islands too fine to see: a continuous metal layer (powder rings still)
+                    inside, tm, grain = film, dep, np.full(int(film.sum()), -1, np.int32)
                 if inside.any():
                     f = B.sub(inside)
                     below = ctx.thick[f].astype(np.float64)
-                    ctx.add_thickness(f, t[inside] + below / eq - below)  # the carbon under it as metal
+                    ctx.add_thickness(f, tm[inside] - below)  # the metal on top ...
+                    ctx.add_under(f, MaterialId.AMORPHOUS_CARBON, below)  # ... the film under it
                     _claim(ctx, f, grain, self.metal)
             if self.extra is not None:
                 self.extra.draw(ctx, B, seed, owner)
