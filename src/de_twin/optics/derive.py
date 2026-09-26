@@ -19,6 +19,7 @@ moves the opposite way.
 from __future__ import annotations
 
 import math
+from typing import Optional
 
 import numpy as np
 
@@ -79,21 +80,27 @@ def _output_geometry(request: AcquisitionRequest, camera) -> tuple[tuple[int, in
     return (h, w), (x + w / 2.0 - sw / 2.0, y + h / 2.0 - sh / 2.0)
 
 
-def _tem_imaging(state: MicroscopeState) -> bool:
+def _tem_imaging(state: MicroscopeState, mode: Optional[RenderMode] = None) -> bool:
+    """TEM imaging: by the render mode when it is known (a 4D-STEM request on a column that
+    reports TEM is a scan), else by the column's state."""
+    if mode is not None:
+        return mode == RenderMode.TEM_IMAGING
     return state.tem_stem == TemStem.TEM and state.projection == Projection.IMAGING
 
 
-def _shift_terms(state: MicroscopeState, cfg: OpticsConfig) -> tuple[float, float]:
+def _shift_terms(state: MicroscopeState, cfg: OpticsConfig,
+                 mode: Optional[RenderMode] = None) -> tuple[float, float]:
     """Everything but the stage that moves the view centre (before the flips), um:
     image shift (through the column's image-shift matrix), beam shift, the displacement of a
     tilted specimen that is off eucentric height, and the magnification's image offset."""
     isx, isy = state.image_shift_um.x, state.image_shift_um.y
     r = cfg.realism
-    if r is not None and _tem_imaging(state):
+    imaging = _tem_imaging(state, mode)
+    if r is not None and imaging:
         isx, isy = (float(v) for v in r.is_matrix(state.mag_mode, state.magnification) @ (isx, isy))
     # beam shift moves the image only where the beam IS the image (STEM probe, diffraction's
     # illuminated area); in TEM imaging it moves the illuminated disc (`beam_offset_px`)
-    bsx, bsy = (0.0, 0.0) if _tem_imaging(state) else _beam_shift_world(state, cfg)
+    bsx, bsy = (0.0, 0.0) if imaging else _beam_shift_world(state, cfg)
     x = isx + bsx
     y = isy + bsy
     # a specimen dz above the eucentric plane puts the point dz tan(tilt) away (specimen
@@ -102,7 +109,7 @@ def _shift_terms(state: MicroscopeState, cfg: OpticsConfig) -> tuple[float, floa
     if dz:
         x += dz * math.tan(math.radians(state.stage.beta_deg))
         y += dz * math.tan(math.radians(state.stage.alpha_deg))
-    if r is not None and _tem_imaging(state):
+    if r is not None and imaging:
         ox, oy = r.mag_offset_um(state.mag_mode, state.magnification)
         x, y = x + ox, y + oy
     return x, y
@@ -116,20 +123,21 @@ def _beam_shift_world(state: MicroscopeState, cfg: OpticsConfig) -> tuple[float,
     return bx, by
 
 
-def view_center_um(state: MicroscopeState, cfg: OpticsConfig) -> tuple[float, float]:
+def view_center_um(state: MicroscopeState, cfg: OpticsConfig,
+                   mode: Optional[RenderMode] = None) -> tuple[float, float]:
     sx = -1.0 if cfg.flip_x else 1.0
     sy = -1.0 if cfg.flip_y else 1.0
     ox, oy, _ = cfg.stage_offset_um
     err = getattr(state, "stage_error_um", None)
     ex, ey = (err.x, err.y) if err is not None else (0.0, 0.0)
-    tx, ty = _shift_terms(state, cfg)
+    tx, ty = _shift_terms(state, cfg, mode)
     cx = sx * (-(state.stage.x_um + ox + ex) + tx)
     cy = sy * (-(state.stage.y_um + oy + ey) + ty)
     return cx, cy
 
 
 def stage_for_view_center(center_um: tuple[float, float], state: MicroscopeState,
-                          cfg: OpticsConfig) -> tuple[float, float]:
+                          cfg: OpticsConfig, mode: Optional[RenderMode] = None) -> tuple[float, float]:
     """The stage (x, y) µm that puts specimen point *center_um* on axis, with the column's
     current image and beam shifts — the inverse of :func:`view_center_um`."""
     sx = -1.0 if cfg.flip_x else 1.0
@@ -137,7 +145,7 @@ def stage_for_view_center(center_um: tuple[float, float], state: MicroscopeState
     ox, oy, _ = cfg.stage_offset_um
     err = getattr(state, "stage_error_um", None)
     ex, ey = (err.x, err.y) if err is not None else (0.0, 0.0)
-    tx, ty = _shift_terms(state, cfg)
+    tx, ty = _shift_terms(state, cfg, mode)
     x = -(center_um[0] / sx - tx) - ox - ex
     y = -(center_um[1] / sy - ty) - oy - ey
     return x, y
@@ -168,7 +176,7 @@ def derive_optics(state: MicroscopeState, request: AcquisitionRequest, camera,
             nm_per_px = float(cfg.fallback_pixel_nm)
     # What the column's calibration says, and (realism) what the camera really sees
     nominal_nm_per_px = nm_per_px
-    if cfg.realism is not None and _tem_imaging(state) and cfg.pixel_size_override_nm <= 0:
+    if cfg.realism is not None and mode == RenderMode.TEM_IMAGING and cfg.pixel_size_override_nm <= 0:
         nm_per_px = nm_per_px * cfg.realism.pixel_scale(state.mag_mode, state.magnification)
 
     # Reciprocal space
@@ -228,7 +236,7 @@ def derive_optics(state: MicroscopeState, request: AcquisitionRequest, camera,
         raster_nm = nm_per_px * d
 
     # View
-    cx, cy = view_center_um(state, cfg)
+    cx, cy = view_center_um(state, cfg, mode)
     if mode == RenderMode.TEM_IMAGING and (roi_offset_px[0] or roi_offset_px[1]):
         # [twin] an off-centre hardware ROI looks at an off-centre part of the field
         cx += roi_offset_px[0] * nm_per_px / 1000.0 / cos_x
