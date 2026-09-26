@@ -158,7 +158,7 @@ class Renderer:
         return out
 
     def _render_preview(self, optics, time_s: float, tkey, gen) -> np.ndarray:
-        """The view at up to ``preview_side``² — the frame shown while it is still
+        """The view at up to ``preview_side`` squared — the frame shown while it is still
         moving — with its own padded crop cache, so a drag between previews is a crop."""
         from .tem import finish_tem, render_tem_raster
 
