@@ -232,8 +232,14 @@ class Renderer:
         # divided by the tilt foreshortening along each axis.
         sx = -1.0 if getattr(view, "flip_x", False) else 1.0
         sy = -1.0 if getattr(view, "flip_y", False) else 1.0
-        dc = sx * (view.center_um[0] - cx0) * max(view.cos_beta, 0.1) / pu
-        dr = sy * (view.center_um[1] - cy0) * max(view.cos_alpha, 0.1) / pu
+        # the centre's move, in the view's own (rotated) frame
+        wx, wy = view.center_um[0] - cx0, view.center_um[1] - cy0
+        rot = float(getattr(view, "rotation_rad", 0.0))
+        if rot:
+            c, s = math.cos(rot), math.sin(rot)
+            wx, wy = c * wx + s * wy, -s * wx + c * wy
+        dc = sx * wx * max(view.cos_beta, 0.1) / pu
+        dr = sy * wy * max(view.cos_alpha, 0.1) / pu
         c0 = int(round((px - nx) / 2 + dc))
         r0 = int(round((py - ny) / 2 + dr))
         if r0 < 0 or c0 < 0 or r0 + ny > py or c0 + nx > px:
@@ -267,8 +273,7 @@ class Renderer:
             return np.zeros((h, w), np.float32)
         optics = _precession_frame(optics, time_s)
         mode = optics.render_mode
-        if mode == RenderMode.TEM_IMAGING and self.config.pan_margin > 0 \
-                and optics.view.rotation_rad == 0.0:
+        if mode == RenderMode.TEM_IMAGING and self.config.pan_margin > 0:
             return self._render_tem_panned(optics, time_s)
         if mode == RenderMode.TEM_IMAGING:
             fm, token = self.field_map(optics, TEM_LAYERS, time_s)
