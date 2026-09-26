@@ -86,9 +86,12 @@ class WaffleGrating:
     def __init__(self, period_um: float, depth_nm: float = 30.0, line_fraction: float = 0.22,
                  ramp_nm: float = 25.0, edge_nm: float = 5.0, edge_corr_nm: float = 60.0,
                  wavy_nm: float = 15.0, wavy_um: float = 1.5, defects: float = 0.0,
-                 both: bool = True, trench: bool = False):
+                 both: bool = True, trench: bool = False, back_ramp_nm: Optional[float] = None):
         self.P, self.depth, self.w = float(period_um), float(depth_nm), float(line_fraction)
         self.ramp, self.edge, self.edge_corr = ramp_nm / NM_PER_UM, edge_nm / NM_PER_UM, edge_corr_nm / NM_PER_UM
+        # a ruled master's lines are sawtooth: a steep front wall (+x / +y side, `ramp_nm`
+        # wide in projection) and a gentler back slope (`back_ramp_nm`)
+        self.back = (back_ramp_nm if back_ramp_nm is not None else ramp_nm) / NM_PER_UM
         self.wavy, self.wavy_um, self.defects = wavy_nm / NM_PER_UM, float(wavy_um), float(defects)
         self.both, self.trench = bool(both), bool(trench)
 
@@ -117,14 +120,16 @@ class WaffleGrating:
         axes = ((u, v, 0x61), (v, u, 0x62)) if self.both else ((u, v, 0x61),)
         for a, b, salt in axes:
             line = np.floor(a / P)
-            d = np.abs(a - (line + 0.5) * P)
+            sd = a - (line + 0.5) * P  # > 0 on the front (+) side of the line's centre
+            d = np.abs(sd)
             if rough and self.edge > 0:
                 near = np.abs(d - half) < 0.5 * self.ramp + 2.0 * self.edge
                 if near.any():
                     d = d.copy()
                     d[near] += self.edge * fbm(seed ^ salt, b[near], line[near] * 0.731 * P,
                                                self.edge_corr, 2)
-            r = np.clip((half - d) / max(self.ramp, 1e-9) + 0.5, 0.0, 1.0)
+            ramp = np.where(sd > 0, self.ramp, self.back)
+            r = np.clip((half - d) / np.maximum(ramp, 1e-9) + 0.5, 0.0, 1.0)
             if rough and self.defects > 0:  # missing segments of a line (old-style gratings)
                 seg = np.floor(b / (2.0 * P))
                 gone = uniform_from_hash(hash_seed(seed ^ salt, SeedKind.STRUCTURE,
@@ -232,11 +237,11 @@ SHADOW_PENUMBRA_RAD = math.radians(4.0)
 class ShadowedReplicaStructure(StandardStructure):
     """A shadowed carbon replica (see the module docstring).
 
-    The replica is a conformal carbon film `base_nm` thick that follows the surface: `relief`
-    (a grating, or None for a flat film), a rough "crumpled" surface (`rough_nm` over
-    `rough_um`, fibrous at 10kx), a long-wavelength undulation (`crumple_nm` over
-    `crumple_um`) and optional latex spheres. Projected, the film is base / cos(slope): only
-    the flanks show, faintly. The contrast is the metal, evaporated at `elevation_deg` from
+    The replica is a carbon film `base_nm` thick over the surface: `relief` (a grating, or
+    None for a flat film), a rough "crumpled" surface (`rough_nm` over `rough_um`, fibrous at
+    10kx), a long-wavelength undulation (`crumple_nm` over `crumple_um`) and optional latex
+    spheres. The carbon is evaporated from straight above, so its projected thickness is the
+    same everywhere, walls included. The contrast is the metal, evaporated at `elevation_deg` from
     `azimuth_deg`, `metal_nm` thick on a surface facing the source. It lands per projected
     area as ``metal_nm (sin e - cos e grad h . u)``, and not at all where the relief hides the
     surface: the embossed look at low magnification. At high magnification the deposit is an
@@ -284,13 +289,9 @@ class ShadowedReplicaStructure(StandardStructure):
         return self.metal_nm * math.sin(self.elev)
 
     def mean_carbon_nm(self) -> float:
-        """Area-mean projected carbon: the film, thicker on the relief's flanks."""
-        t = self.base
-        if self.relief is not None:
-            g = self.relief.depth / max(self.relief.ramp * NM_PER_UM, 1e-9)
-            flanks = (4.0 if self.relief.both else 2.0) * self.relief.ramp / self.relief.P
-            t *= 1.0 + min(flanks, 1.0) * (math.sqrt(1.0 + g * g) - 1.0)
-        return t
+        """Area-mean projected carbon: the replica film (evaporated from straight above, so
+        the same per projected area everywhere)."""
+        return self.base
 
     # -------------------------------------------------------------- the surface
     def _surface(self, seed, x, y, rough: bool, coarse: bool = False):
@@ -380,7 +381,9 @@ class ShadowedReplicaStructure(StandardStructure):
             if rough or self.crumple_nm > 0:
                 hn, nx_, ny_ = self._texture(seed, lx, ly, rough)
                 h, gx, gy = h + hn, gx + nx_, gy + ny_
-            carbon = self.base * np.sqrt(1.0 + gx * gx + gy * gy)
+            # the replica's carbon is evaporated straight down: the same thickness per
+            # projected area on flats and walls alike (only the angled metal marks the walls)
+            carbon = np.full(lx.shape, self.base)
             chord = np.zeros(lx.shape)
             ss = self._sphere_set(seed, lx, ly) if self.spheres is not None else None
             if ss is not None:
@@ -397,7 +400,7 @@ class ShadowedReplicaStructure(StandardStructure):
                     h = np.where(on, h + top, h)
             if self.metal_nm > 0:
                 dep = self.metal_nm * np.maximum(sin_e - cos_e * (gx * ux + gy * uy), 0.0)
-                dep = np.minimum(dep, 2.5 * flat)
+                dep = np.minimum(dep, 12.0 * flat)  # a near-vertical wall facing the source: a lot, projected
                 if ss is not None and self.spheres_shadowed:
                     occ = ss.occlusion(lx, ly, h / NM_PER_UM, self.u, self.elev, SHADOW_PENUMBRA_RAD)
                     lit = np.minimum(lit, 1.0 - occ)

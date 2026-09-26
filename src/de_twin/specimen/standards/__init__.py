@@ -171,10 +171,12 @@ def build_structure(number: str) -> StandardStructure:
     # narrow raised lines, steep walls, shadowed along the diagonal at a low angle, so each
     # well floor has a bare L-shaped shadow ~1/4 of it wide and the rest a grainy coat.
     # The older style (607-A, 603-A): a softer, rougher, wavier embossed relief.
+    # Relief, line profile and coat fitted to Ted Pella's images (unit-cell averages and their
+    # harmonics): the lines are sawtooth (a steep wall and a gentle slope, as a ruled master).
     if number in ("607", "603"):
-        g = WaffleGrating(P2160, depth_nm=45.0, line_fraction=0.14, ramp_nm=12.0, **new)
+        g = WaffleGrating(P2160, depth_nm=90.0, line_fraction=0.24, ramp_nm=8.0, back_ramp_nm=75.0, **new)
         sph = LatexSpheres(262.0, 0.15) if number == "603" else None
-        return ShadowedReplicaStructure(g, rough_nm=2.5, rough_um=0.1, crumple_nm=6.0, metal_nm=8.0,
+        return ShadowedReplicaStructure(g, rough_nm=2.5, rough_um=0.1, crumple_nm=6.0, metal_nm=5.0,
                                         elevation_deg=20.0, spheres=sph, spheres_shadowed=False, **au)
     if number in ("607-A", "603-A"):
         g = WaffleGrating(P2160, depth_nm=25.0, line_fraction=0.18, ramp_nm=45.0, **old)
@@ -182,14 +184,14 @@ def build_structure(number: str) -> StandardStructure:
         return ShadowedReplicaStructure(g, rough_nm=7.0, rough_um=0.1, elevation_deg=20.0, spheres=sph,
                                         spheres_shadowed=False, **au)
     if number == "606":
-        return ShadowedReplicaStructure(WaffleGrating(P2160, depth_nm=45.0, line_fraction=0.14, ramp_nm=12.0,
-                                                      both=False, **new),
-                                        rough_nm=2.5, rough_um=0.1, crumple_nm=6.0, metal_nm=8.0,
+        return ShadowedReplicaStructure(WaffleGrating(P2160, depth_nm=90.0, line_fraction=0.24, ramp_nm=8.0,
+                                                      back_ramp_nm=75.0, both=False, **new),
+                                        rough_nm=2.5, rough_um=0.1, crumple_nm=6.0, metal_nm=5.0,
                                         elevation_deg=20.0, **au)
     if number in ("677", "673"):
-        g = WaffleGrating(0.5, depth_nm=45.0, line_fraction=0.12, ramp_nm=12.0, **new)
+        g = WaffleGrating(0.5, depth_nm=60.0, line_fraction=0.12, ramp_nm=70.0, back_ramp_nm=10.0, **new)
         sph = LatexSpheres(262.0, 0.15) if number == "673" else None
-        return ShadowedReplicaStructure(g, rough_nm=2.0, rough_um=0.1, crumple_nm=6.0, metal_nm=8.0,
+        return ShadowedReplicaStructure(g, rough_nm=2.0, rough_um=0.1, crumple_nm=6.0, metal_nm=12.0,
                                         elevation_deg=20.0, spheres=sph, spheres_shadowed=False, **au)
     if number == "628-B":
         # a heavy, low-angle gold shadow: shadows ~3.5 diameters long
