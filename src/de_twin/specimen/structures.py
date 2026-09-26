@@ -19,12 +19,12 @@ from typing import Sequence
 
 import numpy as np
 
-from ..hashing import SeedKind, hash_seed, mix_cell, uniform_from_hash
+from ..hashing import SeedKind, hash_seed, mix_cell, splitmix64, uniform_from_hash
 from .fieldmap import LAYER_DESCAN, LAYER_STRAIN, grain_id_from_hash
 from .geometry import (ANALYTIC_CELL_MIN_PX, NM_PER_UM, BlockHit, JitteredLattice, inside_rough_ellipse,
                        lognormal_from_hash, rough_ellipse_signed_dist, smoothstep, value_noise,
                        value_noise_separable, ROUGH_PEAK)
-from .materials import MaterialId
+from .materials import MaterialId, absorption_lengths_nm
 from .raster import Owner, RasterContext, Shape
 
 U64 = np.uint64
@@ -496,34 +496,159 @@ class AmorphousStructure(Structure):
 
 
 def cross_grating_mean_nm(base_nm: float, depth_nm: float, line_fraction: float) -> float:
-    """Area-mean thickness of a cross grating: ridges of `line_fraction` of the period in x
-    and in y over a `base_nm` film."""
+    """Area-mean carbon thickness of a cross grating: ridges of `line_fraction` of the period
+    in x and in y over a `base_nm` film."""
     w = min(max(float(line_fraction), 0.0), 1.0)
     return float(base_nm) + float(depth_nm) * (1.0 - (1.0 - w) ** 2)
 
 
+#: Cross grating replica: the ridge flanks (nm of ramp), the line-edge roughness (nm, over
+#: this correlation length), the long-range waviness (nm over um) that averages out, the
+#: shadowing metal's islands (cell, radius, coverage) and the contamination blobs.
+GRATING_RAMP_NM = 30.0
+GRATING_EDGE_ROUGHNESS_NM = 4.0
+GRATING_EDGE_CORRELATION_NM = 50.0
+GRATING_WAVINESS_NM = 8.0
+GRATING_WAVINESS_UM = 2.0
+GRATING_GRAIN_CELL_NM = 3.2
+GRATING_GRAIN_RADIUS_NM = 1.3
+GRATING_GRAIN_COVERAGE = 0.4
+GRATING_DIRT_CELL_UM = 2.0
+GRATING_DIRT_PROBABILITY = 0.3
+GRATING_DIRT_RADIUS_NM = (20.0, 80.0)
+GRATING_DIRT_HEIGHT_NM = 50.0
+
+
 class CrossGratingStructure(Structure):
-    """A replica cross grating (the pixel-size standard, e.g. 2160 lines/mm): ridges along x
-    and along y, `line_fraction` of the period wide, `depth_nm` over a `base_nm` film, at an
-    exact `period_um` in the owner's own (unrotated) frame."""
+    """A carbon replica cross grating (the pixel-size standard, e.g. 2160 lines/mm), shadowed
+    with metal as a real one is.
+
+    Carbon: ridges along x and along y, `line_fraction` of the period wide with sloped flanks,
+    `depth_nm` over a `base_nm` film, with line-edge roughness and a long-range waviness that
+    averages out (the mean period stays exact). Metal: evaporated at `shadow_elevation_deg`
+    from `shadow_azimuth_deg`; the flanks facing the source catch twice the flat coverage,
+    the ground behind a ridge lies in its shadow, and the deposit is granular (2-3 nm
+    islands, each a grain of `metal` with its own orientation: lattice fringes, powder rings).
+    A few carbon contamination blobs. A pixel holds one material, so a metal island is that
+    metal at the thickness that attenuates like the island plus the carbon under it.
+    """
 
     required_layers = frozenset()
 
-    def __init__(self, period_um: float, base_nm: float, depth_nm: float, line_fraction: float = 0.5):
+    def __init__(self, period_um: float, base_nm: float, depth_nm: float, line_fraction: float = 0.5,
+                 metal: int = MaterialId.PLATINUM, metal_nm: float = 2.0, shadow_elevation_deg: float = 30.0,
+                 shadow_azimuth_deg: float = 45.0, rough: bool = True, dirt: bool = True):
         self.period = float(period_um)
         self.base = float(base_nm)
         self.depth = float(depth_nm)
         self.w = min(max(float(line_fraction), 0.0), 1.0)
+        self.metal = int(metal)
+        self.metal_nm = float(metal_nm)
+        self.elev = math.radians(float(shadow_elevation_deg))
+        az = math.radians(float(shadow_azimuth_deg))
+        self.to_source = (math.cos(az), math.sin(az))
+        self.rough = bool(rough)
+        self.dirt = bool(dirt)
+
+    # --------------------------------------------------------------- carbon relief
+    def _warp(self, lx, ly, seed):
+        """Owner-local coordinates with the long-range waviness: two long sinusoids with
+        seeded phases per axis (zero mean, so the mean period is unchanged)."""
+        if not self.rough:
+            return lx, ly
+        wa = GRATING_WAVINESS_NM / NM_PER_UM
+        k = 2.0 * math.pi / GRATING_WAVINESS_UM
+        ph = [2.0 * math.pi * float(uniform_from_hash(hash_seed(seed, SeedKind.STRUCTURE, n, 0x5A)))
+              for n in range(4)]
+        return (lx + wa * (0.6 * np.sin(k * ly + ph[0]) + 0.4 * np.sin(0.61 * k * (lx + ly) + ph[1])),
+                ly + wa * (0.6 * np.sin(k * lx + ph[2]) + 0.4 * np.sin(0.61 * k * (lx - ly) + ph[3])))
+
+    def _ridge_d(self, a):
+        P = self.period
+        return np.abs(a - (np.floor(a / P) + 0.5) * P)
+
+    def _height(self, u, v, rough_seed=None) -> np.ndarray:
+        """Ridge height 0..1 at (warped) owner-local (u, v) um; with *rough_seed*, each ridge
+        edge wanders along its line (evaluated only near the edges)."""
+        P = self.period
+        ramp = GRATING_RAMP_NM / NM_PER_UM
+        half = 0.5 * self.w * P
+        out = None
+        for a, b, salt in ((u, v, 0x61), (v, u, 0x62)):
+            d = self._ridge_d(a)
+            if rough_seed is not None:
+                amp = GRATING_EDGE_ROUGHNESS_NM / NM_PER_UM
+                near = np.abs(d - half) < 0.5 * ramp + amp
+                if near.any():
+                    ec = GRATING_EDGE_CORRELATION_NM / NM_PER_UM
+                    d = d.copy()
+                    d[near] += amp * (2.0 * value_noise(rough_seed ^ salt, b[near] / ec,
+                                                        np.floor(a[near] / P) * 7.31) - 1.0)
+            r = np.clip((half - d) / ramp + 0.5, 0.0, 1.0)
+            out = r if out is None else np.maximum(out, r)
+        return out
+
+    def _metal_nm(self, u, v, h, pixel_um: float) -> np.ndarray:
+        """Metal deposited per pixel: flat coverage, doubled on flanks facing the source,
+        none where a ridge shades the ground from it (marched over the smooth relief: the
+        few-nm edge roughness does not move a ~70 nm shadow)."""
+        sx, sy = self.to_source
+        tan_e = math.tan(self.elev)
+        flat = self.metal_nm * math.sin(self.elev)
+        reach = self.depth / max(tan_e, 1e-3)  # the longest shadow, nm
+        if reach / NM_PER_UM < pixel_um:  # shadows below a pixel: the mean deposit
+            return np.full(h.shape, flat)
+        step = 5.0 / NM_PER_UM
+        slope = (self._height(u + sx * step, v + sy * step) - h) * self.depth / 5.0
+        t = np.where(slope < -0.05, 2.0 * flat, flat)  # a flank that faces the source
+        shaded = np.zeros(h.shape, bool)
+        for s_nm in np.arange(20.0, reach + 20.0, 20.0):
+            hs = self._height(u + sx * s_nm / NM_PER_UM, v + sy * s_nm / NM_PER_UM)
+            shaded |= (hs - h) * self.depth > s_nm * tan_e
+        return np.where(shaded, 0.0, t)
 
     def fill(self, ctx, owner):
         if self.period <= 0 or self.depth == 0 or not _resolved(self.period, ctx):
             return  # unresolved: the owner already carries the mean
         mean = cross_grating_mean_nm(self.base, self.depth, self.w)
+        seed = int(hash_seed(owner.seed, SeedKind.STRUCTURE, 0)) & 0xFFFFFFFF
+        grains = _resolved(GRATING_GRAIN_CELL_NM / NM_PER_UM, ctx) and self.metal_nm > 0
+        lattice = JitteredLattice(GRATING_GRAIN_CELL_NM / NM_PER_UM, seed, 0x71) if grains else None
+        dirt = JitteredLattice(GRATING_DIRT_CELL_UM, seed, 0x72) if self.dirt else None
+        r_grain2 = (GRATING_GRAIN_RADIUS_NM / NM_PER_UM) ** 2
+        cov = U64(int(GRATING_GRAIN_COVERAGE * 256.0))
+        lam = absorption_lengths_nm(200.0)
+        eq = float(lam[self.metal] / lam[int(MaterialId.AMORPHOUS_CARBON)])  # carbon -> metal-equivalent
         for B in _owner_pixels(ctx, owner):
-            fx = np.mod(B.lx / self.period, 1.0)
-            fy = np.mod(B.ly / self.period, 1.0)
-            ridge = (fx < self.w) | (fy < self.w)
-            ctx.add_thickness(B.flat, self.base + self.depth * ridge - mean)
+            u, v = self._warp(B.lx, B.ly, seed)
+            h = self._height(u, v, seed if self.rough else None)
+            carbon = self.base + self.depth * h
+            if dirt is not None:
+                dh = B.nearest(ctx, dirt)
+                hh = dh.h
+                on = (hh % U64(1024)) < U64(int(GRATING_DIRT_PROBABILITY * 1024))
+                lo, hi = GRATING_DIRT_RADIUS_NM
+                r = (lo + (hi - lo) * uniform_from_hash(splitmix64(hh))) / NM_PER_UM
+                inside = on & (dh.d2 < r * r)
+                if inside.any():
+                    dome = np.sqrt(np.clip(1.0 - dh.d2 / np.maximum(r * r, 1e-18), 0.0, 1.0))
+                    carbon = carbon + np.where(inside, GRATING_DIRT_HEIGHT_NM * dome, 0.0)
+            metal = self._metal_nm(u, v, h, ctx.pixel_um) if self.metal_nm > 0 else np.zeros_like(h)
+            if lattice is None:
+                # unresolved islands: their mean deposit, as the carbon that attenuates like it
+                ctx.add_thickness(B.flat, carbon + metal / eq - mean)
+                continue
+            ctx.add_thickness(B.flat, carbon - mean)
+            gh = B.nearest(ctx, lattice)
+            island = (metal > 0) & (gh.d2 < r_grain2) & gh.per_site(lambda k: (k % U64(256)) < cov)
+            if island.any():
+                f = B.sub(island)
+                # the deposit gathered into islands (mean = coverage x island); the carbon under
+                # an island becomes metal-equivalent thickness
+                ctx.add_thickness(f, metal[island] / GRATING_GRAIN_COVERAGE
+                                  + carbon[island] * eq - carbon[island])
+                grain = grain_id_from_hash(self.metal, gh.grid_h).take(gh.site)[island]
+                _claim(ctx, f, grain, self.metal)
 
 
 class MultilayerStructure(Structure):

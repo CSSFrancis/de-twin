@@ -15,7 +15,7 @@ from typing import Optional
 
 import numpy as np
 
-from ..hashing import SeedKind, hash_seed, rng_for
+from ..hashing import SeedKind, hash_seed, rng_for, uniform_from_hash
 from .fieldmap import LAYER_DESCAN, LAYER_STRAIN, grain_id_from_hash
 from .geometry import normal_cdf
 from .holders import Holder, PlacementArea
@@ -282,22 +282,57 @@ class ProteinsPreparation(Preparation):
         return mean, MaterialId.PROTEIN, -1, 0.0
 
 
+class CalibrationStandardPreparation(Preparation):
+    """A Ted Pella calibration standard (`specimen.standards`), by product number."""
+
+    kind = "calibration_standard"
+
+    def __init__(self, number: str):
+        from . import standards
+
+        if number not in standards.PRODUCTS:
+            raise ValueError(f"unknown calibration standard {number!r}; known: {sorted(standards.PRODUCTS)}")
+        self.number = number
+        self.structure = standards.build_structure(number)
+        self.mean = standards.mean_thickness_nm(number)
+
+    def populate(self, holder, area, seed) -> Batch:
+        if abs(area.half[0]) <= 0 or abs(area.half[1]) <= 0:
+            return Batch(area.index, PrimitiveSet(0))
+        s = self.structure
+        base = s.mean_carbon_nm() if hasattr(s, "mean_carbon_nm") else self.mean
+        # the replica lies on the grid at whatever angle it landed
+        rot = 0.5 * math.pi * float(uniform_from_hash(hash_seed(seed, SeedKind.STRUCTURE, 0x607)))
+        return Batch(area.index, _rect_prim(area, base, MaterialId.AMORPHOUS_CARBON, seed, rotation=rot, structure=s))
+
+    def aggregate_params(self, holder, area, seed):
+        return self.mean, MaterialId.AMORPHOUS_CARBON, -1, 0.0
+
+
 class CrossGratingPreparation(Preparation):
     """A carbon replica cross grating: the calibration specimen for pixel size and image-shift
     calibrations (SerialEM's Find Pixel Size)."""
 
     kind = "cross_grating"
 
-    def __init__(self, lines_per_mm: float, base_nm: float, depth_nm: float, line_fraction: float = 0.5):
+    def __init__(self, lines_per_mm: float, base_nm: float, depth_nm: float, line_fraction: float = 0.5,
+                 metal: Optional[int] = MaterialId.PLATINUM, metal_nm: float = 2.0,
+                 elevation_deg: float = 30.0, azimuth_deg: float = 45.0):
         self.period_um = 1000.0 / max(float(lines_per_mm), 1e-6)
         self.base, self.depth, self.w = float(base_nm), float(depth_nm), float(line_fraction)
+        self.metal = metal
+        self.metal_nm = float(metal_nm) if metal is not None else 0.0
+        self.elevation, self.azimuth = float(elevation_deg), float(azimuth_deg)
 
     def populate(self, holder, area, seed) -> Batch:
         from .structures import CrossGratingStructure, cross_grating_mean_nm
 
         if abs(area.half[0]) <= 0 or abs(area.half[1]) <= 0:
             return Batch(area.index, PrimitiveSet(0))
-        s = CrossGratingStructure(self.period_um, self.base, self.depth, self.w)
+        s = CrossGratingStructure(self.period_um, self.base, self.depth, self.w,
+                                  metal=self.metal if self.metal is not None else MaterialId.PLATINUM,
+                                  metal_nm=self.metal_nm, shadow_elevation_deg=self.elevation,
+                                  shadow_azimuth_deg=self.azimuth)
         mean = cross_grating_mean_nm(self.base, self.depth, self.w)
         return Batch(area.index, _rect_prim(area, mean, MaterialId.AMORPHOUS_CARBON, seed, structure=s))
 
@@ -490,8 +525,14 @@ def make_preparation(kind: str, holder_kind: str, film: str, o: SpecimenOptions)
                 grain_um = 0.03
         return ThinFilmPreparation(grain_um, thick, o.thin_film_gradient_per_mm, o.pinhole_fraction,
                                    o.crack_density_per_um, mat)
+    if kind == "calibration_standard":
+        return CalibrationStandardPreparation(str(o.standard))
     if kind == "cross_grating":
-        return CrossGratingPreparation(o.grating_lines_per_mm, o.grating_base_nm, o.grating_depth_nm)
+        metal = None if o.grating_metal == "none" else _MATERIAL_BY_NAME[o.grating_metal]
+        return CrossGratingPreparation(o.grating_lines_per_mm, o.grating_base_nm, o.grating_depth_nm,
+                                       metal=metal, metal_nm=o.grating_metal_nm,
+                                       elevation_deg=o.grating_shadow_elevation_deg,
+                                       azimuth_deg=o.grating_shadow_azimuth_deg)
     if kind == "bulk":
         from .holders import _POST_SAMPLE_TO_KIND
         k = _POST_SAMPLE_TO_KIND.get(o.fib_post_sample, 0)
