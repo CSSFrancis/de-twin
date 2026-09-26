@@ -1,5 +1,5 @@
-"""What the calibration standards share: the structure interface, a perforated (holey) carbon
-film, objects laid out cell by cell, and grain orientations tied to an in-plane angle."""
+"""What the calibration standards share: the structure interface, objects laid out cell by
+cell, and grain orientations tied to an in-plane angle."""
 
 from __future__ import annotations
 
@@ -108,87 +108,3 @@ def angle_overrides(material: int, axis, inplane, spread_deg: float = 0.0) -> tu
     base = int(material) * GRAINS_PER_MATERIAL
     return tuple((base + k, Texture("oriented", tuple(axis), spread_deg, tuple(inplane), 180.0 * k / ANGLE_BUCKETS))
                  for k in range(ANGLE_BUCKETS))
-
-
-# ------------------------------------------------------------------ holey carbon
-class HoleyFilm:
-    """A perforated carbon film (Ted Pella 609, and the support of 611, 613, 638, 645, 646):
-    "holes of widely varying sizes" (~50 nm to ~1 um) densely packed, thin carbon webs
-    between them, clean edges with a slightly thicker rim, and here and there a foam-like
-    patch of tiny holes. Some big holes keep a torn membrane, itself full of tiny holes.
-
-    Shapes are phase-separation stamps (:mod:`..stamps`) at three scales, united."""
-
-    #: (feature spacing um, coverage) of the big, medium and small holes
-    SCALES = ((1.3, 0.13), (0.6, 0.13), (0.28, 0.12), (0.12, 0.1))  # round droplet holes, polydisperse (~40 % open)
-
-    def __init__(self, thickness_nm: float = 15.0, foam_fraction: float = 0.15, membrane_fraction: float = 0.15,
-                 membrane_nm: float = 4.0, rim_nm: float = 4.0):
-        self.t = float(thickness_nm)
-        self.foam, self.membrane_fraction = float(foam_fraction), float(membrane_fraction)
-        self.membrane_nm, self.rim_nm = float(membrane_nm), float(rim_nm)
-        self.min_feature_um = 0.04
-
-    def hole_fraction(self) -> float:
-        keep = 1.0
-        for _, c in self.SCALES:
-            keep *= 1.0 - c
-        return 1.0 - keep * (1.0 - 0.45 * self.foam)
-
-    def in_hole(self, seed: int, lx, ly) -> np.ndarray:
-        return self.thickness(seed, lx, ly) <= 0.0
-
-    def thickness(self, seed: int, lx, ly) -> np.ndarray:
-        """Film thickness (nm) at owner-local (lx, ly) um: 0 in a hole."""
-        from .. import stamps
-
-        lx = np.asarray(lx, np.float64)
-        ly = np.asarray(ly, np.float64)
-        t = np.full(lx.shape, self.t)
-        rim = np.zeros(lx.shape, bool)
-        big = None
-        for k, (feat, cov) in enumerate(self.SCALES):
-            f = stamps.field(seed ^ (0xB1 + k), lx, ly, feat, cov)
-            if big is None:
-                big = f
-            rim |= (f > -0.45) & (f <= 0.0)  # carbon just outside a hole's edge
-            t = np.where(f > 0.0, 0.0, t)
-        t = np.where(rim & (t > 0), t + self.rim_nm, t)
-        # foam: patches of the film riddled with tiny holes
-        if self.foam > 0:
-            patch = fbm(seed ^ 0xB7, lx, ly, 1.5, 2) > _upper_tail(self.foam)
-            if patch.any():
-                tiny = stamps.field(seed ^ 0xB8, lx[patch], ly[patch], 0.045, 0.45) > 0.0
-                tp = t[patch]
-                tp[tiny] = 0.0
-                t[patch] = tp
-        # torn membranes across some big holes, full of tiny holes
-        if self.membrane_fraction > 0:
-            m = (big > 0.0) & (fbm(seed ^ 0xB9, lx, ly, 1.2, 2) > _upper_tail(self.membrane_fraction))
-            if m.any():
-                keep = stamps.field(seed ^ 0xBA, lx[m], ly[m], 0.06, 0.35) <= 0.0  # bubbles
-                t[m] = np.where(keep, self.membrane_nm, 0.0)
-        return t
-
-
-_TAILS: dict = {}
-
-
-def _upper_tail(fraction: float) -> float:
-    """The 2-octave fbm value exceeded on `fraction` of the plane."""
-    v = _TAILS.get(fraction)
-    if v is None:
-        rng = np.random.default_rng(3)
-        x, y = rng.uniform(0, 400, 20000), rng.uniform(0, 400, 20000)
-        v = _TAILS[fraction] = float(np.quantile(fbm(17, x, y, 1.0, 2), 1.0 - fraction))
-    return v
-
-
-def sphere_chord_nm(d2_um2, r_um) -> np.ndarray:
-    """Projected thickness (nm) of a sphere of radius `r_um` at squared distance `d2_um2`."""
-    return 2.0 * np.sqrt(np.maximum(r_um * r_um - d2_um2, 0.0)) * NM_PER_UM
-
-
-def rough(seed: int, lx, ly, amp_nm: float, scale_nm: float) -> np.ndarray:
-    """A small thickness roughness (nm) on world-locked noise."""
-    return amp_nm * fbm(seed, lx, ly, scale_nm / NM_PER_UM, 3)

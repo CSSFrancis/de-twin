@@ -6,9 +6,6 @@ Physical pattern formation is slow; looking it up is not. The library holds
   of compositions, periodic, 256 x 256. Thresholded at 0 they are the shapes of evaporated
   metal near percolation: round droplets at low coverage, worms and a labyrinth at half,
   a film with holes above. Coverage `COVERAGES[j]` for tile family j.
-* **aggregates** (:func:`aggregates`): off-lattice diffusion-limited clusters of touching
-  spheres (the fluffy aggregates of carbon black, ferritin, latex).
-
 :func:`field` places the tiles over the plane: each cell of a lattice (`cell_um`) takes its
 own tile, one of eight rotations / mirrors and an offset, and neighbouring cells are
 blended with sharpened weights, so there is no repeat and no seam. Everything is a
@@ -312,47 +309,6 @@ def sample_periodic(stack: np.ndarray, fu, fv) -> np.ndarray:
     out = np.empty((stack.shape[0], fu.size), np.float32)
     _periodic_nb(np.ascontiguousarray(stack, np.float32), fu, fv, out)
     return out.reshape((stack.shape[0],) + shape)
-
-
-# ------------------------------------------------------------------ aggregates
-@functools.lru_cache(maxsize=1)
-def aggregates(n_clusters: int = 12, n_particles: int = 150) -> list[np.ndarray]:
-    """Off-lattice diffusion-limited aggregates of unit-radius spheres grown in 3D and seen
-    from above: a list of (n, 2) projected centre arrays (in radii), in the order they grew
-    (any prefix is itself an aggregate), centred on the first. Particles launched from a
-    sphere random-walk until they touch the cluster and stick there."""
-    path = _cache_dir() / f"stamps_dla3_v{_VERSION}_{n_clusters}_{n_particles}.npz"
-    if path.exists():
-        with np.load(path) as z:
-            return [z[f"c{i}"] for i in range(n_clusters)]
-    out = []
-    for c in range(n_clusters):
-        rng = np.random.default_rng(7000 + c)
-
-        def launch(r):
-            v = rng.standard_normal(3)
-            return r * v / np.linalg.norm(v)
-
-        pts = [np.zeros(3)]
-        rmax = 0.0
-        while len(pts) < n_particles:
-            p = launch(rmax + 4.0)
-            P = np.array(pts)
-            while True:
-                d = np.linalg.norm(P - p, axis=1)
-                j = int(np.argmin(d))
-                if d[j] <= 2.0:  # touching: stick at contact
-                    p = P[j] + 2.0 * (p - P[j]) / max(d[j], 1e-9)
-                    pts.append(p)
-                    rmax = max(rmax, float(np.linalg.norm(p)))
-                    break
-                v = rng.standard_normal(3)
-                p = p + max(d[j] - 2.0, 0.3) * v / np.linalg.norm(v)  # walk far when far away
-                if np.linalg.norm(p) > rmax + 20.0:  # wandered off: relaunch
-                    p = launch(rmax + 4.0)
-        out.append(np.array(pts)[:, :2])
-    np.savez_compressed(path, **{f"c{i}": a for i, a in enumerate(out)})
-    return out
 
 
 if __name__ == "__main__":  # regenerate the shipped tiles

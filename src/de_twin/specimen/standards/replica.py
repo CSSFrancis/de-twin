@@ -189,30 +189,6 @@ class LatexSpheres:
     diameter_nm: float
     density_per_um2: float
     sigma_frac: float = 0.02  # coefficient of variation of the diameter (normal)
-    cluster: float = 0.0  # mean extra spheres per cluster (dried latex gathers in chains and rafts)
-
-    def clusters(self, seed, i, j, cell):
-        """The spheres (x, y, r um) of cluster cell (i, j): a chain of touching spheres
-        wandering from a random start."""
-        from .common import cell_rng
-
-        r = cell_rng(seed, 0x610, i, j)
-        x, y = (i + r.uniform()) * cell, (j + r.uniform()) * cell
-        d = r.uniform(0.0, 6.283)
-        R0 = 0.5 * self.diameter_nm / NM_PER_UM
-        out = []
-        for _ in range(r.poisson(self.cluster) + 1):
-            R = R0 * (1.0 + self.sigma_frac * max(-3.0, min(3.0, r.normal())))
-            if out:  # touch the previous sphere
-                px, py, pr = out[-1]
-                d += r.normal(0.0, 1.0)
-                x, y = px + (pr + R) * math.cos(d), py + (pr + R) * math.sin(d)
-            out.append((x, y, R))
-        return out
-
-    def cluster_cell_um(self) -> float:
-        return math.sqrt((1.0 + self.cluster) / max(self.density_per_um2, 1e-6))
-
     def cell_um(self) -> float:
         """A lattice finer than the mean spacing, sparsely occupied, so the spheres lie at
         random rather than on a grid (but never overlap)."""
@@ -308,10 +284,9 @@ class ShadowedReplicaStructure(StandardStructure):
         return h
 
     def _sphere_set(self, seed, lx, ly):
-        """Every latex sphere that can touch (or shade) the pixels at (lx, ly): lattice sites
-        or dried clusters, as a binned :class:`..spheres.SphereSet` (um)."""
+        """Every latex sphere that can touch (or shade) the pixels at (lx, ly), as a binned
+        :class:`..spheres.SphereSet` (um)."""
         from ..spheres import SphereSet, lattice_sites
-        from .common import cells_near
 
         sp = self.spheres
         R0 = 0.5 * sp.diameter_nm / NM_PER_UM
@@ -319,14 +294,6 @@ class ShadowedReplicaStructure(StandardStructure):
         reach = 2.0 * R0 + shade
         x0, x1 = float(np.min(lx)) - reach, float(np.max(lx)) + reach
         y0, y1 = float(np.min(ly)) - reach, float(np.max(ly)) + reach
-        if sp.cluster > 0:
-            cell = sp.cluster_cell_um()
-            extent = (4.0 * sp.cluster + 4.0) * 2.0 * R0
-            cx, cy, r = [], [], []
-            for i, j in cells_near(np.array([x0, x1]), np.array([y0, y1]), cell, extent):
-                for x, y, R in sp.clusters(seed, i, j, cell):
-                    cx.append(x), cy.append(y), r.append(R)
-            return SphereSet(np.array(cx), np.array(cy), np.array(r))
         cell = sp.cell_um()
         xs, ys, hs = lattice_sites(seed ^ 0x2F, cell, x0, y0, x1, y1, 0.4)
         present = uniform_from_hash(hs ^ U64(0x71)) < min(1.0, sp.density_per_um2 * cell * cell)

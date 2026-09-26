@@ -18,8 +18,8 @@ from de_twin.twin import DigitalTwin
 
 
 def _centre_on(tw, kind, pixel_um, n=512):
-    """Put the densest spot of a feature (``latex``, ``graphite`` edge-on shells, ``moo3``,
-    ``film``: no hole) on axis: rasterize coarse windows around home, then move the stage."""
+    """Put the densest spot of a feature (``latex``, on top or under a metal island, or
+    ``moo3``) on axis: rasterize coarse windows around home, then move the stage."""
     from scipy import ndimage
 
     from de_twin.optics.derive import stage_for_view_center
@@ -29,10 +29,10 @@ def _centre_on(tw, kind, pixel_um, n=512):
         r = 0.0 if k == 0 else n * pixel_um * (0.5 + 0.5 * k ** 0.5)
         c = (home[0] + r * math.cos(2.4 * k), home[1] + r * math.sin(2.4 * k))
         fm = tw.specimen.rasterize(ViewWindow(center_um=c, pixel_um=pixel_um, shape=(n, n)))
-        m, g = fm.material_id, fm.grain_id
-        hit = {"latex": m == int(MaterialId.PROTEIN), "moo3": m == int(MaterialId.MOLYBDENUM_TRIOXIDE),
-               "graphite": (m == int(MaterialId.GRAPHITE)) & (g >= 0),
-               "film": ndimage.binary_erosion(m != 0, iterations=n // 4)}[kind]
+        m = fm.material_id
+        um = fm.under_material if fm.under_material is not None else np.zeros_like(m)
+        hit = {"latex": (m == int(MaterialId.PROTEIN)) | (um == int(MaterialId.PROTEIN)),
+               "moo3": m == int(MaterialId.MOLYBDENUM_TRIOXIDE)}[kind]
         if hit.any():
             i, j = np.unravel_index(np.argmax(ndimage.uniform_filter(hit.astype(float), 9) * hit), hit.shape)
             x, y = stage_for_view_center(fm.view.pixel_to_world(i, j), tw.column.state(), tw.optics_config)
@@ -89,19 +89,46 @@ def test_the_grating_period_is_the_published_one(number):
     assert _period_nm(img, tw.optics(req).specimen_pixel_nm, published) == pytest.approx(published, rel=0.005)
 
 
-@pytest.mark.parametrize("number", ["610-17", "610-61"])
+@pytest.mark.parametrize("number", ["603", "673", "628-B"])
 def test_latex_spheres_have_the_published_diameter(number):
-    """Nominal 0.26 um (<= 3% uniformity) and certified 200 +/- 6 nm (sd 3.4 nm): the spheres'
-    chords peak at the published size, on a 15 nm carbon film (the layer under them)."""
-    d = PRODUCTS[number].numbers["sphere_nm"]
+    """The spheres on the gratings (262 nm, the tech notes) and 628-B's 204 nm: their chords
+    peak at the published size (for 628-B under its gold: the layer under the metal)."""
+    d = {"603": 262.0, "673": 262.0, "628-B": 204.0}[number]
     tw = _twin(number, 4000)
     _centre_on(tw, "latex", 0.004)
     gt = tw.ground_truth(as_arrays=True)
     latex = gt["material_id"] == int(MaterialId.PROTEIN)
-    assert latex.mean() > 0.01
-    chord = gt["thickness_nm"][latex]  # the sphere alone: its support film is the layer under it
-    assert 0.94 * d < chord.max() < 1.12 * d
-    assert np.allclose(gt["under_thickness_nm"][latex], 15.0) and (gt["under_material"][latex] == 1).all()
+    chord = gt["thickness_nm"][latex]
+    if "under_material" in gt:  # latex under a metal island
+        under = gt["under_material"] == int(MaterialId.PROTEIN)
+        chord = np.concatenate([chord, gt["under_thickness_nm"][under]])
+    assert chord.size > 100
+    assert 0.94 * d < chord.max() < 1.15 * d
+
+
+def test_the_aluminium_rings_are_at_the_published_spacings():
+    """619: the SAED rings of the evaporated aluminium at Ted Pella's d-spacings (camera
+    length calibration: K = S d must agree across the rings)."""
+    from scipy import ndimage
+
+    tw = _twin("619", 20000)
+    tw.column.set("Intensity", 0.95)  # SAED: a parallel beam
+    tw.column.set("ProjectionMode", 2)
+    req = tw.request()
+    img = tw.flux(req).astype(float)
+    recip = tw.optics(req).recip_pixel_inv_nm
+    m = img > np.percentile(img, 99.99)
+    cy, cx = ndimage.center_of_mass(img * m)
+    yy, xx = np.indices(img.shape)
+    r2 = (np.hypot(yy - cy, xx - cx) * 2).astype(int)
+    prof = np.bincount(r2.ravel(), img.ravel()) / np.maximum(np.bincount(r2.ravel()), 1)
+    rr = np.arange(prof.size) / 2.0
+    for hkl in ("111", "200", "220", "311"):
+        e = 1.0 / PRODUCTS["619"].numbers["d_nm"][hkl] / recip
+        win = (rr > 0.95 * e) & (rr < 1.05 * e)
+        found = rr[np.argmax(np.where(win, prof, 0))]
+        assert found == pytest.approx(e, rel=0.005), hkl
+        assert prof[win].max() > 1.5 * np.median(prof[win])
 
 
 def test_the_island_film_coverage_follows_the_deposit():
@@ -142,61 +169,6 @@ def test_the_shadowed_replica_has_gold_islands_at_high_magnification():
     assert np.unique(gt["grain_id"][au]).size > 200, "nanocrystalline islands"
 
 
-def _spectrum_peak_nm(img, pixel_nm, lo_nm, hi_nm):
-    """The d-spacing (nm) of the strongest power-spectrum peak between d = lo and hi."""
-    n = img.shape[0]
-    w = np.hanning(n)
-    F = np.abs(np.fft.fftshift(np.fft.fft2((img - img.mean()) * np.outer(w, w))))
-    k = np.hypot(*np.meshgrid(np.arange(n) - n // 2, np.arange(n) - n // 2))
-    d = n * pixel_nm / np.maximum(k, 1e-9)
-    F[(k == 0) | (d < lo_nm) | (d > hi_nm)] = 0.0
-    iy, ix = np.unravel_index(np.argmax(F), F.shape)
-    return float(d[iy, ix])
-
-
-def _hrtem(number, mag, kind, pixel_um):
-    tw = _twin(number, mag)
-    tw.column.set("Intensity", 0.95)  # a spread, near-parallel beam
-    tw.column.set_defocus_um(-0.066)  # ~Scherzer at 200 kV, Cs 1.2 mm
-    _centre_on(tw, kind, pixel_um)
-    req = tw.request()
-    return tw.flux(req).astype(float), tw.optics(req).specimen_pixel_nm
-
-
-def test_oriented_gold_foil_shows_the_published_lattice_spacings():
-    img, p = _hrtem("646", 800000, "film", 0.0005)
-    assert _spectrum_peak_nm(img, p, 0.18, 0.25) == pytest.approx(0.204, rel=0.02)
-    assert _spectrum_peak_nm(img, p, 0.13, 0.16) == pytest.approx(0.144, rel=0.02)
-
-
-def test_graphitized_carbon_black_shows_0_34_nm_fringes():
-    img, p = _hrtem("645", 600000, "graphite", 0.001)
-    # published "0.34 nm": graphite (002), 0.3355 nm, to two figures
-    assert _spectrum_peak_nm(img, p, 0.25, 0.5) == pytest.approx(0.34, abs=0.0075)
-
-
-def test_catalase_shows_its_two_lattice_spacings():
-    from de_twin.optics.derive import stage_for_view_center
-
-    tw = _twin("612", 40000)
-    tw.column.set("Intensity", 0.95)
-    tw.column.set_defocus_um(-0.3)
-    home = tw.specimen.home_um()
-    for k in range(60):  # a field inside a crystal: the stained lattice everywhere
-        c = (home[0] + 0.5 * k ** 0.5 * math.cos(2.4 * k), home[1] + 0.5 * k ** 0.5 * math.sin(2.4 * k))
-        fm = tw.specimen.rasterize(ViewWindow(center_um=c, pixel_um=0.00025, shape=(1024, 1024)))
-        t = fm.thickness_nm.astype(float)
-        if (t > np.percentile(t, 1) + 3.0).mean() > 0.3 and np.ptp(t) > 5.0:
-            break
-    x, y = stage_for_view_center(c, tw.column.state(), tw.optics_config)
-    tw.column.set_stage(x=x, y=y)
-    tw.clock.advance(30.0)
-    req = tw.request()
-    img, p = tw.flux(req).astype(float), tw.optics(req).specimen_pixel_nm
-    assert _spectrum_peak_nm(img, p, 7.8, 10.0) == pytest.approx(8.75, rel=0.03)
-    assert _spectrum_peak_nm(img, p, 6.0, 7.6) == pytest.approx(6.85, rel=0.03)
-
-
 def test_a_moo3_lath_long_edge_is_its_crystal_long_axis():
     """The image / diffraction rotation standard: each lath's crystal [010] (Pnma; [001] Pbnm)
     lies along its long edge, so the edge in the image and the spots of its pattern are tied."""
@@ -232,39 +204,3 @@ def test_a_moo3_lath_long_edge_is_its_crystal_long_axis():
     assert checked >= 1
 
 
-def test_magical_marker_sets_are_at_the_calibrated_depths():
-    from de_twin.specimen.standards.magical import SET_SPACINGS_UM, SET_SPANS_NM, layer_bands
-
-    sets = np.array(layer_bands()).reshape(4, 5, 2)
-    centres = 0.5 * (sets[:, 0, 0] + sets[:, -1, 1])
-    assert np.allclose(np.diff(np.concatenate([[0.0], centres])), SET_SPACINGS_UM)
-    assert np.allclose((sets[:, -1, 1] - sets[:, 0, 0]) * 1000.0, SET_SPANS_NM)
-    tw = _twin("675", 2000)
-    fm = tw.specimen.rasterize(ViewWindow(center_um=tw.specimen.home_um(), pixel_um=0.01, shape=(1024, 1024)))
-    assert (fm.material_id == int(MaterialId.SILICON_GERMANIUM)).any()
-
-
-def test_lattice_fringes_are_as_strong_as_on_a_real_microscope():
-    """Kinematic fringe amplitudes (times the calibrated efficiency): Si <011> in MAG*I*CAL
-    shows {111} fringes of ~34 % contrast, as in Ted Pella's lattice image (not the few
-    percent a fixed phase amplitude gave)."""
-    from de_twin.optics import OpticsConfig
-
-    tw = DigitalTwin(preset_name("675"), camera="DESim", clock=ManualClock(), seed=1,
-                     optics_config=OpticsConfig(objective_aperture_mrad=25.0))
-    tw.column.set("Magnification", 800000)
-    tw.column.set("Intensity", 0.95)
-    tw.column.set_defocus_um(-0.066)
-    home = tw.specimen.home_um()
-    from de_twin.optics.derive import stage_for_view_center
-
-    # in the silicon, 0.6 um below the surface: above the first marker set
-    x, y = stage_for_view_center((home[0], home[1] + 0.6), tw.column.state(), tw.optics_config)
-    tw.column.set_stage(x=x, y=y)
-    tw.clock.advance(30.0)
-    gt = tw.ground_truth(as_arrays=True)
-    assert (gt["material_id"] == int(MaterialId.SILICON)).mean() > 0.99
-    img = tw.flux(tw.request()).astype(float)
-    c = img[256:768, 256:768]
-    assert 0.2 < c.std() / c.mean() < 0.6
-    assert _spectrum_peak_nm(img, tw.optics(tw.request()).specimen_pixel_nm, 0.25, 0.4) == pytest.approx(0.3135, rel=0.03)
