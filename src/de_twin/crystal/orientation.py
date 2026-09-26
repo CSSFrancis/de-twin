@@ -82,12 +82,17 @@ class Texture:
     * ``fibre``: crystal direction ``axis`` along the specimen normal (``z``), random rotation
       about it, Gaussian spread ``spread_deg`` (deposited thin films: ``<111>``);
     * ``single``: zone axis ``axis`` along the beam with a small misorientation
-      ``spread_deg`` (single-crystal matrices, e.g. a Si [110] lamella).
+      ``spread_deg`` (single-crystal matrices, e.g. a Si [110] lamella);
+    * ``oriented``: as ``single``, and the crystal direction ``inplane`` (perpendicular to
+      ``axis``) at ``angle_deg`` in the specimen plane from +x (crystals whose shape fixes
+      their orientation: MoO3 laths, graphite shells, an epitaxial multilayer).
     """
 
     kind: str = "random"
     axis: tuple = (1, 1, 1)
     spread_deg: float = 0.0
+    inplane: tuple = ()
+    angle_deg: float = 0.0
 
     def draw(self, rng, crystal_basis=np.eye(3)) -> np.ndarray:
         """Crystal->specimen matrix. ``crystal_basis`` maps [uvw] to Cartesian (direct lattice)."""
@@ -98,6 +103,10 @@ class Texture:
             return _small_rotation(rng, self.spread_deg) @ rot_z(rng.uniform(0, 2 * math.pi)) @ base
         if self.kind == "single":
             return _small_rotation(rng, self.spread_deg) @ base
+        if self.kind == "oriented":
+            v = base @ (crystal_basis @ np.asarray(self.inplane, float))
+            turn = math.radians(self.angle_deg) - math.atan2(v[1], v[0])
+            return _small_rotation(rng, self.spread_deg) @ rot_z(turn) @ base
         raise ValueError(f"unknown texture {self.kind!r}")
 
 

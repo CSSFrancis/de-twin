@@ -29,6 +29,11 @@ class MaterialId(IntEnum):
     SILICON = 8
     PLATINUM = 9
     PROTEIN = 10
+    GRAPHITE = 11
+    MOLYBDENUM_TRIOXIDE = 12
+    SILICON_GERMANIUM = 13  # Si0.8Ge0.2
+    URANYL_STAIN = 14  # dried uranyl acetate (negative stain)
+    FERRIHYDRITE = 15  # the ferritin core
 
 
 N_MATERIALS = len(MaterialId)  # built-in materials (see n_materials() for registered ones)
@@ -108,6 +113,20 @@ MATERIALS: list[Material] = [
     _metal(M.SILICON, "Silicon", "Si", 227, 0.5431, 2.33, 145.0, 14.0, 12.1, 50.0, 0.45),
     _metal(M.PLATINUM, "Platinum", "Pt", 225, 0.3924, 21.45, 26.0, 78.0, 30.0, 66.0, 0.40),
     Material(M.PROTEIN, "Protein", 1.35, 400.0, 6.5, 7.5, 70.0, halos=((2.5, 0.6), (4.8, 0.2))),
+    # Mean free paths below are scaled from aluminium's by the Z^(4/3)-weighted atom density.
+    Material(M.GRAPHITE, "Graphite", 2.26, 133.0, 6.0, 10.2, 113.0,
+             Crystal(194, (0.2464, 0.2464, 0.6711, 90.0, 90.0, 120.0),
+                     (("C", 0.0, 0.0, 0.25), ("C", 1.0 / 3.0, 2.0 / 3.0, 0.25))), 0.3,
+             halos=((2.95, 0.60), (5.10, 0.25))),
+    # Pnma setting (a is the layer-stacking axis; b the long axis of the laths)
+    Material(M.MOLYBDENUM_TRIOXIDE, "Molybdenum trioxide", 4.69, 63.0, 30.0, 17.0, 78.5,
+             Crystal(62, (1.3856, 0.3697, 0.3963, 90.0, 90.0, 90.0),
+                     (("Mo", 0.1016, 0.25, 0.0867), ("O", 0.0866, 0.25, 0.5212),
+                      ("O", 0.2214, 0.25, -0.0373), ("O", 0.4351, 0.25, 0.4994))), 0.5,
+             halos=((3.0, 0.6), (5.0, 0.25))),
+    _metal(M.SILICON_GERMANIUM, "Silicon germanium", "Si", 227, 0.5476, 2.93, 106.0, 20.5, 13.0, 48.7, 0.5),
+    Material(M.URANYL_STAIN, "Uranyl stain", 2.89, 100.0, 51.7, 15.0, 86.0, halos=((2.9, 0.6), (5.0, 0.2))),
+    Material(M.FERRIHYDRITE, "Ferrihydrite", 3.8, 83.0, 20.3, 18.0, 71.5, halos=((4.0, 0.6), (6.7, 0.3))),
 ]
 del M
 

@@ -28,12 +28,13 @@ from typing import Optional
 
 import numpy as np
 
-from ..hashing import SeedKind, hash_seed, splitmix64, uniform_from_hash
-from .fieldmap import grain_id_from_hash
-from .geometry import NM_PER_UM, JitteredLattice
-from .materials import MaterialId, absorption_lengths_nm
-from .noise import cells, fbm
-from .structures import Structure, _claim, _owner_pixels, _resolved
+from ...hashing import SeedKind, hash_seed, normal_from_hash, splitmix64, uniform_from_hash
+from ..fieldmap import grain_id_from_hash
+from ..geometry import NM_PER_UM, JitteredLattice
+from ..materials import MaterialId, absorption_lengths_nm
+from ..noise import cells, fbm
+from ..structures import _claim, _owner_pixels, _resolved
+from .common import StandardStructure
 
 U64 = np.uint64
 
@@ -143,19 +144,42 @@ class LatexSpheres:
 
     diameter_nm: float
     density_per_um2: float
-    sigma_frac: float = 0.02
+    sigma_frac: float = 0.02  # coefficient of variation of the diameter (normal)
+    cluster: float = 0.0  # mean extra spheres per cluster (dried latex gathers in chains and rafts)
+
+    def clusters(self, seed, i, j, cell):
+        """The spheres (x, y, r um) of cluster cell (i, j): a chain of touching spheres
+        wandering from a random start."""
+        from .common import cell_rng
+
+        r = cell_rng(seed, 0x610, i, j)
+        x, y = (i + r.uniform()) * cell, (j + r.uniform()) * cell
+        d = r.uniform(0.0, 6.283)
+        R0 = 0.5 * self.diameter_nm / NM_PER_UM
+        out = []
+        for _ in range(r.poisson(self.cluster) + 1):
+            R = R0 * (1.0 + self.sigma_frac * max(-3.0, min(3.0, r.normal())))
+            if out:  # touch the previous sphere
+                px, py, pr = out[-1]
+                d += r.normal(0.0, 1.0)
+                x, y = px + (pr + R) * math.cos(d), py + (pr + R) * math.sin(d)
+            out.append((x, y, R))
+        return out
+
+    def cluster_cell_um(self) -> float:
+        return math.sqrt((1.0 + self.cluster) / max(self.density_per_um2, 1e-6))
 
     def cell_um(self) -> float:
         """A lattice finer than the mean spacing, sparsely occupied, so the spheres lie at
         random rather than on a grid (but never overlap)."""
         spacing = 1.0 / math.sqrt(max(self.density_per_um2, 1e-6))
-        return max(0.5 * spacing, 1.3 * self.diameter_nm / NM_PER_UM)
+        return max(0.5 * spacing, 1.3 * self.diameter_nm * (1.0 + 3.0 * self.sigma_frac) / NM_PER_UM)
 
     def spheres(self, seed, lattice, hit):
         """(present, radius um, centre x, centre y) at the nearest lattice sites of *hit*."""
         h = hit.h
         present = (h % U64(1024)) < U64(int(min(1.0, self.density_per_um2 * self.cell_um() ** 2) * 1024))
-        rj = 1.0 + self.sigma_frac * (2.0 * uniform_from_hash(splitmix64(h)) - 1.0)
+        rj = 1.0 + self.sigma_frac * np.clip(normal_from_hash(splitmix64(h)), -3.0, 3.0)
         return present, 0.5 * self.diameter_nm / NM_PER_UM * rj, hit.sx, hit.sy
 
 
@@ -164,7 +188,7 @@ class LatexSpheres:
 SHADOW_PENUMBRA_RAD = math.radians(4.0)
 
 
-class ShadowedReplicaStructure(Structure):
+class ShadowedReplicaStructure(StandardStructure):
     """A shadowed carbon replica (see the module docstring).
 
     The replica is a conformal carbon film `base_nm` thick that follows the surface: `relief`
@@ -186,7 +210,8 @@ class ShadowedReplicaStructure(Structure):
                  crumple_um: float = 0.3, metal: int = MaterialId.GOLD, metal_nm: float = 6.0,
                  elevation_deg: float = 25.0, azimuth_deg: float = 45.0, island_nm: float = 9.0,
                  coverage: float = 0.65, grain_nm: float = 2.2, shadow_leak: float = 0.12,
-                 spheres: Optional[LatexSpheres] = None, sphere_material: int = MaterialId.PROTEIN):
+                 spheres: Optional[LatexSpheres] = None, sphere_material: int = MaterialId.PROTEIN,
+                 spheres_shadowed: bool = True):
         self.relief = relief
         self.base, self.rough_nm, self.rough_um = float(base_nm), float(rough_nm), float(rough_um)
         self.crumple_nm, self.crumple_um = float(crumple_nm), float(crumple_um)
@@ -196,7 +221,22 @@ class ShadowedReplicaStructure(Structure):
         self.u = (math.cos(az), math.sin(az))
         self.island_nm, self.coverage, self.grain_nm = float(island_nm), float(coverage), float(grain_nm)
         self.shadow_leak = float(shadow_leak)  # metal that still reaches a shadow (source size, migration)
+        # False: the latex went on after the shadowing (603, 673): no metal on it, no shadow
+        self.spheres_shadowed = bool(spheres_shadowed)
         self.spheres, self.sphere_material = spheres, int(sphere_material)
+
+    def base_nm(self) -> float:
+        return self.mean_carbon_nm()
+
+    def mean_nm(self) -> float:
+        t = self.mean_carbon_nm()
+        if self.spheres is not None:  # latex volume per area, as carbon
+            r = 0.5 * self.spheres.diameter_nm
+            t += self.spheres.density_per_um2 / NM_PER_UM ** 2 * 4.0 / 3.0 * math.pi * r ** 3 * (
+                carbon_equivalent(self.sphere_material))
+        if self.metal_nm > 0:
+            t += self.flat_deposit_nm() * carbon_equivalent(self.metal)
+        return t
 
     def flat_deposit_nm(self) -> float:
         """Metal per projected area on a flat, level surface."""
@@ -227,12 +267,34 @@ class ShadowedReplicaStructure(Structure):
 
     def _sphere_top(self, seed, lat, X, Y):
         """(top height nm, chord nm) of the latex spheres at owner-local (X, Y) um."""
+        if self.spheres.cluster > 0:
+            return self._cluster_top(seed, X, Y)
         hit = lat.nearest(X, Y)
         present, R, sx, sy = self.spheres.spheres(seed, lat, hit)
         d2 = (X - sx) ** 2 + (Y - sy) ** 2
         inside = present & (d2 < R * R)
         half = np.where(inside, np.sqrt(np.maximum(R * R - d2, 0.0)), 0.0) * NM_PER_UM
         return np.where(inside, R * NM_PER_UM + half, 0.0), 2.0 * half
+
+    def _cluster_top(self, seed, X, Y):
+        from .common import cells_near
+
+        sp = self.spheres
+        cell = sp.cluster_cell_um()
+        reach = 0.5 * cell + (4.0 * sp.cluster + 4.0) * sp.diameter_nm / NM_PER_UM
+        top = np.zeros(np.shape(X))
+        chord = np.zeros(np.shape(X))
+        if np.size(X) == 0:
+            return top, chord
+        for i, j in cells_near(X, Y, cell, reach):
+            for sx, sy, R in sp.clusters(seed, i, j, cell):
+                d2 = (X - sx) ** 2 + (Y - sy) ** 2
+                inside = d2 < R * R
+                if inside.any():
+                    half = np.sqrt(np.maximum(R * R - d2[inside], 0.0)) * NM_PER_UM
+                    top[inside] = np.maximum(top[inside], R * NM_PER_UM + half)
+                    chord[inside] = chord[inside] + 2.0 * half
+        return top, chord
 
     def fill(self, ctx, owner):
         seed = int(hash_seed(owner.seed, SeedKind.STRUCTURE, 0)) & 0xFFFFFFFF
@@ -262,7 +324,7 @@ class ShadowedReplicaStructure(Structure):
             if lat is not None:
                 top, chord = self._sphere_top(seed, lat, lx, ly)
                 on = top > 0
-                if on.any():
+                if on.any() and self.spheres_shadowed:
                     tx = self._sphere_top(seed, lat, lx + step, ly)[0]
                     ty = self._sphere_top(seed, lat, lx, ly + step)[0]
                     # the sphere's own surface, its slope capped where the rim is vertical
@@ -272,7 +334,7 @@ class ShadowedReplicaStructure(Structure):
             if self.metal_nm > 0:
                 dep = self.metal_nm * np.maximum(sin_e - cos_e * (gx * ux + gy * uy), 0.0)
                 dep = np.minimum(dep, 2.5 * flat)
-                lit = 1.0 - self._shadow(seed, lx, ly, B, h, lat, px, tan_e)
+                lit = 1.0 - self._shadow(seed, lx, ly, B, h, lat if self.spheres_shadowed else None, px, tan_e)
                 dep = dep * lit + self.shadow_leak * flat * (1.0 - lit)
             else:
                 dep = np.zeros_like(h)
@@ -341,103 +403,3 @@ class ShadowedReplicaStructure(Structure):
             o = np.clip((R - D) / np.maximum(w, 1e-6) + 0.5, 0.0, 1.0)
             occl = np.maximum(occl, np.where(present & (t > 0.5 * R), o, 0.0))
         return occl
-
-
-# ------------------------------------------------------------------ products
-@dataclass(frozen=True)
-class Product:
-    """A Ted Pella calibration standard: what the catalogue says it is."""
-
-    number: str
-    name: str
-    description: str
-    use: str
-    numbers: dict = field(default_factory=dict)  # published values (nm, lines/mm, ...)
-    not_modelled: str = ""
-
-
-PRODUCTS: dict[str, Product] = {}
-
-
-def _p(number, name, description, use, numbers=None, not_modelled=""):
-    PRODUCTS[number] = Product(number, name, description, use, dict(numbers or {}), not_modelled)
-
-
-_p("607", "2160 l/mm diffraction grating replica (waffle)",
-   "Carbon replica with Au/Pd shadowing of a crossed-line (waffle) diffraction grating, "
-   "2160 lines/mm in both directions, on a G400 copper grid.",
-   "Magnification calibration up to ~80-100,000x.", {"lines_per_mm": 2160.0, "period_nm": 462.9})
-_p("607-A", "2160 l/mm diffraction grating replica, old style (waffle)",
-   "The older-style 2160 lines/mm waffle replica with Au/Pd shadowing: more defects and a less "
-   "clear pattern than the current 607, on a G400 copper grid.",
-   "Aberration corrector alignment and SerialEM; magnification.", {"lines_per_mm": 2160.0, "period_nm": 462.9})
-_p("606", "2160 l/mm diffraction grating replica (parallel lines)",
-   "Carbon replica with Au/Pd shadowing of a parallel-line diffraction grating, 2160 lines/mm "
-   "(d = 462.9 nm), on a G400 copper grid.",
-   "Magnification calibration up to ~40-50,000x.", {"lines_per_mm": 2160.0, "period_nm": 462.9})
-_p("603", "2160 l/mm grating replica with 0.261 um latex spheres",
-   "Carbon waffle grating replica with Au/Pd shadowing and 0.261 um polystyrene latex spheres, "
-   "on a G400 copper grid.",
-   "A double check of magnification calibration at higher magnifications.",
-   {"lines_per_mm": 2160.0, "period_nm": 462.9, "sphere_nm": 261.0})
-_p("603-A", "2160 l/mm grating replica with 0.261 um latex spheres, old style",
-   "The older-style 2160 lines/mm waffle replica with Au/Pd shadowing and 0.261 um latex "
-   "spheres, on a G400 copper grid.",
-   "Aberration corrector alignment and SerialEM; magnification double check.",
-   {"lines_per_mm": 2160.0, "period_nm": 462.9, "sphere_nm": 261.0})
-_p("677", "500 nm cross-line grating replica",
-   "Carbon replica with Au/Pd shadowing of a cross-line grating with well-defined trench-type "
-   "grooves, 500 nm pitch (2000 lines/mm) in both directions, on a G400 copper grid.",
-   "Magnification calibration up to 100,000x.", {"lines_per_mm": 2000.0, "period_nm": 500.0})
-_p("673", "500 nm grating replica with 261 nm latex spheres",
-   "The 500 nm cross-line trench grating replica with Au/Pd shadowing and 261 nm latex spheres.",
-   "Magnification double check up to 150,000x.",
-   {"lines_per_mm": 2000.0, "period_nm": 500.0, "sphere_nm": 261.0})
-_p("628-B", "Gold-shadowed latex",
-   "0.204 um latex particles on a carbon film shadowed with a fairly heavy coating of gold.",
-   "Test object for STEM (and shadow-length / resolution checks).", {"sphere_nm": 204.0})
-for _d in (30, 80, 90, 170, 260, 300, 490, 1000):
-    _p(f"610-{_d}", f"Polystyrene latex spheres, {_d / 1000:g} um nominal",
-       f"{_d} nm polystyrene latex spheres dried on a carbon support film.",
-       "Magnification test specimen.", {"sphere_nm": float(_d)})
-
-#: Old-style gratings: rougher, wavier, with missing line segments.
-_OLD = dict(edge_nm=10.0, edge_corr_nm=60.0, wavy_nm=40.0, wavy_um=1.2, defects=0.0)
-_NEW = dict(edge_nm=3.0, edge_corr_nm=80.0, wavy_nm=6.0, wavy_um=3.0, defects=0.0)
-
-
-def build_structure(number: str) -> Structure:
-    """The structure of product *number* (see :data:`PRODUCTS`)."""
-    P2160 = 1.0 / 2.160
-    au = dict(metal=MaterialId.GOLD)  # Au/Pd: gold stands in for the alloy
-    if number in ("607", "607-A", "603", "603-A"):
-        g = WaffleGrating(P2160, depth_nm=20.0, line_fraction=0.18, ramp_nm=45.0, **(_OLD if number.endswith("A") else _NEW))
-        sph = LatexSpheres(261.0, 0.15) if number.startswith("603") else None
-        return ShadowedReplicaStructure(g, rough_nm=7.0 if number.endswith("A") else 4.5, rough_um=0.1, spheres=sph, **au)
-    if number == "606":
-        return ShadowedReplicaStructure(WaffleGrating(P2160, depth_nm=30.0, line_fraction=0.3, both=False, **_NEW), **au)
-    if number in ("677", "673"):
-        g = WaffleGrating(0.5, depth_nm=40.0, line_fraction=0.5, ramp_nm=12.0, trench=True, **_NEW)
-        sph = LatexSpheres(261.0, 0.15) if number == "673" else None
-        return ShadowedReplicaStructure(g, rough_nm=2.0, spheres=sph, **au)
-    if number == "628-B":
-        return ShadowedReplicaStructure(None, base_nm=15.0, rough_nm=1.5, crumple_nm=4.0, metal_nm=15.0, elevation_deg=25.0,
-                                        spheres=LatexSpheres(204.0, 0.8), island_nm=10.0, coverage=0.7, **au)
-    if number.startswith("610-"):
-        d = float(number.split("-")[1])
-        return ShadowedReplicaStructure(None, base_nm=15.0, rough_nm=0.0, crumple_nm=0.0, metal_nm=0.0,
-                                        spheres=LatexSpheres(d, min(20.0, 0.15 / (d / 1000.0) ** 2), 0.03))
-    raise KeyError(f"no structure for product {number!r}")
-
-
-def mean_thickness_nm(number: str) -> float:
-    """Area-mean carbon-equivalent thickness of product *number* (its low-magnification look)."""
-    s = build_structure(number)
-    t = s.mean_carbon_nm() if isinstance(s, ShadowedReplicaStructure) else 20.0
-    if isinstance(s, ShadowedReplicaStructure) and s.metal_nm > 0:
-        t += s.flat_deposit_nm() * carbon_equivalent(s.metal)
-    return t
-
-
-def preset_name(number: str) -> str:
-    return f"Ted Pella {number} - {PRODUCTS[number].name}"

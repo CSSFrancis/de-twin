@@ -294,19 +294,20 @@ class CalibrationStandardPreparation(Preparation):
             raise ValueError(f"unknown calibration standard {number!r}; known: {sorted(standards.PRODUCTS)}")
         self.number = number
         self.structure = standards.build_structure(number)
-        self.mean = standards.mean_thickness_nm(number)
+
+    def grain_textures(self):
+        return self.structure.grain_textures()
 
     def populate(self, holder, area, seed) -> Batch:
         if abs(area.half[0]) <= 0 or abs(area.half[1]) <= 0:
             return Batch(area.index, PrimitiveSet(0))
         s = self.structure
-        base = s.mean_carbon_nm() if hasattr(s, "mean_carbon_nm") else self.mean
-        # the replica lies on the grid at whatever angle it landed
+        # the specimen lies on the grid at whatever angle it landed
         rot = 0.5 * math.pi * float(uniform_from_hash(hash_seed(seed, SeedKind.STRUCTURE, 0x607)))
-        return Batch(area.index, _rect_prim(area, base, MaterialId.AMORPHOUS_CARBON, seed, rotation=rot, structure=s))
+        return Batch(area.index, _rect_prim(area, s.base_nm(), s.base_material, seed, rotation=rot, structure=s))
 
     def aggregate_params(self, holder, area, seed):
-        return self.mean, MaterialId.AMORPHOUS_CARBON, -1, 0.0
+        return self.structure.mean_nm(), MaterialId.AMORPHOUS_CARBON, -1, 0.0
 
 
 class CrossGratingPreparation(Preparation):
