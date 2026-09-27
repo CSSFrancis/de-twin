@@ -85,10 +85,40 @@ def gaussian_filter_threaded(a: np.ndarray, sigma: float, **kw) -> np.ndarray:
     return out
 
 
+if _cubic_nb is not None:
+    @_nb.njit(parallel=True, cache=True, nogil=True)
+    def _up2x_nb(a, c0, c1, out):  # pragma: no cover - compiled
+        """`upsample2x_scaled` in one pass, the same float32 arithmetic in the same order."""
+        ny, nx = a.shape
+        q0 = np.float32(0.75)
+        q1 = np.float32(0.25)
+        for i in _nb.prange(ny):
+            ip = i - 1 if i > 0 else 0
+            inx = i + 1 if i < ny - 1 else ny - 1
+            for half in range(2):
+                src2 = ip if half == 0 else inx
+                o = 2 * i + half
+                # the row pass at padded columns j - 1, j, j + 1 (edge clamped)
+                for j in range(nx):
+                    jm = j - 1 if j > 0 else 0
+                    jp = j + 1 if j < nx - 1 else nx - 1
+                    um = a[i, jm] * c0 + c1 * a[src2, jm]
+                    u = a[i, j] * c0 + c1 * a[src2, j]
+                    up = a[i, jp] * c0 + c1 * a[src2, jp]
+                    out[o, 2 * j] = u * q0 + q1 * um
+                    out[o, 2 * j + 1] = u * q0 + q1 * up
+else:
+    _up2x_nb = None
+
+
 def upsample2x_scaled(a: np.ndarray, scale: float = 1.0) -> np.ndarray:
     """Threaded pixel-centre bilinear 2x upsampling (edge clamped) times ``scale``."""
     a = np.asarray(a, np.float32)
     ny, nx = a.shape
+    if _up2x_nb is not None:
+        out = np.empty((2 * ny, 2 * nx), np.float32)
+        _up2x_nb(a, np.float32(0.75 * scale), np.float32(0.25 * scale), out)
+        return out
     p = np.pad(a, 1, mode="edge")
     out = np.empty((2 * ny, 2 * nx), np.float32)
     c0 = np.float32(0.75 * scale)
