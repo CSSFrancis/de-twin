@@ -54,7 +54,7 @@ def _settle(tw, req):
 
 def _frame(tw, req):
     T.clear()
-    reused, built = tw.renderer.rasters_reused, tw.renderer.rasters_built
+    reused, built = getattr(tw.renderer, "rasters_reused", 0), tw.renderer.rasters_built
     t0 = time.perf_counter()
     flux = tw.flux(req)
     t1 = time.perf_counter()
@@ -68,7 +68,7 @@ def _frame(tw, req):
         t0 = time.perf_counter()
         tw.flux(req)
         out["settled"] = time.perf_counter() - t0
-    out["how"] = "reuse" if tw.renderer.rasters_reused > reused else ("crop" if tw.renderer.rasters_built == built
+    out["how"] = "reuse" if getattr(tw.renderer, "rasters_reused", 0) > reused else ("crop" if tw.renderer.rasters_built == built
                                                                      else "full")
     return out
 
