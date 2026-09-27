@@ -148,6 +148,38 @@ class CrystalLibrary:
         i = int(np.flatnonzero((self.hkl == np.asarray(hkl)).all(axis=1))[0])
         return float(math.pi / self.inv_xi(ht_kv, wavelength_nm)[i])
 
+    def geometry(self, matrices, wavelength_nm: float, convergence_mrad: float = 0.0):
+        """(owner, index, gx, gy, s) of the reflections near the Ewald sphere for each
+        crystal->lab matrix (N, 3, 3) - the orientation-only part of :meth:`excite`,
+        sorted by owner."""
+        m = np.asarray(matrices, np.float64).reshape(-1, 3, 3)
+        inv_lam = 1.0 / wavelength_nm
+        s_max = S_WINDOW_INV_NM + self.g_len * (convergence_mrad * 1e-3)
+        parts = []
+        for c0 in range(0, len(m), CHUNK):
+            gl = np.einsum("nij,gj->ngi", m[c0:c0 + CHUNK], self.g)
+            r2 = gl[..., 0] ** 2 + gl[..., 1] ** 2
+            s = inv_lam - np.sqrt(np.maximum(inv_lam * inv_lam - r2, 0.0)) - gl[..., 2]
+            own, idx = np.nonzero(np.abs(s) < s_max)
+            parts.append((own + c0, idx, gl[own, idx, 0], gl[own, idx, 1], s[own, idx]))
+        if not parts:
+            e = np.zeros(0)
+            return e.astype(np.int64), e.astype(np.int64), e, e, e
+        return tuple(np.concatenate(v) for v in zip(*parts))
+
+    def intensity_at(self, idx, s, thickness_nm, ht_kv: float, wavelength_nm: float,
+                     convergence_mrad: float = 0.0) -> np.ndarray:
+        """Kinematic fraction ``(pi t / xi_g)^2 <sinc^2>`` of reflections ``idx`` at excitation
+        errors ``s`` and thicknesses ``thickness_nm`` (all (K,)): the thickness-dependent part
+        of :meth:`excite`, element by element."""
+        k = self.inv_xi(ht_kv, wavelength_nm)
+        alpha = convergence_mrad * 1e-3
+        tt = np.asarray(thickness_nm, np.float64)
+        ga = self.g_len[idx] * alpha
+        excess = np.clip((np.abs(s) - S_TAPER_INV_NM - ga) / (S_WINDOW_INV_NM - S_TAPER_INV_NM), 0.0, 1.0)
+        taper = np.cos(0.5 * math.pi * excess) ** 2
+        return (k[idx] * tt) ** 2 * rocking_curve(math.pi * tt * s, math.pi * tt * ga) * taper
+
     def excite(self, matrices, wavelength_nm: float, thickness_nm, ht_kv: float,
                convergence_mrad: float = 0.0, min_intensity: float = 0.0) -> Excitation:
         """Excited reflections of each crystal->lab matrix (N, 3, 3) at thickness (N,) nm.
@@ -159,17 +191,8 @@ class CrystalLibrary:
         t_in = np.asarray(thickness_nm, np.float64)
         t = np.broadcast_to(t_in, (n,) + t_in.shape[1:]) if t_in.ndim == 2 else np.broadcast_to(t_in, (n,))
         k = self.inv_xi(ht_kv, wavelength_nm)
-        inv_lam = 1.0 / wavelength_nm
+        own, idx, gx, gy, s = self.geometry(m, wavelength_nm, convergence_mrad)
         alpha = convergence_mrad * 1e-3
-        s_max = S_WINDOW_INV_NM + self.g_len * alpha
-        parts = []
-        for c0 in range(0, n, CHUNK):
-            gl = np.einsum("nij,gj->ngi", m[c0:c0 + CHUNK], self.g)
-            r2 = gl[..., 0] ** 2 + gl[..., 1] ** 2
-            s = inv_lam - np.sqrt(np.maximum(inv_lam * inv_lam - r2, 0.0)) - gl[..., 2]
-            own, idx = np.nonzero(np.abs(s) < s_max)
-            parts.append((own + c0, idx, gl[own, idx, 0], gl[own, idx, 1], s[own, idx]))
-        own, idx, gx, gy, s = (np.concatenate(v) for v in zip(*parts))
         tt = t[own]
         col = (lambda v: v[:, None]) if t.ndim == 2 else (lambda v: v)
         x = math.pi * tt * col(s)
