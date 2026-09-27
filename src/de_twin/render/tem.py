@@ -161,10 +161,20 @@ def bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max: float
     ``MAX_COHERENT_BEAMS`` Friedel pairs); only the beams beyond are removed (the renderer adds
     them back incoherently)."""
     mat = fm.material_id
-    t = fm.thickness_nm.astype(np.float32) * np.float32(optics.thickness_tilt_factor)
-    gid = fm.grain_id.astype(np.int64)
+    f_t = np.float32(optics.thickness_tilt_factor)
     n = len(grains) if grains is not None else 0
-    gid = np.where((gid >= 0) & (gid < n) & (gid // GRAINS_PER_MATERIAL == mat), gid, -1)
+    nb = MAX_THICKNESS_BIN + 1
+    gid = np.empty(mat.shape, np.int64)
+    # (grain, thickness bin) of every crystal pixel as one integer (-1 none); the pairs are few
+    pix_all = np.empty(mat.shape, np.int64)
+
+    def pixel_rows(r0, r1):
+        g = fm.grain_id[r0:r1].astype(np.int64)
+        ok = (g >= 0) & (g < n) & (g // GRAINS_PER_MATERIAL == mat[r0:r1])
+        gid[r0:r1] = np.where(ok, g, -1)
+        tb = thickness_bin_for(fm.thickness_nm[r0:r1].astype(np.float32) * f_t)
+        pix_all[r0:r1] = np.where(ok, g * nb + tb, -1)
+    parallel_rows(pixel_rows, mat.shape[0])
     loss = np.zeros(mat.shape, np.float32)
     fringes: dict = {}
     if not (gid >= 0).any():
@@ -177,11 +187,7 @@ def bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max: float
     if coherent:
         g_obj = min(coherent_k_max, g_res)
     t_typ: dict = {}
-    has = gid >= 0
-    # (grain, thickness bin) of every crystal pixel as one integer; the pairs present are few
-    nb = MAX_THICKNESS_BIN + 1
-    pix = gid[has] * nb + thickness_bin_for(t[has])
-    pair_count = np.bincount(pix, minlength=n * nb)
+    pair_count = np.bincount(pix_all[pix_all >= 0], minlength=n * nb)
     nz = np.flatnonzero(pair_count)
     pg, ptb = np.divmod(nz, nb)
     g_u = np.unique(pg)
@@ -242,9 +248,9 @@ def bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max: float
                     w = np.array(waves)
                     fringes[int(g_u[gi])] = (2 * math.pi * w[:, 0], 2 * math.pi * w[:, 1], w[:, 2])
                     t_typ[int(g_u[gi])] = max(float(tb_u[typical[gi]]) * THICKNESS_BIN_NM, THICKNESS_BIN_NM)
-    lut = np.zeros(len(pair_count), np.float32)
+    lut = np.zeros(len(pair_count) + 1, np.float32)  # the last entry: no crystal (-1)
     lut[nz] = cfg.diffraction_contrast_scale * table[pgi, pti]
-    loss[has] = lut[pix]
+    parallel_rows(lambda r0, r1: loss.__setitem__(slice(r0, r1), lut[pix_all[r0:r1]]), mat.shape[0])
     kinematic = coherent or (cfg.lattice_fringes and cfg.lattice_fringe_model == "kinematic")
     return BraggContrast(loss, gid, fringes, coherent, t_typ, kinematic)
 

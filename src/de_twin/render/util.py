@@ -156,7 +156,8 @@ def world_normal_noise(ix0: int, iy0: int, ny: int, nx: int, seed: int, salt: in
     out = np.empty((ny, nx), np.float32)
     tx0, tx1 = ix0 // _TILE, (ix0 + nx - 1) // _TILE
     ty0, ty1 = iy0 // _TILE, (iy0 + ny - 1) // _TILE
-    for ty in range(ty0, ty1 + 1):
+
+    def row(ty):
         ya = max(iy0, ty * _TILE)
         yb = min(iy0 + ny, (ty + 1) * _TILE)
         for tx in range(tx0, tx1 + 1):
@@ -167,6 +168,11 @@ def world_normal_noise(ix0: int, iy0: int, ny: int, nx: int, seed: int, salt: in
             tile = rng.standard_normal((_TILE, _TILE), dtype=np.float32)
             out[ya - iy0:yb - iy0, xa - ix0:xb - ix0] = \
                 tile[ya - ty * _TILE:yb - ty * _TILE, xa - tx * _TILE:xb - tx * _TILE]
+    if ty1 - ty0 < 2:
+        for ty in range(ty0, ty1 + 1):
+            row(ty)
+    else:  # tile rows on the shared pool (the generators release the GIL)
+        list(pool().map(row, range(ty0, ty1 + 1)))
     return out
 
 
