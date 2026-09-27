@@ -72,6 +72,15 @@ class ColumnRealism:
     mag_offset_fraction: float = 0.02
     #: The stage stops short by half of this against its approach direction, micrometres.
     backlash_um: float = 0.3
+    #: Beam-shift matrix (illumination system: one for all magnifications): scale / skew /
+    #: rotation spreads, as for image shift.
+    bs_scale_sigma: float = 0.05
+    bs_skew_sigma: float = 0.02
+    bs_rotation_sigma_deg: float = 5.0
+    #: C2 crossover: the Intensity at which the beam is smallest, and its spread over spot
+    #: sizes and probe modes (SerialEM's Beam Crossover calibration).
+    crossover_intensity: float = 0.35
+    crossover_sigma: float = 0.02
 
     def _key(self, mag_mode, mag: float) -> tuple[int, int]:
         return _mode_id(mag_mode), int(round(float(mag)))
@@ -106,6 +115,20 @@ class ColumnRealism:
         f = self.mag_offset_fraction * 1.0e5 / max(float(mag), 1.0)
         return f * _n(self.seed, 41, mode, m), f * _n(self.seed, 42, mode, m)
 
+    def bs_matrix(self) -> np.ndarray:
+        """2x2: specimen micrometres (world frame) per beam-shift unit."""
+        sx = 1.0 + self.bs_scale_sigma * _n(self.seed, 51)
+        sy = 1.0 + self.bs_scale_sigma * _n(self.seed, 52)
+        k = self.bs_skew_sigma * _n(self.seed, 53)
+        r = math.radians(self.bs_rotation_sigma_deg) * _n(self.seed, 54)
+        c, s = math.cos(r), math.sin(r)
+        return np.array([[c, -s], [s, c]]) @ np.array([[sx, k], [0.0, sy]])
+
+    def crossover(self, spot: int, probe_mode: int = 0) -> float:
+        """The Intensity at the C2 crossover for this spot size and probe mode."""
+        x = self.crossover_intensity + self.crossover_sigma * _n(self.seed, 61, int(spot), int(probe_mode))
+        return float(min(max(x, 0.05), 0.95))
+
     def truth(self, mag_mode, mag: float) -> dict:
         """Every value at one magnification, for tests that calibrate against the twin."""
         return {
@@ -114,4 +137,5 @@ class ColumnRealism:
             "is_matrix_um_per_unit": self.is_matrix(mag_mode, mag).tolist(),
             "mag_offset_um": self.mag_offset_um(mag_mode, mag),
             "backlash_um": self.backlash_um,
+            "bs_matrix_um_per_unit": self.bs_matrix().tolist(),
         }
