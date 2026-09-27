@@ -16,6 +16,24 @@ from .options import CLEARS_POPULATION, NON_REGENERATING, SpecimenConfig
 from .raster import RasterContext, rasterize_scene
 from .scene import Feature, Scene
 
+#: A view is rasterised in parallel strips no thinner than this (rows).
+MIN_STRIP_ROWS = 192
+
+
+def _numba_threadsafe() -> bool:
+    """Whether numba's parallel kernels may be called from several threads at once: its
+    'omp' and 'tbb' threading layers are thread-safe, 'workqueue' is not. Unknown until
+    a parallel kernel has run (then the first raster is serial)."""
+    try:
+        import numba
+    except Exception:  # noqa: BLE001 - no numba: the NumPy paths
+        return True
+    try:
+        return numba.threading_layer() in ("omp", "tbb")
+    except ValueError:
+        return False
+
+
 # Thermal budget model (OpticsState.h / AdvanceThermalBudget).
 REFERENCE_OVERHEAT_C = 100.0  # degrees above onset at which the budget advances at 1 s/s
 MELT_RATE_PER_S = 40.0  # budget units shed per second at/above the melting point
@@ -235,19 +253,67 @@ class Specimen:
         """Optional FieldMap layers this specimen can fill (descan/strain for FIB lamellae)."""
         return frozenset(self.scene.required_layers)
 
-    def rasterize(self, view: ViewWindow, layers: frozenset = frozenset()) -> FieldMap:
+    def rasterize(self, view: ViewWindow, layers: frozenset = frozenset(), *, span_px: Optional[int] = None,
+                  threads: int = 1) -> FieldMap:
+        """The specimen on ``view``. ``span_px``: the size of the whole view when ``view`` is
+        a piece of one (the scene draws a piece as it draws the whole). ``threads`` > 1
+        rasterises row strips of a large view in parallel (the pixels are local, so the
+        strips are the rows of the whole), when numba's threading layer allows it."""
         layers = frozenset(layers) & OPTIONAL_LAYERS
         drifted = view
         dx, dy = self.drift_um()
         if dx or dy:  # the specimen moved by (dx, dy): look at world - drift
             drifted = dataclasses.replace(view, center_um=(view.center_um[0] - dx, view.center_um[1] - dy))
-        ctx = RasterContext(drifted, layers, grains=self.grains, time_index=self.time_index,
-                            lod_threshold_px=self.options.lod_threshold_px)
-        rasterize_scene(self.scene, ctx, curtain_depth=min(max(self.options.curtain_depth, 0.0), 1.0))
+        span = int(span_px) if span_px else max(view.shape)
+        n = max(1, min(int(threads), view.shape[0] // MIN_STRIP_ROWS))
+        if n > 1 and _numba_threadsafe():
+            fm = self._rasterize_strips(drifted, layers, span, n)
+        else:
+            ctx = self._rasterize_ctx(drifted, layers, span)
+            self.last_stats = dict(ctx.stats, **self.scene.last_stats)
+            fm = ctx.to_fieldmap(time_s=self._time_s)
         self._generation += 1
-        self.last_stats = dict(ctx.stats, **self.scene.last_stats)
-        fm = ctx.to_fieldmap(time_s=self._time_s, generation=self._generation)
+        fm.generation = self._generation
         fm.view = view
+        return fm
+
+    def _rasterize_ctx(self, view: ViewWindow, layers: frozenset, span: int) -> RasterContext:
+        ctx = RasterContext(view, layers, grains=self.grains, time_index=self.time_index,
+                            lod_threshold_px=self.options.lod_threshold_px, span_px=span)
+        rasterize_scene(self.scene, ctx, curtain_depth=min(max(self.options.curtain_depth, 0.0), 1.0))
+        return ctx
+
+    def _rasterize_strips(self, view: ViewWindow, layers: frozenset, span: int, n: int) -> FieldMap:
+        from concurrent.futures import ThreadPoolExecutor
+
+        ny, nx = view.shape
+        edges = np.linspace(0, ny, n + 1).astype(int)
+
+        def strip(i):
+            import numba
+
+            numba.set_num_threads(max(1, numba.config.NUMBA_NUM_THREADS // n))  # thread-local
+            r0, r1 = int(edges[i]), int(edges[i + 1])
+            x, y = view.pixel_to_world(np.array([(r0 + r1 - 1) / 2.0]), np.array([(nx - 1) / 2.0]))
+            sub = dataclasses.replace(view, center_um=(float(x[0]), float(y[0])), shape=(r1 - r0, nx))
+            return r0, r1, self._rasterize_ctx(sub, layers, span).to_fieldmap(time_s=self._time_s)
+        with ThreadPoolExecutor(n, thread_name_prefix="de-twin-raster") as ex:
+            parts = list(ex.map(strip, range(n)))
+        fm = FieldMap.empty(view, layers)
+        fm.time_s = self._time_s
+        if any(p.under_thickness_nm is not None for _, _, p in parts):
+            fm.under_material = np.zeros((ny, nx), np.uint8)
+            fm.under_thickness_nm = np.zeros((ny, nx), np.float32)
+        for r0, r1, p in parts:
+            for name in ("material_id", "thickness_nm", "grain_id", "under_material", "under_thickness_nm"):
+                a = getattr(p, name)
+                if a is not None:
+                    getattr(fm, name)[r0:r1] = a
+            for name in ("descan", "strain"):
+                a = getattr(p, name)
+                if a is not None and getattr(fm, name) is not None:
+                    getattr(fm, name)[:, r0:r1] = a
+        self.last_stats = dict(self.scene.last_stats, strips=n)
         return fm
 
     def drift_um(self) -> tuple[float, float]:

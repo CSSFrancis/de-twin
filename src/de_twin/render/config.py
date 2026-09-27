@@ -41,6 +41,9 @@ class RenderConfig:
     #: least ``reuse_min_overlap`` of its area, and rasterises only the rest.
     reuse_rasters: bool = True
     reuse_min_overlap: float = 0.25
+    #: Threads a large raster is rasterised on, in row strips (1 = serial). Each strip's
+    #: numba kernels get the matching share of numba's threads.
+    raster_threads: int = 4
     #: Interactive use (dragging the stage, zooming): while the view keeps changing, a
     #: view the cache cannot crop is rendered at up to ``preview_side`` squared and upsampled
     #: (~35-70 ms rather than ~0.3-0.9 s); the first time the same view is asked for

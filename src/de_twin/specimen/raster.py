@@ -184,9 +184,12 @@ class RasterContext:
     BLOCK_PIXELS = 1 << 17
 
     def __init__(self, view: ViewWindow, layers=frozenset(), grains: Optional[GrainTable] = None,
-                 time_index: int = 0, lod_threshold_px: float = 0.5):
+                 time_index: int = 0, lod_threshold_px: float = 0.5, span_px: Optional[int] = None):
         self.view = view
         self.ny, self.nx = int(view.shape[0]), int(view.shape[1])
+        #: The size (pixels) of the view this raster is part of: what the scene's populate /
+        #: aggregate choice is made on, so a piece of a view is drawn as the whole view is.
+        self.span_px = int(span_px) if span_px else max(self.ny, self.nx)
         self.npix = self.ny * self.nx
         x00, y00 = view.pixel_to_world(0.0, 0.0)
         xr, yr = view.pixel_to_world(1.0, 0.0)

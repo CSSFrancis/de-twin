@@ -11,6 +11,7 @@ at most 4 new populations / 192 MB per query).
 from __future__ import annotations
 
 import math
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -61,6 +62,7 @@ class Scene:
         self._aggregates: Optional[PrimitiveSet] = None  # one row per placement area, built lazily
         self._resident: OrderedDict[int, Batch] = OrderedDict()
         self._resident_bytes = 0
+        self._query_lock = threading.RLock()
         self.last_stats: dict = {}
 
     # ------------------------------------------------------------------------------------------
@@ -116,13 +118,18 @@ class Scene:
         return batch, True
 
     def query(self, ctx: RasterContext) -> PrimitiveSet:
-        """Primitives visible in the view, in painter's order (Scene::Query)."""
+        """Primitives visible in the view, in painter's order (Scene::Query). Serialised:
+        it populates areas on demand, and strips of one raster are rasterised in threads."""
+        with self._query_lock:
+            return self._query(ctx)
+
+    def _query(self, ctx: RasterContext) -> PrimitiveSet:
         t0 = time.perf_counter()
         stats = {"areas_visible": 0, "areas_populated": 0, "areas_aggregated": 0}
         box = ctx.aabb
         idx = self.holder.query_areas(box)
         stats["areas_visible"] = int(idx.size)
-        span = max(ctx.ny, ctx.nx)
+        span = getattr(ctx, "span_px", None) or max(ctx.ny, ctx.nx)
         threshold = max(AGGREGATE_HOLE_DIAMETER_PX, POPULATE_VIEW_FRACTION * span)
         parts: list[PrimitiveSet] = []
         protected: set = set()

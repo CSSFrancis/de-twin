@@ -90,6 +90,16 @@ def _from_lattice(view, lc: float, lr: float) -> tuple[float, float]:
     return (float(x), float(y))
 
 
+def _axis_aligned(view) -> bool:
+    """Whether the view's rows run along a world axis. Only then is a raster exactly the
+    rasters of its pieces: the specimen paints overlapping particles window by window, and
+    a rotated view's windows, clipped at a piece's edge, change which particle claims a
+    pixel where two overlap (a few pixels in a thousand), so rotated views are rasterised
+    whole."""
+    rot = float(getattr(view, "rotation_rad", 0.0))
+    return abs(math.sin(2.0 * rot)) < 1e-9
+
+
 def _pad_len(n: int, margin: float) -> int:
     """``n`` plus ``margin`` of it on both sides, rounded up (keeping the parity of ``n``,
     so the padded raster's pixels sit on the view's lattice) to a fast FFT length."""
@@ -212,11 +222,20 @@ class Renderer:
             if getattr(fm, "generation", 0) == fgen:
                 store.move_to_end(key)
                 return fm, token
-        fm = self.specimen.rasterize(optics.view, frozenset(layers))
+        fm = self._rasterize(optics.view, frozenset(layers))
         self.rasters_built += 1
         token = (next(self._tokens), getattr(fm, "generation", 0))
         self._keep_field_map(store, key, fm, token)
         return fm, token
+
+    def _rasterize(self, view, layers: frozenset, span_px=None):
+        """``specimen.rasterize``: in parallel strips (``RenderConfig.raster_threads``) and,
+        for a piece of a larger view, drawn as that view (``span_px``), when the specimen's
+        raster is pixel-local."""
+        if getattr(self.specimen, "raster_is_local", False) and _axis_aligned(view):
+            return self.specimen.rasterize(view, layers, span_px=span_px,
+                                           threads=max(1, int(self.config.raster_threads)))
+        return self.specimen.rasterize(view, layers)
 
     def _keep_field_map(self, store, key, fm, token) -> None:
         store[key] = (fm, token, getattr(fm, "generation", 0))
@@ -333,7 +352,8 @@ class Renderer:
         specimen whose raster is pixel-local (``raster_is_local``), for which the pieces
         are the pixels a whole raster has."""
         store = self._fieldmaps if store is None else store
-        if not getattr(self.specimen, "raster_is_local", False) or not self.config.reuse_rasters:
+        if (not getattr(self.specimen, "raster_is_local", False) or not self.config.reuse_rasters
+                or not _axis_aligned(optics.view)):
             return self.field_map(optics, TEM_LAYERS, time_s, store)
         tq = self.config.time_quantum_s
         tkey = round(time_s / tq) if (self._time_dependent() and tq > 0) else 0
@@ -366,7 +386,7 @@ class Renderer:
         parts = [((r_lo, r_hi, c_lo, c_hi), old, (r_lo + dr, c_lo + dc))]
         for r0, r1, c0, c1 in ((0, r_lo, 0, nx), (r_hi, ny, 0, nx), (r_lo, r_hi, 0, c_lo), (r_lo, r_hi, c_hi, nx)):
             if r1 > r0 and c1 > c0:
-                sub = self.specimen.rasterize(_sub_view(view, r0, r1, c0, c1), frozenset(TEM_LAYERS))
+                sub = self._rasterize(_sub_view(view, r0, r1, c0, c1), frozenset(TEM_LAYERS), max(ny, nx))
                 parts.append(((r0, r1, c0, c1), sub, (0, 0)))
         last = parts[-1][1]
         fm = FieldMap(view=view, material_id=np.zeros((ny, nx), np.uint8),

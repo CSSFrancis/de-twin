@@ -111,26 +111,30 @@ def test_a_reused_field_map_is_the_fresh_raster(name, dx, dy):
 
 
 def _same_raster(fm, ref):
-    """The same pixels, up to the rounding of world coordinates: a pixel centre a few ulp
-    from an edge may land on the other side of it (a handful of pixels in a million)."""
+    """The same pixels, up to the rounding of world coordinates (a pixel centre a few ulp
+    from an edge may land on the other side of it) and the painter's order where two
+    particles overlap: the scene paints particles window by window, and which one claims
+    an overlap pixel can depend on how a view's windows were grouped (below 1e-3 of the
+    pixels, grain ids only, in the densest scenes)."""
     n = fm.material_id.size
     assert np.count_nonzero(fm.material_id != ref.material_id) <= 2e-5 * n
-    assert np.count_nonzero(fm.grain_id != ref.grain_id) <= 2e-5 * n
-    assert np.count_nonzero(~np.isclose(fm.thickness_nm, ref.thickness_nm, rtol=1e-5, atol=1e-2)) <= 2e-5 * n
+    assert np.count_nonzero(fm.grain_id != ref.grain_id) <= 1e-3 * n
+    assert np.count_nonzero(~np.isclose(fm.thickness_nm, ref.thickness_nm, rtol=1e-5, atol=1e-2)) <= 1e-4 * n
     assert (fm.under_thickness_nm is None) == (ref.under_thickness_nm is None) or not ref.under_thickness_nm.any()
     if ref.under_thickness_nm is not None and fm.under_thickness_nm is not None:
         assert np.count_nonzero(~np.isclose(fm.under_thickness_nm, ref.under_thickness_nm, rtol=1e-5,
                                             atol=1e-2)) <= 2e-5 * n
 
 
-def test_a_rotated_flipped_view_reuses_on_its_own_lattice():
+@pytest.mark.parametrize("rotation", [0.0, 0.5 * np.pi])
+def test_a_turned_flipped_tilted_view_reuses_on_its_own_lattice(rotation):
     import dataclasses
 
     from de_twin.render import Renderer
 
     tw = _twin()
     o = tw.optics(tw.request())
-    v = dataclasses.replace(o.view, rotation_rad=0.7, flip_x=True, cos_alpha=0.9)
+    v = dataclasses.replace(o.view, rotation_rad=rotation, flip_x=True, cos_alpha=0.9)
     r = Renderer(tw.specimen, tw.renderer.config)
     a = r._padded_optics(dataclasses.replace(o, view=v))[0]
     r._panned_field_map(a, 0.0)
@@ -266,3 +270,53 @@ def test_a_crop_is_where_a_fresh_render_puts_the_view(dx_px, dy_px):
     # of the exit wave and one of the image move a little differently)
     assert np.abs(_shift_px(fresh[inner].astype(float), crop[inner].astype(float))).max() <= 0.2
     assert np.corrcoef(crop[inner].ravel(), fresh[inner].ravel())[0, 1] > 0.999
+
+
+# ------------------------------------------------------------------ strips
+@pytest.mark.parametrize("name", ["Dense Au on holey C", "Ted Pella 607 - 2160 l/mm grating replica (waffle)",
+                                  "Negative stain on carbon"])
+def test_a_raster_in_parallel_strips_is_the_serial_raster(name):
+    from de_twin.specimen.model import _numba_threadsafe
+
+    tw = _twin(name)
+    req = tw.request()
+    tw.flux(req)  # runs the numba kernels (the threading layer is known after)
+    v = tw.renderer._padded_optics(tw.optics(req))[0].view
+    serial = tw.specimen.rasterize(v)
+    strips = tw.specimen.rasterize(v, threads=4)
+    if _numba_threadsafe():
+        assert tw.specimen.last_stats.get("strips") == 4
+    _same_raster(strips, serial)
+
+
+def test_a_piece_of_a_view_is_drawn_as_the_whole_view():
+    """The scene populates a placement area or draws its aggregate by how large it is in
+    the view; a piece of a view (a strip, the part a stage move brings in) must decide as
+    the whole view does."""
+    from de_twin.render.renderer import _sub_view
+    from de_twin.specimen import Specimen, ViewWindow, from_name
+
+    s = Specimen(from_name("Dense Au on holey C"))
+    v = ViewWindow(center_um=s.features()[0].center_um, pixel_um=0.1, shape=(1344, 1344))
+    whole = s.rasterize(v)
+    piece = s.rasterize(_sub_view(v, 544, 800, 544, 800), span_px=1344)
+    alone = s.rasterize(_sub_view(v, 544, 800, 544, 800))
+    np.testing.assert_array_equal(piece.material_id, whole.material_id[544:800, 544:800])
+    assert not np.array_equal(alone.material_id, piece.material_id), "a small view alone decides otherwise"
+
+
+def test_a_rotated_view_is_rasterised_whole():
+    import dataclasses
+
+    from de_twin.render import Renderer
+
+    tw = _twin()
+    o = tw.optics(tw.request())
+    v = dataclasses.replace(o.view, rotation_rad=0.7)
+    r = Renderer(tw.specimen, tw.renderer.config)
+    r._panned_field_map(r._padded_optics(dataclasses.replace(o, view=v))[0], 0.0)
+    moved = dataclasses.replace(v, center_um=(v.center_um[0] + 0.25 * v.shape[1] * v.pixel_um, v.center_um[1]))
+    fm, _ = r._panned_field_map(r._padded_optics(dataclasses.replace(o, view=moved))[0], 0.0)
+    assert r.rasters_reused == 0 and "strips" not in tw.specimen.last_stats
+    ref = tw.specimen.rasterize(fm.view)
+    np.testing.assert_array_equal(fm.grain_id, ref.grain_id)

@@ -153,9 +153,14 @@ def _level_offset(c: np.ndarray):
     lv = np.interp(np.clip(c, cov[1], cov[half]), cov[1:half + 1], np.arange(1, half + 1, dtype=np.float64))
     row = np.clip(np.rint((lv - 1.0) / (half - 1.0) * (_LEVELS - 1)).astype(np.int64), 0, _LEVELS - 1)
     off = np.empty_like(c)
-    for r in np.unique(row):
-        m = row == r
-        off[m] = np.interp(c[m], table[r], _OFFSETS)
+    # each row's pixels as one slice of a (radix) sort, not a mask over all of them per row
+    order = np.argsort(row.astype(np.uint8), kind="stable")
+    cuts = np.searchsorted(row[order], np.arange(_LEVELS + 1))
+    cs = c[order]
+    for r in range(_LEVELS):
+        a, b = cuts[r], cuts[r + 1]
+        if b > a:
+            off[order[a:b]] = np.interp(cs[a:b], table[r], _OFFSETS)
     return levels[row], off
 
 
