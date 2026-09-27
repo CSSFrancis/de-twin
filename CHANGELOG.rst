@@ -10,6 +10,55 @@ Fragment files in ``upcoming_changes/`` are assembled into this file by
 
 .. towncrier release notes start
 
+0.2.0 (2026-09-27)
+==================
+
+New Features
+------------
+
+- A tilted specimen that is off eucentric height moves in the image (by dz sin(tilt) across the tilt axis), as it does on a real stage: what eucentric-height routines measure.
+- Apollo super-resolution: ``AcquisitionRequest(super_resolution=True)`` (deapi: ``Centroiding Mode = Super-resolution``) reads a counting camera out at 2x the ROI each way (8192² for a full Apollo frame, ~20 ms). Each event lands in one of its pixel's 2x2 sub-pixels, drawn uniformly: the rendered flux has no detail finer than a sensor pixel, so that is what a real super-resolution readout of it would show.
+- Beam tilt reaches diffraction: a tilted beam moves the SAED / CBED pattern (tilt / mrad-per-pixel) and tilts the Ewald sphere, so tilting towards -g by the Bragg angle excites +g.
+- Counting cameras (the Apollo family) run through numba kernels too: a 4096² counted frame in ~9 ms (the numpy path took ~90 ms).
+- Low dose on the column: ``LowDose``, ``LowDoseArea`` (Search / View / Focus / Record) and ``LowDoseAreas``. Each area stores its magnification, spot, intensity, defocus offset from Record's focus, image shift and beam shift; switching stores the area left and applies the one entered. On a realistic column the areas do not line up by themselves, which is what SerialEM's View-to-Record low-dose calibration measures.
+- Pinned acquisitions: ``AcquisitionRequest(seed=...)`` (and ``snap(seed=...)``) seeds frame *i* of an acquisition by ``(seed, i)`` whatever the twin exposed before; ``DigitalTwin.reset_serial()`` restarts the running frame count.
+- Precession: the column's ``Precession``, ``PrecessionAngle`` (mrad), ``PrecessionFrequency`` (Hz) and ``PrecessionDescan`` drive the beam tilt round a cone; SAED and kinematic 4D-STEM patterns average over the tilts swept during each frame (the whole cone, or the arc a frame shorter than the period covers). Without descan the pattern sweeps round a ring.
+- STEM and 4D STEM patterns with large disks (a probe's disks can outgrow the detector) are drawn row by row over the detector with a numba kernel instead of stamping each disk's whole square: a Steel 4D STEM frame goes from ~3.3 s to ~50 ms.
+- Shared-memory throughput: ``ShmFace(reuse=N, threads=M)`` (``de-twin serve --shm --reuse N --threads M``) renders into a pool on its own thread and publishes each frame up to N times, with the detector physics capped at M cores; frames are copied into the mapping once. A 4096² DE16 stream reaches ~170 fps (5.7 GB/s) with ``reuse=8, threads=8``, an Apollo ~250 fps (4.2 GB/s) with ``reuse=8, threads=4``. Recycled frames are always of the current view.
+- Specimen preset ``Cross grating 2160 l/mm``: a carbon replica cross grating (463 nm period), the pixel-size calibration standard.
+- TEM imaging renders a view 15 % of the field larger on each side and serves a stage move inside that margin by cropping it: a nudge costs ~2 ms instead of a render; ``RenderConfig(pan_margin=0)`` turns it off.
+- The deapi face has a read-only ``Simulator Source`` property (``de-twin <version>``) so clients can stamp provenance on what they save.
+- The detector simulation runs as fused numba kernels for integrating cameras: 6x faster at 4096² (170 → 28 ms a frame) and 11x at 1024² (42 → 4 ms), with the same statistics; ``DE_TWIN_NUMPY_DETECTOR=1`` keeps the numpy path. TEM images render at up to 1024² (from 2048²), which makes a re-render after a stage move ~2.7x faster on a 4096² camera. numba is now a dependency.
+- The realistic column (``OpticsConfig.realistic``) has a C2 crossover (the beam converges to its smallest at an Intensity that varies by spot size and probe mode, and spreads again past it) and a beam-shift matrix; ``calibration_truth()`` reports both. Closed-loop tests run SerialEM's Beam Crossover and Beam Shift calibrations against them.
+- The realistic column adds image-shift-induced coma and astigmatism (image shift images the specimen off the coma-free axis: an effective beam tilt of ~0.43 mrad per micrometre, and ~15 nm A1 per micrometre) and the high-defocus change of magnification and rotation (~4 % and ~2 deg at -200 um). ``calibration_truth()`` reports them; closed-loop tests run SerialEM's autofocus, coma-vs-image-shift and high-defocus calibrations against the twin.
+- ``OpticsConfig(intensity_zoom=True)``: in TEM imaging the condenser follows the magnification (like TFS Intensity Zoom), so the dose per detector pixel stays put as the operator zooms; Intensity sets the beam at ``intensity_zoom_reference_mag``. Off by default: the dose per pixel goes as 1/mag², so zooming out from a safe dose saturates the camera and zooming in drowns it in shot noise.
+- ``OpticsConfig(max_raster_pixels=...)`` sets the largest TEM raster (0: render at the frame's own sampling, for CTF and MTF measurements); ``OpticsState.resolution_warning`` says when a frame is upsampled from a coarser raster.
+- ``OpticsConfig.realistic(seed)``: a column with a real one's geometry, what SerialEM's calibrations measure. Per magnification an image rotation (with a large jump between LowMAG and MAG1), a true pixel size off the nominal one, an image-shift matrix (scale, skew, rotation) and an image-centre offset; stage backlash that depends on the approach direction. The ideal column stays the default. ``DigitalTwin.calibration_truth()`` reports every true value for closed-loop tests; the pan-crop cache now works for rotated views.
+- ``RenderConfig(interactive=True)``: while the view keeps changing (dragging the stage, zooming), a view the pan cache cannot crop is rendered at up to ``preview_side``² and upsampled, so live view keeps up; once the view has been still for ``settle_s`` it is rendered in full.
+- ``de_twin.optics.serialem``: ``to_serialem`` writes a column's calibrations as SerialEM would measure them (``SerialEMcalibrations.txt`` entries: image-shift and stage-to-camera matrices, image-shift offsets, beam-shift calibrations, crossovers, high-focus magnification and focus calibrations; plus the camera's ``RotationAndPixel`` lines), and ``from_serialem`` reads a microscope's calibrations into a ``ColumnDefinition`` that goes in ``OpticsConfig(realism=...)``, so a twin behaves like that microscope. The round trip is exact.
+
+
+Bug Fixes
+---------
+
+- A specimen with an amorphous material in a crystalline slot (the FIB-liftout pattern's "auto" post) no longer raises in imaging or diffraction; it scatters no Bragg beams.
+- A twin now starts where an operator would: the stage over the specimen (the nearest intact grid square, well, lamella or chip window, and its largest particle cluster) instead of the stage origin, which was a grid bar or chip frame for some presets and left them black; the beam at a dose the detector takes without saturating a frame; and cryo specimens 1.5 µm underfocus. ``DigitalTwin(start_on_specimen=False)`` keeps the old start, and a supplied column is never moved.
+- In TEM imaging, beam shift moves the illuminated disc across the camera and leaves the specimen where it is (it used to move the image, like image shift). STEM and diffraction are unchanged.
+- The column's ``mag_ladder()`` in TEM imaging lists LowMAG's and MAG1's magnifications together, the ones a ``Magnification`` write can reach, so a client stepping it (Ground Crew's mag +/-) crosses from low to medium magnification instead of stopping at the top of LowMAG.
+- The deapi face caches its port at start, so a face stopped before its UDP thread binds no longer calls ``getsockname`` on a closed socket.
+- The deapi face starts with a 0.5 s exposure instead of a single frame, whose sparse electrons read as noise.
+- The shared-memory face keeps its frame pool across back-to-back requests for the same frames (DE-MC's live view is a string of short acquisitions), and republishes the last frame while a new request has nothing rendered yet, so a slow render at the start of one no longer stops DE-Server.
+- The shared-memory face renders on a thread of its own and republishes the last frame while a slow render runs, so DE-Server no longer stops a live acquisition ("no frame from the producer within 1020 ms") when a view takes over a second to render.
+- The shared-memory face renders one frame to warm the twin up before it attaches, so DE-Server's first acquisition no longer times out while a fresh twin starts (about 15 s on first use); ``ShmFace.ready`` is set once it is serving.
+- impulsePy is imported on a thread of its own with a timeout (``holder.impulse.import_impulse``): with Impulse not running, ``connect_holder("impulse")`` falls back to the simulated holder instead of hanging.
+
+
+Documentation
+-------------
+
+- User-guide pages on the realistic column (and intensity zoom), beam tilt and precession, low dose, and SerialEM calibrations; the new classes and functions are in the API reference.
+
+
 0.1.1 (2026-09-24)
 ==================
 
