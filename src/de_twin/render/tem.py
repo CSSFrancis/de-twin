@@ -441,8 +441,9 @@ def _world_locked_noise(view, seed: int, salt: int) -> np.ndarray:
     pitch_x = view.pixel_um / view.cos_beta
     pitch_y = view.pixel_um / view.cos_alpha
     if not getattr(view, "rotation_rad", 0.0) and not getattr(view, "flip_x", False)             and not getattr(view, "flip_y", False):
-        ix0 = int(round(view.center_um[0] / pitch_x + (0.5 - nx / 2.0)))
-        iy0 = int(round(view.center_um[1] / pitch_y + (0.5 - ny / 2.0)))
+        # the nearest cell, ties (a view centred on the pixel lattice) broken upwards
+        ix0 = math.floor(view.center_um[0] / pitch_x + (0.5 - nx / 2.0) + 0.5 + 1e-6)
+        iy0 = math.floor(view.center_um[1] / pitch_y + (0.5 - ny / 2.0) + 0.5 + 1e-6)
         return world_normal_noise(ix0, iy0, ny, nx, seed, salt)
     rows, cols = np.mgrid[0:ny, 0:nx]
     x, y = view.pixel_to_world(rows.ravel(), cols.ravel())

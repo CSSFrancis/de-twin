@@ -243,3 +243,26 @@ def test_serve_interactive_flag():
     assert _build_twin(args).renderer.config.interactive
     args.interactive = False
     assert not _build_twin(args).renderer.config.interactive
+
+
+@pytest.mark.parametrize("dx_px,dy_px", [(7.4, -3.3), (0.5, 0.25), (-120.7, 60.45)])
+def test_a_crop_is_where_a_fresh_render_puts_the_view(dx_px, dy_px):
+    """Inside the margin a move is a crop, interpolated to a fraction of a pixel: the image
+    sits where a fresh render of the view puts it (not on the nearest raster pixel)."""
+    from test_realism_calibrations import _shift_px
+
+    tw, ref = _twin(), _twin()
+    req = tw.request()
+    tw.flux(req)
+    built = tw.renderer.rasters_built
+    px = tw.optics(req).view.pixel_um
+    for t in (tw, ref):
+        _move(t, dx_px * px, dy_px * px)
+    crop = tw.flux(req)
+    assert tw.renderer.rasters_built == built, "a crop"
+    fresh = ref.flux(req)
+    inner = (slice(64, -64), slice(64, -64))
+    # (the whitened phase correlation weighs the pixel-scale texture, which a sub-pixel shift
+    # of the exit wave and one of the image move a little differently)
+    assert np.abs(_shift_px(fresh[inner].astype(float), crop[inner].astype(float))).max() <= 0.2
+    assert np.corrcoef(crop[inner].ravel(), fresh[inner].ravel())[0, 1] > 0.999

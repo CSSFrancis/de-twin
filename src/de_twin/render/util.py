@@ -35,6 +35,42 @@ def parallel_rows(fn, nrows: int, min_chunk: int = 64) -> None:
     list(pool().map(lambda i: fn(int(edges[i]), int(edges[i + 1])), range(n)))
 
 
+try:  # numba: the cubic resampling kernel (NumPy fallback below)
+    import numba as _nb
+
+    @_nb.njit(parallel=True, cache=True, nogil=True)
+    def _cubic_nb(src, wr, wc, out):  # pragma: no cover - compiled
+        ny, nx = out.shape
+        for i in _nb.prange(ny):
+            for j in range(nx):
+                acc = 0.0
+                for a in range(4):
+                    row = 0.0
+                    for b in range(4):
+                        row += wc[b] * src[i + a, j + b]
+                    acc += wr[a] * row
+                out[i, j] = acc if acc > 0.0 else 0.0
+except Exception:  # noqa: BLE001
+    _cubic_nb = None
+
+
+def cubic_resample(src: np.ndarray, wr: np.ndarray, wc: np.ndarray, shape) -> np.ndarray:
+    """``out[i, j] = max(0, sum_ab wr[a] wc[b] src[i + a, j + b])`` for a 4 x 4 tap kernel:
+    a separable sub-pixel shift of ``src`` (``shape`` + 3 on each axis) to ``shape``."""
+    ny, nx = shape
+    out = np.empty((ny, nx), np.float32)
+    if _cubic_nb is not None:
+        _cubic_nb(np.asarray(src, np.float32), wr.astype(np.float32), wc.astype(np.float32), out)
+        return out
+    tmp = wr[0] * src[0:ny]
+    for k in range(1, 4):
+        tmp += wr[k] * src[k:k + ny]
+    acc = wc[0] * tmp[:, 0:nx]
+    for k in range(1, 4):
+        acc += wc[k] * tmp[:, k:k + nx]
+    return np.maximum(acc, 0.0, out=out)
+
+
 def gaussian_filter_threaded(a: np.ndarray, sigma: float, **kw) -> np.ndarray:
     """``scipy.ndimage.gaussian_filter`` of a 2-D array, the same numbers, with each axis's
     1-D pass split into strips on the shared pool (ndimage releases the GIL)."""

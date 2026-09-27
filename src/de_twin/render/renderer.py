@@ -109,16 +109,24 @@ def _sub_view(view, r0: int, r1: int, c0: int, c1: int):
 
 #: A crop whose offset is this close to a whole number of raster pixels is not resampled.
 SUBPIXEL_TOLERANCE_PX = 0.02
-#: Extra raster pixels around a sub-pixel crop, so the Fourier shift's wrap-around stays out
-#: of the view.
-SUBPIXEL_HALO_PX = 8
+
+
+def _cubic_weights(t: float) -> np.ndarray:
+    """Keys cubic convolution (a = -1/2) weights of the samples at -1, 0, 1, 2 for a point
+    a fraction ``t`` in [0, 1) past sample 0: interpolating, and exact for quadratics."""
+    return np.array([((-0.5 * t + 1.0) * t - 0.5) * t,
+                     (1.5 * t - 2.5) * t * t + 1.0,
+                     ((-1.5 * t + 2.0) * t + 0.5) * t,
+                     (0.5 * t - 0.5) * t * t], np.float32)
 
 
 def _crop(raster, center_um, view):
     """The view's pixels out of a padded raster whose middle shows ``center_um``, or None
-    when the view is not inside it. An offset of a fraction of a pixel is a band-limited
-    (Fourier) shift of the crop, so a stage move inside the margin moves the image as far
-    as a fresh render would, not to the nearest raster pixel."""
+    when the view is not inside it. An offset of a fraction of a pixel is interpolated
+    (separable cubic convolution), so a stage move inside the margin moves the image as
+    far as a fresh render would, not to the nearest raster pixel."""
+    from .util import cubic_resample
+
     ny, nx = view.shape
     py, px = raster.shape
     lc, lr = _lattice(view, *view.center_um)
@@ -128,23 +136,18 @@ def _crop(raster, center_um, view):
     c0, r0 = int(round(fc)), int(round(fr))
     if r0 < 0 or c0 < 0 or r0 + ny > py or c0 + nx > px:
         return None
-    dc, dr = fc - c0, fr - r0
-    if abs(dc) < SUBPIXEL_TOLERANCE_PX and abs(dr) < SUBPIXEL_TOLERANCE_PX:
+    if abs(fc - c0) < SUBPIXEL_TOLERANCE_PX and abs(fr - r0) < SUBPIXEL_TOLERANCE_PX:
         return raster[r0:r0 + ny, c0:c0 + nx]
-    from scipy import fft as sfft
-
-    h = SUBPIXEL_HALO_PX
-    a0, a1 = max(0, r0 - h), min(py, r0 + ny + h)
-    b0, b1 = max(0, c0 - h), min(px, c0 + nx + h)
-    win = raster[a0:a1, b0:b1]
-    ramp_r = np.exp(2j * np.pi * sfft.fftfreq(win.shape[0]) * dr).astype(np.complex64)
-    ramp_c = np.exp(2j * np.pi * sfft.rfftfreq(win.shape[1]) * dc).astype(np.complex64)
-    spec = sfft.rfft2(win, workers=-1)
-    spec *= ramp_r[:, None]
-    spec *= ramp_c[None, :]
-    out = sfft.irfft2(spec, s=win.shape, workers=-1)
-    out = out[r0 - a0:r0 - a0 + ny, c0 - b0:c0 - b0 + nx]
-    return np.maximum(out, 0.0, out=np.ascontiguousarray(out, np.float32))
+    # output pixel j samples the raster at f + j: taps at floor(f) - 1 .. floor(f) + 2
+    br, bc = math.floor(fr), math.floor(fc)
+    wr, wc = _cubic_weights(fr - br), _cubic_weights(fc - bc)
+    # the rows and columns the taps need (edge-clamped where the view touches the raster edge)
+    if br >= 1 and bc >= 1 and br + ny + 2 <= py and bc + nx + 2 <= px:
+        src = raster[br - 1:br + ny + 2, bc - 1:bc + nx + 2]
+    else:
+        src = raster[np.clip(np.arange(br - 1, br + ny + 2), 0, py - 1)][
+            :, np.clip(np.arange(bc - 1, bc + nx + 2), 0, px - 1)]
+    return cubic_resample(src, wr, wc, (ny, nx))
 
 
 class Renderer:
