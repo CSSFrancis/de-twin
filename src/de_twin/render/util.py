@@ -35,6 +35,20 @@ def parallel_rows(fn, nrows: int, min_chunk: int = 64) -> None:
     list(pool().map(lambda i: fn(int(edges[i]), int(edges[i + 1])), range(n)))
 
 
+def gaussian_filter_threaded(a: np.ndarray, sigma: float, **kw) -> np.ndarray:
+    """``scipy.ndimage.gaussian_filter`` of a 2-D array, the same numbers, with each axis's
+    1-D pass split into strips on the shared pool (ndimage releases the GIL)."""
+    from scipy import ndimage
+
+    tmp = np.empty_like(a)
+    out = np.empty_like(a)
+    parallel_rows(lambda c0, c1: ndimage.gaussian_filter1d(a[:, c0:c1], sigma, axis=0, output=tmp[:, c0:c1], **kw),
+                  a.shape[1], 32)
+    parallel_rows(lambda r0, r1: ndimage.gaussian_filter1d(tmp[r0:r1], sigma, axis=1, output=out[r0:r1], **kw),
+                  a.shape[0], 32)
+    return out
+
+
 def upsample2x_scaled(a: np.ndarray, scale: float = 1.0) -> np.ndarray:
     """Threaded pixel-centre bilinear 2x upsampling (edge clamped) times ``scale``."""
     a = np.asarray(a, np.float32)

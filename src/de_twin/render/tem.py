@@ -54,7 +54,8 @@ from ..specimen.materials import (GRAINS_PER_MATERIAL, MATERIALS, MaterialId, ab
                                   material_array)
 from .diffraction import MAX_THICKNESS_BIN, THICKNESS_BIN_NM, bragg_fraction, thickness_bin_for
 from .samples import DIFFUSE_CUTOFF_LENGTHS
-from .util import chi_and_gradient, disk_profile, parallel_rows, upsample_to, world_normal_noise
+from .util import (chi_and_gradient, disk_profile, gaussian_filter_threaded, parallel_rows, pool, upsample_to,
+                   world_normal_noise)
 
 GOLD_LATTICE_CONTRAST = 0.12
 LATTICE_MIN_SAMPLES = 2.25
@@ -270,24 +271,39 @@ def lattice_field(fm, optics, bc: BraggContrast, t, gold_only: bool = False):
     if mask is None or not mask.any():
         return None
     rows, cols = np.nonzero(mask)
-    x_um, y_um = optics.view.pixel_to_world(rows, cols)
-    X, Y = x_um * 1000.0, y_um * 1000.0
     g = bc.gid[rows, cols]
     acc = np.zeros(len(rows))
     raw = np.zeros(len(rows))
     grating = bool(getattr(bc, "phase_grating", False) or getattr(bc, "kinematic", False))
     weight = np.zeros(len(rows)) if grating else np.minimum(1.0, t[rows, cols] / 10.0)
+    # each grain's pixels as slices of a grain-sorted order (not a mask over all of them),
+    # in chunks on the shared pool
+    order = np.argsort(g, kind="stable")
+    gs = g[order]
+    jobs = []
     for gg in gids:
-        sel = g == gg
+        a, b = int(np.searchsorted(gs, gg)), int(np.searchsorted(gs, gg, side="right"))
+        jobs += [(gg, c0, min(b, c0 + 65536)) for c0 in range(a, b, 65536)]
+
+    def one(job):
+        gg, a, b = job
+        sel = order[a:b]
+        x_um, y_um = optics.view.pixel_to_world(rows[sel], cols[sel])
+        xs, ys = x_um * 1000.0, y_um * 1000.0
         kx, ky, amp = bc.fringes[gg]
         norm = 1.0 if grating else 1.0 / len(kx)
+        acc_g = np.zeros(len(sel))
+        raw_g = np.zeros(len(sel))
         for w in range(len(kx)):
             ph = 2.0 * math.pi * uniform_from_hash(hash_seed(int(gg), SeedKind.GRAIN, w, 0xA111))
-            c = np.cos(kx[w] * X[sel] + ky[w] * Y[sel] + ph) * norm
-            acc[sel] += amp[w] * c
-            raw[sel] += c
+            c = np.cos(kx[w] * xs + ky[w] * ys + ph) * norm
+            acc_g += amp[w] * c
+            raw_g += c
+        acc[sel] = acc_g
+        raw[sel] = raw_g
         if grating:  # kinematic amplitude grows with the projected thickness
             weight[sel] = np.clip(t[rows[sel], cols[sel]] / bc.t_typ[gg], 0.0, 2.0)
+    list(pool().map(one, jobs))
     return (rows, cols), (acc * weight).astype(np.float32), raw.astype(np.float32)
 
 
@@ -439,7 +455,7 @@ def texture_noise(optics, cfg, seed: int) -> np.ndarray:
     noise = _world_locked_noise(view, seed, salt)
     sb = cfg.texture_bandlimit_nm / p_nm
     if sb > 0.3:
-        noise = ndimage.gaussian_filter(noise, sb, mode="wrap")
+        noise = gaussian_filter_threaded(noise, sb, mode="wrap")
     return noise
 
 
@@ -533,13 +549,17 @@ def transmission_function(fm, optics, grains, crystallinity, cfg, seed: int, *,
     taper_px = cfg.edge_taper_nm / p_nm
     if cfg.mip_phase:
         # mean-inner-potential phase with rounded (not ideal-step) edges
-        t_all = fm.thickness_nm.astype(np.float32) * np.float32(optics.thickness_tilt_factor)
-        mip = sigma * mip_v[fm.material_id] * t_all
-        if fm.under_thickness_nm is not None:
-            mip = mip + sigma * mip_v[fm.under_material] * (
-                fm.under_thickness_nm * np.float32(optics.thickness_tilt_factor))
+        f_t = np.float32(optics.thickness_tilt_factor)
+
+        def mip_rows(r0, r1):
+            m = sigma * mip_v[fm.material_id[r0:r1]] * (fm.thickness_nm[r0:r1].astype(np.float32) * f_t)
+            if fm.under_thickness_nm is not None:
+                m = m + sigma * mip_v[fm.under_material[r0:r1]] * (fm.under_thickness_nm[r0:r1] * f_t)
+            return m
+        mip = np.empty((ny, nx), mip_rows(0, 1).dtype)
+        parallel_rows(lambda r0, r1: mip.__setitem__(slice(r0, r1), mip_rows(r0, r1)), ny)
         if taper_px > 0.3:
-            mip = ndimage.gaussian_filter(mip, min(taper_px, 16.0), mode="nearest", truncate=3.0)
+            mip = gaussian_filter_threaded(mip, min(taper_px, 16.0), mode="nearest", truncate=3.0)
         if cfg.refraction_loss:
             # Electrons refracted by a steep phase gradient beyond the imaging band (objective
             # aperture, or half the raster Nyquist) are lost: amplitude *= exp(-(g/g_c)^4),
@@ -548,13 +568,22 @@ def transmission_function(fm, optics, grains, crystallinity, cfg, seed: int, *,
             if optics.objective_aperture_mrad > 0:
                 g_c = min(g_c, 2.0 * math.pi * p_nm * optics.objective_aperture_mrad * 1e-3
                           / optics.wavelength_nm)
-            gy = np.zeros_like(mip)
-            gx = np.zeros_like(mip)
-            gy[1:-1] = 0.5 * (mip[2:] - mip[:-2])
-            gx[:, 1:-1] = 0.5 * (mip[:, 2:] - mip[:, :-2])
-            q = (gx * gx + gy * gy) * np.float32(1.0 / (g_c * g_c))
+            q = np.empty_like(mip)
+            inv_gc2 = np.float32(1.0 / (g_c * g_c))
+
+            def q_rows(r0, r1):
+                gy = np.zeros((r1 - r0, nx), mip.dtype)
+                gx = np.zeros((r1 - r0, nx), mip.dtype)
+                a, b = max(r0, 1), min(r1, ny - 1)
+                if b > a:
+                    gy[a - r0:b - r0] = 0.5 * (mip[a + 1:b + 1] - mip[a - 1:b - 1])
+                gx[:, 1:-1] = 0.5 * (mip[r0:r1, 2:] - mip[r0:r1, :-2])
+                q[r0:r1] = (gx * gx + gy * gy) * inv_gc2
+            parallel_rows(q_rows, ny)
             if float(q.max()) > 0.01:
-                loss = np.exp(-q * q).astype(np.float32)
+                loss = np.empty((ny, nx), np.float32)
+                parallel_rows(lambda r0, r1: loss.__setitem__(
+                    slice(r0, r1), np.exp(-q[r0:r1] * q[r0:r1]).astype(np.float32)), ny)
 
     def work(r0, r1):
         I, t = amplitude_rows(fm, optics, r0, r1, bc.loss)
@@ -601,8 +630,12 @@ def transmission_function(fm, optics, grains, crystallinity, cfg, seed: int, *,
         lat = lattice_field(fm, optics, bc, t_full)
         if lat is not None:
             (rows, cols), val, _ = lat
-            scale = 1.0 if (bc.phase_grating or bc.kinematic) else cfg.lattice_phase_rad
-            psi[rows, cols] *= np.exp(1j * np.float32(scale) * val).astype(np.complex64)
+            scale = np.float32(1.0 if (bc.phase_grating or bc.kinematic) else cfg.lattice_phase_rad)
+
+            def fringe(a, b):
+                r, c = rows[a:b], cols[a:b]
+                psi[r, c] *= np.exp(1j * scale * val[a:b]).astype(np.complex64)
+            parallel_rows(fringe, len(rows), 16384)
     return (psi, bc) if return_contrast else psi
 
 
