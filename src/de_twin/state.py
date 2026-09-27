@@ -119,6 +119,8 @@ class MicroscopeState:
     condenser_stig: Vec2 = field(default_factory=Vec2)
     # Precession [twin]: the beam-tilt coils driven round a cone of half-angle
     # `precession_mrad` at `precession_hz`; with descan the pattern is brought back.
+    # [twin] true stage position minus reported (backlash), x/y um
+    stage_error_um: Vec2 = field(default_factory=Vec2)
     precession_on: bool = False
     precession_mrad: float = 10.0
     precession_hz: float = 100.0

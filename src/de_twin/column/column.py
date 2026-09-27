@@ -279,6 +279,9 @@ class Column:
         self._stage_target = list(pos)
         self._stage_now = list(pos)
         self._move_t0 = self._now()
+        # [twin] stage backlash (um) and each of x/y's last approach direction (+1 / -1 / 0)
+        self.backlash_um = 0.0
+        self._approach = [0.0, 0.0]
         self._last_op_state = 0  # DE-TEM-Channel OperationState of the last set
         sizes = [2] * L.APERTURE_KIND_COUNT
         sizes[L.APERTURE_KIND_CLA] = int(s.condenser_aperture_index)
@@ -443,6 +446,9 @@ class Column:
             s = self._s.copy()
             x, y, z, a, b = self._stage_now
             s.stage = StagePosition(x, y, z, a, b)
+            # backlash: the stage stops short of the reported position, against its approach
+            h = 0.5 * float(self.backlash_um)
+            s.stage_error_um = Vec2(-h * self._approach[0], -h * self._approach[1])
             s.op_status = 1 if moving else 0
             s.mag_mode = L.FUNCTION_MODE_NAMES[self._fm]
             s.projection = Projection.DIFFRACTION if self._fm == L.FM_DIFF else Projection.IMAGING
@@ -777,6 +783,8 @@ class Column:
                     raise ColumnRefused(f"stage {axis} must be finite")
                 lim = self.stage_limits[i]
                 self._stage_target[i] = min(max(v, -lim), lim)
+                if i < 2 and self._stage_target[i] != self._stage_now[i]:
+                    self._approach[i] = 1.0 if self._stage_target[i] > self._stage_now[i] else -1.0
         self._move_t0 = self._now()
 
     def _s_screen(self, value) -> None:

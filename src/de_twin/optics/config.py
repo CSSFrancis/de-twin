@@ -79,6 +79,16 @@ class OpticsConfig:
     #: the dose per pixel goes as 1/mag^2 and zooming out saturates the camera.
     intensity_zoom: bool = False
     intensity_zoom_reference_mag: float = 20000.0
+    #: A real column's geometry (image rotation, true pixel size, image-shift matrices,
+    #: magnification offsets, backlash): what SerialEM's calibrations measure. None: ideal.
+    realism: Optional["ColumnRealism"] = None
+
+    @classmethod
+    def realistic(cls, seed: int = 0, **kw) -> "OpticsConfig":
+        """A column as imperfect as a real one (:mod:`de_twin.optics.realism`), reproducibly."""
+        from .realism import ColumnRealism
+
+        return cls(realism=ColumnRealism(seed=seed), **kw)
 
     # ---- aberrations / coherence (twin additions) --------------------------
     cs_mm: float = 1.2
