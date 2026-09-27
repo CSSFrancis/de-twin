@@ -34,6 +34,13 @@ class RenderConfig:
     #: serves a stage move that stays inside the margin by cropping it: the image moves
     #: rigidly with the specimen, so a joystick nudge costs a crop, not a render. 0 off.
     pan_margin: float = 0.15
+    #: Padded rasters kept for cropping (a jump back to a recent place is a crop too).
+    pan_cache_size: int = 4
+    #: A new padded raster takes the specimen it shares with a cached one (same sampling, on
+    #: the same world-fixed pixel lattice) from that one's field map when they overlap by at
+    #: least ``reuse_min_overlap`` of its area, and rasterises only the rest.
+    reuse_rasters: bool = True
+    reuse_min_overlap: float = 0.25
     #: Interactive use (dragging the stage, zooming): while the view keeps changing, a
     #: view the cache cannot crop is rendered at up to ``preview_side`` squared and upsampled
     #: (~35-70 ms rather than ~0.3-0.9 s); the first time the same view is asked for

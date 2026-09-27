@@ -25,7 +25,7 @@ from typing import Optional
 
 import numpy as np
 
-from ..specimen.fieldmap import LAYER_DESCAN, LAYER_STRAIN, GrainTable
+from ..specimen.fieldmap import LAYER_DESCAN, LAYER_STRAIN, FieldMap, GrainTable
 from ..state import RenderMode
 from .coherent import CoherentStem, choose_model
 from .config import RenderConfig
@@ -63,6 +63,90 @@ def _precession_frame(optics, time_s: float):
     return dataclasses.replace(optics, precession_phase_rad=round(phase / step) * step, precession_arc_rad=arc)
 
 
+def _lattice(view, x: float, y: float) -> tuple[float, float]:
+    """(column, row) of world point (x, y) on the view's world-fixed pixel lattice: pixel
+    units along the view's own (rotated, flipped, foreshortened) axes from the origin."""
+    rot = float(getattr(view, "rotation_rad", 0.0))
+    if rot:
+        c, s = math.cos(rot), math.sin(rot)
+        x, y = c * x + s * y, -s * x + c * y
+    sx = -1.0 if getattr(view, "flip_x", False) else 1.0
+    sy = -1.0 if getattr(view, "flip_y", False) else 1.0
+    pu = view.pixel_um
+    return sx * x * max(view.cos_beta, 0.1) / pu, sy * y * max(view.cos_alpha, 0.1) / pu
+
+
+def _from_lattice(view, lc: float, lr: float) -> tuple[float, float]:
+    """The world point at lattice (column, row) ``(lc, lr)`` (inverse of `_lattice`)."""
+    sx = -1.0 if getattr(view, "flip_x", False) else 1.0
+    sy = -1.0 if getattr(view, "flip_y", False) else 1.0
+    pu = view.pixel_um
+    x = sx * lc * pu / max(view.cos_beta, 0.1)
+    y = sy * lr * pu / max(view.cos_alpha, 0.1)
+    rot = float(getattr(view, "rotation_rad", 0.0))
+    if rot:
+        c, s = math.cos(rot), math.sin(rot)
+        x, y = c * x - s * y, s * x + c * y
+    return (float(x), float(y))
+
+
+def _pad_len(n: int, margin: float) -> int:
+    """``n`` plus ``margin`` of it on both sides, rounded up (keeping the parity of ``n``,
+    so the padded raster's pixels sit on the view's lattice) to a fast FFT length."""
+    from scipy.fft import next_fast_len
+
+    p = n + 2 * int(round(margin * n))
+    while next_fast_len(p) != p:
+        p += 2
+    return p
+
+
+def _sub_view(view, r0: int, r1: int, c0: int, c1: int):
+    """Rows r0:r1, columns c0:c1 of ``view`` as a view of their own."""
+    x, y = view.pixel_to_world(np.array([(r0 + r1 - 1) / 2.0]), np.array([(c0 + c1 - 1) / 2.0]))
+    return dataclasses.replace(view, center_um=(float(x[0]), float(y[0])), shape=(r1 - r0, c1 - c0))
+
+
+#: A crop whose offset is this close to a whole number of raster pixels is not resampled.
+SUBPIXEL_TOLERANCE_PX = 0.02
+#: Extra raster pixels around a sub-pixel crop, so the Fourier shift's wrap-around stays out
+#: of the view.
+SUBPIXEL_HALO_PX = 8
+
+
+def _crop(raster, center_um, view):
+    """The view's pixels out of a padded raster whose middle shows ``center_um``, or None
+    when the view is not inside it. An offset of a fraction of a pixel is a band-limited
+    (Fourier) shift of the crop, so a stage move inside the margin moves the image as far
+    as a fresh render would, not to the nearest raster pixel."""
+    ny, nx = view.shape
+    py, px = raster.shape
+    lc, lr = _lattice(view, *view.center_um)
+    oc, orow = _lattice(view, *center_um)
+    fc = (px - nx) / 2 + (lc - oc)
+    fr = (py - ny) / 2 + (lr - orow)
+    c0, r0 = int(round(fc)), int(round(fr))
+    if r0 < 0 or c0 < 0 or r0 + ny > py or c0 + nx > px:
+        return None
+    dc, dr = fc - c0, fr - r0
+    if abs(dc) < SUBPIXEL_TOLERANCE_PX and abs(dr) < SUBPIXEL_TOLERANCE_PX:
+        return raster[r0:r0 + ny, c0:c0 + nx]
+    from scipy import fft as sfft
+
+    h = SUBPIXEL_HALO_PX
+    a0, a1 = max(0, r0 - h), min(py, r0 + ny + h)
+    b0, b1 = max(0, c0 - h), min(px, c0 + nx + h)
+    win = raster[a0:a1, b0:b1]
+    ramp_r = np.exp(2j * np.pi * sfft.fftfreq(win.shape[0]) * dr).astype(np.complex64)
+    ramp_c = np.exp(2j * np.pi * sfft.rfftfreq(win.shape[1]) * dc).astype(np.complex64)
+    spec = sfft.rfft2(win, workers=-1)
+    spec *= ramp_r[:, None]
+    spec *= ramp_c[None, :]
+    out = sfft.irfft2(spec, s=win.shape, workers=-1)
+    out = out[r0 - a0:r0 - a0 + ny, c0 - b0:c0 - b0 + nx]
+    return np.maximum(out, 0.0, out=np.ascontiguousarray(out, np.float32))
+
+
 class Renderer:
     def __init__(self, specimen, config: Optional[RenderConfig] = None):
         self.specimen = specimen
@@ -77,6 +161,7 @@ class Renderer:
         self._coherent = CoherentStem(self.cache, self.config, self.seed)
         self._grains_fallback: Optional[GrainTable] = None
         self.rasters_built = 0
+        self.rasters_reused = 0  # of rasters_built: assembled from a cached field map + new strips
         self.frames_from_cache = 0
 
     # ----------------------------------------------------------- specimen
@@ -131,11 +216,16 @@ class Renderer:
     def _render_tem_panned(self, optics, time_s: float) -> np.ndarray:
         """TEM imaging through a padded raster, cropped to the view.
 
-        The raster is rendered ``pan_margin`` of the field larger on every side and kept,
-        keyed by everything about the view EXCEPT where it is; a later view at the same
-        magnification, focus and so on whose centre is within the margin is a crop of it,
-        to the nearest raster pixel. The illumination disc and the upsampling are applied
-        after the crop — they are fixed on the detector, not the specimen.
+        The raster is rendered ``pan_margin`` of the field larger on every side, centred on
+        the pixel-lattice point nearest the view's centre, and kept (the last
+        ``pan_cache_size``), keyed by everything about the view EXCEPT where it is; a later
+        view at the same magnification, focus and so on whose centre is within the margin
+        is a crop of it, to the nearest raster pixel. Every raster sits on the same
+        world-fixed pixel lattice, so the crop is the one a fresh render of that view gives
+        (up to the transfer's periodic edges), and a new raster takes the part of the
+        specimen it shares with a recent one from that one's field map (see
+        `_panned_field_map`). The illumination disc and the upsampling are applied after
+        the crop — they are fixed on the detector, not the specimen.
         """
         from .tem import finish_tem, render_tem_raster
 
@@ -149,7 +239,6 @@ class Renderer:
         view = optics.view
         base = dataclasses.replace(optics, view=dataclasses.replace(view, center_um=(0.0, 0.0)), beam_offset_px=(0.0, 0.0))
         key = (base, self.config.tem_model, gen, tkey)
-        ny, nx = view.shape
         img = self._crop_pan(key, view)
         if img is None and self.config.interactive:
             import time as _time
@@ -164,16 +253,11 @@ class Renderer:
             if now - self._changed_at < self.config.settle_s:
                 return self._render_preview(optics, time_s, tkey, gen)
         if img is None:
-            m = self.config.pan_margin
-            py, px = ny + 2 * int(round(m * ny)), nx + 2 * int(round(m * nx))
-            pview = dataclasses.replace(view, shape=(py, px))
-            d = max(1, optics.raster_downsample)
-            poptics = dataclasses.replace(optics, view=pview, output_shape=(py * d, px * d))
-            fm, token = self.field_map(poptics, TEM_LAYERS, time_s)
+            poptics, shift = self._padded_optics(optics)
+            fm, token = self._panned_field_map(poptics, time_s)
             raster = render_tem_raster(fm, poptics, self.grains, self.crystallinity, self.config,
-                                       self.seed, self._tem_cache, token)
-            self.rasters_built += 0  # counted by field_map
-            self._pan = (key, view.center_um, raster)
+                                       self.seed, self._tem_cache, token, shift)
+            self._keep_pan("_pans", key, view.center_um, raster)
             img = self._crop_pan(key, view)
         else:
             self.frames_from_cache += 1
@@ -190,7 +274,8 @@ class Renderer:
         view = optics.view
         ny, nx = view.shape
         f = 1
-        while (ny // (2 * f)) * (nx // (2 * f)) >= self.config.preview_side ** 2                 and ny % (2 * f) == 0 and nx % (2 * f) == 0:
+        while (ny // (2 * f)) * (nx // (2 * f)) >= self.config.preview_side ** 2 \
+                and ny % (2 * f) == 0 and nx % (2 * f) == 0:
             f *= 2
         if f == 1:
             self._changed_at = -1e9  # already small: the full render is the preview
@@ -203,55 +288,116 @@ class Renderer:
         pbase = dataclasses.replace(poptics, view=dataclasses.replace(pview, center_um=(0.0, 0.0)),
                                     beam_offset_px=(0.0, 0.0))
         pkey = ("preview", pbase, self.config.tem_model, gen, tkey)
-        img = self._crop_pan(pkey, pview, "_pan_preview")
+        img = self._crop_pan(pkey, pview, "_pan_previews")
         if img is None:
-            m = self.config.pan_margin
-            qy, qx = pview.shape
-            py, px = qy + 2 * int(round(m * qy)), qx + 2 * int(round(m * qx))
-            padded = dataclasses.replace(pview, shape=(py, px))
-            d = poptics.raster_downsample
-            pad_optics = dataclasses.replace(poptics, view=padded, output_shape=(py * d, px * d))
-            fm, token = self.field_map(pad_optics, TEM_LAYERS, time_s)
+            pad_optics, shift = self._padded_optics(poptics)
+            fm, token = self._panned_field_map(pad_optics, time_s)
             raster = render_tem_raster(fm, pad_optics, self.grains, self.crystallinity,
-                                       self.config, self.seed, self._tem_cache, token)
-            self._pan_preview = (pkey, pview.center_um, raster)
-            img = self._crop_pan(pkey, pview, "_pan_preview")
+                                       self.config, self.seed, self._tem_cache, token, shift)
+            self._keep_pan("_pan_previews", pkey, pview.center_um, raster)
+            img = self._crop_pan(pkey, pview, "_pan_previews")
         self.previews_rendered = getattr(self, "previews_rendered", 0) + 1
         out = finish_tem(img, poptics, self.config)
         out.flags.writeable = False
         return out
 
-    def _crop_pan(self, key, view, slot: str = "_pan"):
-        pan = getattr(self, slot, None)
-        if pan is None or pan[0] != key:
-            return None
-        _, (cx0, cy0), raster = pan
+    def _padded_optics(self, optics):
+        """(``optics`` over the padded raster, sub-pixel shift): ``pan_margin`` more on every
+        side (rounded up to a fast FFT size of the same parity), centred on the lattice
+        point nearest the view's centre, and the (rows, cols) translation that puts the
+        view's own centre back in the middle of it."""
+        view = optics.view
+        py, px = (_pad_len(n, self.config.pan_margin) for n in view.shape)
+        lc, lr = _lattice(view, *view.center_um)
+        kc, kr = round(lc), round(lr)
+        pview = dataclasses.replace(view, shape=(py, px), center_um=_from_lattice(view, kc, kr))
+        d = max(1, optics.raster_downsample)
+        return (dataclasses.replace(optics, view=pview, output_shape=(py * d, px * d)),
+                (-(lr - kr), -(lc - kc)))
+
+    def _panned_field_map(self, optics, time_s: float):
+        """`field_map` of a padded (lattice-centred) view that takes the part it shares with
+        a cached field map of the same sampling from that one and rasterises only the rest:
+        a stage move rasterises the strips of specimen it brings into view. Only for a
+        specimen whose raster is pixel-local (``raster_is_local``), for which the pieces
+        are the pixels a whole raster has."""
+        if not getattr(self.specimen, "raster_is_local", False) or not self.config.reuse_rasters:
+            return self.field_map(optics, TEM_LAYERS, time_s)
+        tq = self.config.time_quantum_s
+        tkey = round(time_s / tq) if (self._time_dependent() and tq > 0) else 0
+        gen = getattr(self.specimen, "generation", 0)
+        view = optics.view
+        if (view, frozenset(TEM_LAYERS), gen, tkey) in self._fieldmaps:
+            return self.field_map(optics, TEM_LAYERS, time_s)
         ny, nx = view.shape
-        py, px = raster.shape
-        pu = view.pixel_um
-        # ViewWindow pixel (row, col) centres sit at centre + ((i + 0.5) - n / 2) * pixel,
-        # divided by the tilt foreshortening along each axis.
-        sx = -1.0 if getattr(view, "flip_x", False) else 1.0
-        sy = -1.0 if getattr(view, "flip_y", False) else 1.0
-        # the centre's move, in the view's own (rotated) frame
-        wx, wy = view.center_um[0] - cx0, view.center_um[1] - cy0
-        rot = float(getattr(view, "rotation_rad", 0.0))
-        if rot:
-            c, s = math.cos(rot), math.sin(rot)
-            wx, wy = c * wx + s * wy, -s * wx + c * wy
-        dc = sx * wx * max(view.cos_beta, 0.1) / pu
-        dr = sy * wy * max(view.cos_alpha, 0.1) / pu
-        c0 = int(round((px - nx) / 2 + dc))
-        r0 = int(round((py - ny) / 2 + dr))
-        if r0 < 0 or c0 < 0 or r0 + ny > py or c0 + nx > px:
-            return None
-        return raster[r0:r0 + ny, c0:c0 + nx]
+        base = dataclasses.replace(view, center_um=(0.0, 0.0))
+        lc, lr = _lattice(view, *view.center_um)
+        best, best_area = None, 0
+        for (v, layers, g, t), (fm, _, fgen) in self._fieldmaps.items():
+            if layers or g != gen or t != tkey or getattr(fm, "generation", 0) != fgen:
+                continue
+            if dataclasses.replace(v, center_um=(0.0, 0.0)) != base:
+                continue
+            oc, orow = _lattice(view, *v.center_um)
+            dc, dr = lc - oc, lr - orow
+            if abs(dc - round(dc)) > 1e-3 or abs(dr - round(dr)) > 1e-3:
+                continue  # not on the same lattice
+            dc, dr = int(round(dc)), int(round(dr))
+            area = max(0, nx - abs(dc)) * max(0, ny - abs(dr))
+            if area > best_area:
+                best, best_area = (fm, dr, dc), area
+        if best is None or best_area < self.config.reuse_min_overlap * ny * nx:
+            return self.field_map(optics, TEM_LAYERS, time_s)
+        old, dr, dc = best
+        r_lo, r_hi = max(0, -dr), min(ny, ny - dr)
+        c_lo, c_hi = max(0, -dc), min(nx, nx - dc)
+        parts = [((r_lo, r_hi, c_lo, c_hi), old, (r_lo + dr, c_lo + dc))]
+        for r0, r1, c0, c1 in ((0, r_lo, 0, nx), (r_hi, ny, 0, nx), (r_lo, r_hi, 0, c_lo), (r_lo, r_hi, c_hi, nx)):
+            if r1 > r0 and c1 > c0:
+                sub = self.specimen.rasterize(_sub_view(view, r0, r1, c0, c1), frozenset(TEM_LAYERS))
+                parts.append(((r0, r1, c0, c1), sub, (0, 0)))
+        last = parts[-1][1]
+        fm = FieldMap(view=view, material_id=np.zeros((ny, nx), np.uint8),
+                      thickness_nm=np.zeros((ny, nx), np.float32), grain_id=np.full((ny, nx), -1, np.int32),
+                      generation=getattr(last, "generation", 0), time_s=getattr(last, "time_s", 0.0))
+        if any(p.under_thickness_nm is not None for _, p, _ in parts):
+            fm.under_material = np.zeros((ny, nx), np.uint8)
+            fm.under_thickness_nm = np.zeros((ny, nx), np.float32)
+        for (r0, r1, c0, c1), src, (sr, sc) in parts:
+            h, w = r1 - r0, c1 - c0
+            for name in ("material_id", "thickness_nm", "grain_id", "under_material", "under_thickness_nm"):
+                a = getattr(src, name)
+                if a is not None:
+                    getattr(fm, name)[r0:r1, c0:c1] = a[sr:sr + h, sc:sc + w]
+        self.rasters_built += 1
+        self.rasters_reused += 1
+        token = (next(self._tokens), fm.generation)
+        self._fieldmaps[(view, frozenset(TEM_LAYERS), gen, tkey)] = (fm, token, fm.generation)
+        while len(self._fieldmaps) > max(1, self.config.fieldmap_cache_size):
+            self._fieldmaps.popitem(last=False)
+        return fm, token
+
+    def _keep_pan(self, slot: str, key, center_um, raster) -> None:
+        pans = getattr(self, slot, None) or []
+        pans.insert(0, (key, center_um, raster))
+        setattr(self, slot, pans[:max(1, self.config.pan_cache_size)])
+
+    def _crop_pan(self, key, view, slot: str = "_pans"):
+        pans = getattr(self, slot, None) or []
+        for i, (k, c0, raster) in enumerate(pans):
+            if k != key:
+                continue
+            img = _crop(raster, c0, view)
+            if img is not None:
+                pans.insert(0, pans.pop(i))
+                return img
+        return None
 
     def invalidate(self) -> None:
         """Drop every cached raster, frame and pattern (e.g. after the specimen changed)."""
-        self._pan = None
+        self._pans = []
         self._pan_out = None
-        self._pan_preview = None
+        self._pan_previews = []
         self._last_req = None
         self._fieldmaps.clear()
         self._tem_cache = TransferCache()

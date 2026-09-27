@@ -91,6 +91,11 @@ class Specimen:
     >>> fm = s.rasterize(ViewWindow(center_um=(0.0, 0.0), pixel_um=0.002, shape=(256, 256)))
     """
 
+    #: Every raster pixel depends only on where it is and the pixel size, not on the rest of
+    #: the view, so a raster can be assembled from rasters of its parts (the renderer does
+    #: that on a stage move; tests/test_render_caches.py checks it).
+    raster_is_local = True
+
     def __init__(self, config: Optional[SpecimenConfig] = None):
         self.config = (config or SpecimenConfig()).copy()
         self.options = self.config.resolved_options()

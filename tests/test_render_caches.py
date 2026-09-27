@@ -79,3 +79,119 @@ def test_a_stage_tilt_is_a_new_excitation():
     assert not np.array_equal(a.loss, b.loss)
     np.testing.assert_allclose(b.loss, _dense_loss(fm, o2, r.grains, r.crystallinity, r.config),
                                rtol=1e-6, atol=1e-9)
+
+
+# ------------------------------------------------------------------ raster reuse
+def _twin(name="Dense Au on holey C", **cfg):
+    from de_twin.render.config import RenderConfig
+
+    return DigitalTwin(name, camera="DESim", clock=ManualClock(), seed=3, render_config=RenderConfig(**cfg))
+
+
+def _move(tw, dx_um, dy_um=0.0):
+    s = tw.column.state().stage
+    tw.column.move_stage(x=s.x_um + dx_um, y=s.y_um + dy_um)
+
+
+@pytest.mark.parametrize("name", ["Dense Au on holey C", "Ted Pella 607 - 2160 l/mm grating replica (waffle)",
+                                  "Negative stain on carbon"])
+@pytest.mark.parametrize("dx,dy", [(0.3, 0.0), (0.0, -0.4), (-0.35, 0.3)])
+def test_a_reused_field_map_is_the_fresh_raster(name, dx, dy):
+    tw = _twin(name)
+    req = tw.request()
+    tw.flux(req)
+    n = tw.optics(req).view.shape[0]
+    px = tw.optics(req).view.pixel_um
+    _move(tw, dx * n * px, dy * n * px)
+    before = tw.renderer.rasters_reused
+    tw.flux(req)
+    assert tw.renderer.rasters_reused == before + 1, "the move reused the last field map"
+    fm = next(reversed(tw.renderer._fieldmaps.values()))[0]
+    _same_raster(fm, tw.specimen.rasterize(fm.view))
+
+
+def _same_raster(fm, ref):
+    """The same pixels, up to the rounding of world coordinates: a pixel centre a few ulp
+    from an edge may land on the other side of it (a handful of pixels in a million)."""
+    n = fm.material_id.size
+    assert np.count_nonzero(fm.material_id != ref.material_id) <= 2e-5 * n
+    assert np.count_nonzero(fm.grain_id != ref.grain_id) <= 2e-5 * n
+    assert np.count_nonzero(~np.isclose(fm.thickness_nm, ref.thickness_nm, rtol=1e-5, atol=1e-2)) <= 2e-5 * n
+    assert (fm.under_thickness_nm is None) == (ref.under_thickness_nm is None) or not ref.under_thickness_nm.any()
+    if ref.under_thickness_nm is not None and fm.under_thickness_nm is not None:
+        assert np.count_nonzero(~np.isclose(fm.under_thickness_nm, ref.under_thickness_nm, rtol=1e-5,
+                                            atol=1e-2)) <= 2e-5 * n
+
+
+def test_a_rotated_flipped_view_reuses_on_its_own_lattice():
+    import dataclasses
+
+    from de_twin.render import Renderer
+
+    tw = _twin()
+    o = tw.optics(tw.request())
+    v = dataclasses.replace(o.view, rotation_rad=0.7, flip_x=True, cos_alpha=0.9)
+    r = Renderer(tw.specimen, tw.renderer.config)
+    a = r._padded_optics(dataclasses.replace(o, view=v))[0]
+    r._panned_field_map(a, 0.0)
+    moved = dataclasses.replace(v, center_um=(v.center_um[0] + 0.25 * v.shape[1] * v.pixel_um, v.center_um[1] - 0.1))
+    b = r._padded_optics(dataclasses.replace(o, view=moved))[0]
+    fm, _ = r._panned_field_map(b, 0.0)
+    assert r.rasters_reused == 1
+    _same_raster(fm, tw.specimen.rasterize(fm.view))
+
+
+def test_a_moved_view_is_the_image_without_reuse():
+    a, b = _twin(), _twin(reuse_rasters=False)
+    req = a.request()
+    for tw in (a, b):
+        tw.flux(req)
+        n = tw.optics(req).view.shape[0]
+        _move(tw, 0.3 * n * tw.optics(req).view.pixel_um, -0.2 * n * tw.optics(req).view.pixel_um)
+    img_a, img_b = a.flux(req), b.flux(req)
+    assert a.renderer.rasters_reused == 1 and b.renderer.rasters_reused == 0
+    close = np.isclose(img_a, img_b, rtol=1e-3, atol=1e-3 * float(img_b.mean()))
+    assert close.mean() > 0.999
+    assert img_a.mean() == pytest.approx(img_b.mean(), rel=1e-4)
+
+
+def test_a_view_is_the_same_image_however_it_was_reached():
+    """World-locked and deterministic: a view reached by a drag (crops of lattice-centred
+    rasters) is the fresh render of that view, away from the transfer's periodic edges."""
+    a, b = _twin(), _twin()
+    req = a.request()
+    a.flux(req)
+    n = a.optics(req).view.shape[0]
+    px = a.optics(req).view.pixel_um
+    for step in (0.07, 0.3, 0.07):
+        _move(a, step * n * px, 0.5 * step * n * px)
+        a.flux(req)
+    _move(b, 0.44 * n * px, 0.22 * n * px)
+    img_a, img_b = a.flux(req), b.flux(req)
+    inner = (slice(60, -60), slice(60, -60))
+    assert np.corrcoef(img_a[inner].ravel(), img_b[inner].ravel())[0, 1] > 0.995
+    assert img_a[inner].mean() == pytest.approx(img_b[inner].mean(), rel=0.01)
+
+
+def test_a_magnification_step_renders_the_new_view():
+    tw, ref = _twin(), _twin()
+    req = tw.request()
+    tw.flux(req)
+    built = tw.renderer.rasters_built
+    for t in (tw, ref):
+        t.column.set("Magnification", 25000.0)
+    img = tw.flux(req)
+    assert tw.renderer.rasters_built == built + 1 and tw.renderer.rasters_reused == 0
+    np.testing.assert_array_equal(img, ref.flux(req))
+
+
+def test_a_jump_back_is_a_crop():
+    tw = _twin()
+    req = tw.request()
+    home = tw.flux(req)
+    _move(tw, 30.0, 20.0)
+    tw.flux(req)
+    _move(tw, -30.0, -20.0)
+    built = tw.renderer.rasters_built
+    np.testing.assert_array_equal(tw.flux(req), home)
+    assert tw.renderer.rasters_built == built

@@ -644,8 +644,23 @@ def exit_wave(fm, optics, grains, crystallinity, cfg, seed: int) -> np.ndarray:
     return transmission_function(fm, optics, grains, crystallinity, cfg, seed)
 
 
+def _shift_ramps(shape, shift_px) -> tuple[np.ndarray, np.ndarray] | None:
+    """Row and column phase ramps (complex64, FFT layout) that move an image's content by
+    ``shift_px = (rows, cols)`` pixels (a sub-pixel, band-limited translation), or None."""
+    dy, dx = (float(v) for v in shift_px)
+    if dy == 0.0 and dx == 0.0:
+        return None
+    ny, nx = shape
+    ry = np.exp(-2j * np.pi * sfft.fftfreq(ny) * dy).astype(np.complex64)
+    rx = np.exp(-2j * np.pi * sfft.fftfreq(nx) * dx).astype(np.complex64)
+    return ry, rx
+
+
 def render_physical(fm, optics, grains, crystallinity, cfg, seed: int, cache: TransferCache,
-                    fm_token) -> np.ndarray:
+                    fm_token, shift_px=(0.0, 0.0)) -> np.ndarray:
+    """|psi|^2 on the raster; ``shift_px`` (rows, cols) translates the image content by a
+    fraction of a pixel (a phase ramp on the spectrum), so a raster on a world-fixed pixel
+    lattice can show a view centred between its pixels."""
     view = optics.view
     shape = view.shape
     p_nm = view.pixel_um * 1000.0
@@ -669,11 +684,21 @@ def render_physical(fm, optics, grains, crystallinity, cfg, seed: int, cache: Tr
     else:
         H = transfer_function(shape, p_nm, optics)
         cache._put(cache.transfer, hkey, H)
-    if H is None:
+    ramps = _shift_ramps(shape, shift_px)
+    if H is None and ramps is None:
         psi = sfft.ifft2(spec, workers=-1)
     else:
         prod = np.empty_like(spec)
-        parallel_rows(lambda r0, r1: np.multiply(spec[r0:r1], H[r0:r1], out=prod[r0:r1]), shape[0])
+
+        def mult(r0, r1):
+            if H is None:
+                prod[r0:r1] = spec[r0:r1]
+            else:
+                np.multiply(spec[r0:r1], H[r0:r1], out=prod[r0:r1])
+            if ramps is not None:
+                prod[r0:r1] *= ramps[0][r0:r1, None]
+                prod[r0:r1] *= ramps[1][None, :]
+        parallel_rows(mult, shape[0])
         psi = sfft.ifft2(prod, workers=-1, overwrite_x=True)
     out = np.empty(shape, np.float32)
 
@@ -694,12 +719,18 @@ def render_tem(fm, optics, grains, crystallinity, cfg, seed: int, cache: Transfe
 
 
 def render_tem_raster(fm, optics, grains, crystallinity, cfg, seed: int, cache: TransferCache,
-                      fm_token) -> np.ndarray:
+                      fm_token, shift_px=(0.0, 0.0)) -> np.ndarray:
     """The specimen's image in RASTER space, before the illumination disc and upsampling —
-    what moves rigidly with the stage (see `Renderer` panning)."""
+    what moves rigidly with the stage (see `Renderer` panning). ``shift_px`` (rows, cols)
+    translates it by a fraction of a pixel."""
     if cfg.tem_model == "legacy":
-        return render_legacy(fm, optics, grains, crystallinity, cfg)
-    return render_physical(fm, optics, grains, crystallinity, cfg, seed, cache, fm_token)
+        img = render_legacy(fm, optics, grains, crystallinity, cfg)
+        ramps = _shift_ramps(img.shape, shift_px)
+        if ramps is None:
+            return img
+        spec = sfft.fft2(img, workers=-1) * ramps[0][:, None] * ramps[1][None, :]
+        return np.clip(sfft.ifft2(spec, workers=-1).real, 0.0, None).astype(np.float32)
+    return render_physical(fm, optics, grains, crystallinity, cfg, seed, cache, fm_token, shift_px)
 
 
 def finish_tem(img, optics, cfg) -> np.ndarray:
