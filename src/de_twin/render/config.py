@@ -24,7 +24,7 @@ class RenderConfig:
     #: rigidly with the specimen, so a joystick nudge costs a crop, not a render. 0 off.
     pan_margin: float = 0.15
     #: Interactive use (dragging the stage, zooming): while the view keeps changing, a
-    #: view the cache cannot crop is rendered at up to `preview_side`² and upsampled
+    #: view the cache cannot crop is rendered at up to ``preview_side`` squared and upsampled
     #: (~35-70 ms rather than ~0.3-0.9 s); the first time the same view is asked for
     #: again — the next frame after you stop — it is rendered in full. Off by default,
     #: so a library caller always gets the full render.
