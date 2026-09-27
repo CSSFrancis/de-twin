@@ -26,13 +26,25 @@ class Samples:
     thickness_bin: np.ndarray  # int64
     crystallinity: np.ndarray  # float64 per pixel (1 where no grain)
     diffuse_w: np.ndarray  # float32 fraction redistributed into the diffuse background
+    under_mat: np.ndarray = None  # uint8 material of the amorphous under layer (0: none)
+    under_w: np.ndarray = None  # float32 its diffuse fraction
 
 
 def describe(fm, optics, grains, crystallinity, *, fallback_grains: bool = True, diffuse: bool = True) -> Samples:
     mat = fm.material_id
     t = fm.thickness_nm.astype(np.float32) * np.float32(optics.thickness_tilt_factor)
-    lam_px = absorption_lengths_nm(optics.ht_kv)[mat]
+    lam = absorption_lengths_nm(optics.ht_kv)
+    lam_px = lam[mat]
     T = np.exp(-t / lam_px).astype(np.float32)
+    umat = uw = None
+    if fm.under_thickness_nm is not None:
+        # the under layer scatters first: its diffuse share, and what it lets through
+        umat = fm.under_material
+        tu = fm.under_thickness_nm.astype(np.float32) * np.float32(optics.thickness_tilt_factor)
+        Tu = np.exp(-tu / lam[umat]).astype(np.float32)
+        uw = ((1.0 - Tu) * np.exp(-tu / (DIFFUSE_CUTOFF_LENGTHS * lam[umat]))).astype(np.float32) if diffuse \
+            else np.zeros_like(tu)
+        uw = np.where(umat > 0, uw, np.float32(0.0))
 
     gid = fm.grain_id.astype(np.int64)
     n_grains = len(grains) if grains is not None else 0
@@ -59,5 +71,8 @@ def describe(fm, optics, grains, crystallinity, *, fallback_grains: bool = True,
             cryst[ungrained] = float(np.asarray(crystallinity(np.array([-1])), float)[0])
     dw = ((1.0 - T) * np.exp(-t / (DIFFUSE_CUTOFF_LENGTHS * lam_px))).astype(np.float32) if diffuse \
         else np.zeros_like(t)
+    if umat is not None:  # the primary sees only what the under layer let through
+        T = T * Tu
+        dw = dw * Tu
     return Samples(mat, t, np.maximum(T, MIN_TRANSMISSION).astype(np.float32), own_gid, diff_gid,
-                   thickness_bin_for(t), cryst, dw)
+                   thickness_bin_for(t), cryst, dw, umat, uw)

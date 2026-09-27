@@ -29,6 +29,7 @@ class MaterialId(IntEnum):
     SILICON = 8
     PLATINUM = 9
     PROTEIN = 10
+    MOLYBDENUM_TRIOXIDE = 11
 
 
 N_MATERIALS = len(MaterialId)  # built-in materials (see n_materials() for registered ones)
@@ -108,6 +109,13 @@ MATERIALS: list[Material] = [
     _metal(M.SILICON, "Silicon", "Si", 227, 0.5431, 2.33, 145.0, 14.0, 12.1, 50.0, 0.45),
     _metal(M.PLATINUM, "Platinum", "Pt", 225, 0.3924, 21.45, 26.0, 78.0, 30.0, 66.0, 0.40),
     Material(M.PROTEIN, "Protein", 1.35, 400.0, 6.5, 7.5, 70.0, halos=((2.5, 0.6), (4.8, 0.2))),
+    # MoO3's mean free path is scaled from aluminium's by the Z^(4/3)-weighted atom density.
+    # Pnma setting (a is the layer-stacking axis; b the long axis of the laths)
+    Material(M.MOLYBDENUM_TRIOXIDE, "Molybdenum trioxide", 4.69, 63.0, 30.0, 17.0, 78.5,
+             Crystal(62, (1.3856, 0.3697, 0.3963, 90.0, 90.0, 90.0),
+                     (("Mo", 0.1016, 0.25, 0.0867), ("O", 0.0866, 0.25, 0.5212),
+                      ("O", 0.2214, 0.25, -0.0373), ("O", 0.4351, 0.25, 0.4994))), 0.5,
+             halos=((3.0, 0.6), (5.0, 0.25))),
 ]
 del M
 

@@ -124,6 +124,11 @@ class FieldMap:
     grain_id: np.ndarray  # (ny, nx) int32, -1 = no grain / amorphous
     descan: Optional[np.ndarray] = None  # (2, ny, nx) float32
     strain: Optional[np.ndarray] = None  # (3, ny, nx) float32
+    # An amorphous layer in the same column as the primary material (a support film under
+    # particles, stain around protein, ...): its absorption, phase and diffuse scattering add
+    # to the primary's. None when the scene has none.
+    under_material: Optional[np.ndarray] = None  # (ny, nx) uint8
+    under_thickness_nm: Optional[np.ndarray] = None  # (ny, nx) float32
     generation: int = 0  # bumps whenever content changes (cache key)
     time_s: float = 0.0  # scene time the raster represents
 

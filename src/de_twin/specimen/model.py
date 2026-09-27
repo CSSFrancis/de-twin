@@ -71,6 +71,11 @@ def grain_textures(scene: Scene) -> tuple[tuple, tuple]:
     overrides = {}
     for area in scene.holder.areas:
         prep = scene.preparation_for(area)
+        hook = getattr(prep, "grain_textures", None)
+        if hook is not None:  # a preparation that fixes its own crystals' orientations
+            t, o = hook()
+            textures.extend(t)
+            overrides.update(dict(o))
         if isinstance(prep, BulkSamplePreparation):
             gid = prep._matrix_grain(area, scene.area_seed(area.index))
             if gid >= 0:

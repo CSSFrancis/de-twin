@@ -18,7 +18,18 @@ class RenderConfig:
     texture_bandlimit_nm: float = 0.07  # Gaussian sigma: atomic form-factor band limit
     amplitude_contrast: float = 0.07  # absorptive part of the amorphous texture (w)
     lattice_fringes: bool = True
-    lattice_phase_rad: float = 0.15  # total phase amplitude of resolved lattice fringes
+    #: "kinematic": each resolved beam that reaches the image is a phase grating of its own
+    #: kinematic strength, a = sqrt(2 f) for a Friedel pair carrying f of the electrons, grown
+    #: with the thickness (heavy crystals give strong fringes, light ones weak), up to its
+    #: MAX_FRINGE_BEAMS strongest pairs. "fixed": every crystal's fringes share a total phase
+    #: `lattice_phase_rad` (the older model).
+    lattice_fringe_model: str = "kinematic"
+    #: The kinematic amplitude times this: what dynamical scattering (saturation in thick,
+    #: heavy crystals), vibration, drift and the recording take from the fringes. Calibrated
+    #: on Ted Pella's lattice images (646 Au [001], 675 Si <011>: fringe contrast 27 % and
+    #: 34 %, twice the kinematic value).
+    lattice_fringe_efficiency: float = 0.5
+    lattice_phase_rad: float = 0.15  # total phase amplitude of resolved lattice fringes ("fixed")
     #: TEM imaging renders a view this fraction of the field larger on each side and
     #: serves a stage move that stays inside the margin by cropping it: the image moves
     #: rigidly with the specimen, so a joystick nudge costs a crop, not a render. 0 off.

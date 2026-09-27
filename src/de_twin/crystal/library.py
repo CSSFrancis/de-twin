@@ -103,7 +103,10 @@ class CrystalLibrary:
         from diffsims.crystallography import ReciprocalLatticeVector
 
         rlv = ReciprocalLatticeVector.from_min_dspacing(self.phase, min_dspacing=10.0 / self.max_g_inv_nm)
-        rlv = rlv[rlv.allowed]
+        try:
+            rlv = rlv[rlv.allowed]
+        except NotImplementedError:  # primitive hexagonal (graphite): the structure factor decides
+            pass
         rlv.sanitise_phase()
         rlv.calculate_structure_factor(self.scattering_params)
         g_a = rlv.gspacing  # 1/A

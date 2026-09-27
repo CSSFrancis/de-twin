@@ -33,7 +33,8 @@ from dataclasses import dataclass, field, fields
 from typing import Any, Optional
 
 HOLDERS = ("mesh_grid", "waffle_grid", "fib_liftout", "insitu_heating_chip")
-PREPARATIONS = ("nanoparticles", "proteins", "thin_film", "bulk", "time_evolving", "cross_grating")
+PREPARATIONS = ("nanoparticles", "proteins", "thin_film", "bulk", "time_evolving", "cross_grating",
+                "calibration_standard")
 FILMS = ("holey", "lacey", "continuous", "none", "vitreous_ice", "auto")
 FIB_POST_SAMPLES = ("auto", "precipitate_matrix", "pn_junction", "strained_inclusion",
                     "polycrystal", "multilayer")
@@ -79,9 +80,16 @@ class SpecimenOptions:
     # -- deposited thin film -----------------------------------------------------------------
     grain_size_nm: float = _opt(150.0, 2.0, 5000.0, "Median grain size (fine lattice) of a deposited film.")
     deposited_film_thickness_nm: float = _opt(40.0, 1.0, 1000.0, "Nominal deposited-film thickness.")
+    standard: str = _opt("607", doc="Calibration standard: the Ted Pella product number "
+                         "(see specimen.standards.PRODUCTS).")
     grating_lines_per_mm: float = _opt(2160.0, 10.0, 10000.0, "Cross grating: lines per mm (period 1/that).")
     grating_base_nm: float = _opt(20.0, 0.0, 500.0, "Cross grating: carbon film under the ridges, nm.")
     grating_depth_nm: float = _opt(40.0, 0.0, 500.0, "Cross grating: ridge height, nm.")
+    grating_metal: str = _opt("platinum", doc="Cross grating: the shadowing metal (Pt/Pd-like "
+                              "platinum, or gold).", choices=("platinum", "gold", "none"))
+    grating_metal_nm: float = _opt(2.0, 0.0, 20.0, "Cross grating: mean shadowing deposit, nm.")
+    grating_shadow_elevation_deg: float = _opt(30.0, 5.0, 90.0, "Cross grating: shadowing elevation, deg.")
+    grating_shadow_azimuth_deg: float = _opt(45.0, -180.0, 180.0, "Cross grating: shadowing azimuth, deg.")
     pinhole_fraction: float = _opt(0.03, 0.0, 1.0, "Fraction of the film area that is a pinhole.")
     crack_density_per_um: float = _opt(0.02, 0.0, 5.0, "Film cracks per micrometre.")
     thin_film_material: str = _opt("auto", doc="Deposited-film material; 'auto' = gold on a waffle "
@@ -149,6 +157,8 @@ class SpecimenOptions:
             value = str(value).lower().replace(" ", "_")
             if value not in md["choices"]:
                 raise ValueError(f"{name} must be one of {md['choices']}, got {value!r}")
+        elif isinstance(f.default, str):
+            value = str(value)
         elif isinstance(f.default, bool) or f.default is None:
             value = None if value is None else bool(value)
         elif isinstance(f.default, int):
@@ -343,7 +353,17 @@ def _build_patterns() -> dict[str, SpecimenConfig]:
 
 
 #: The 12 VirtualSpecimen presets (ApplyPreset), each paired with the pattern it was designed for.
+def _build_standards() -> dict:
+    from .standards import PRODUCTS, preset_name
+
+    return {preset_name(n): SpecimenConfig(seed=0, holder="mesh_grid", preparation="calibration_standard",
+                                           film="none", options={"standard": n}, name=preset_name(n))
+            for n in PRODUCTS}
+
+
 PRESETS: dict[str, SpecimenConfig] = _build_presets()
+#: Ted Pella's TEM/STEM calibration and test specimens, by product (`specimen.standards`).
+CALIBRATION_STANDARDS: dict[str, SpecimenConfig] = _build_standards()
 #: The 6 "Virtual Specimen - ..." test patterns plus the 4 legacy ``*-Scan`` aliases.
 PATTERNS: dict[str, SpecimenConfig] = _build_patterns()
 LEGACY_ALIASES: tuple[str, ...] = tuple(a[0] for a in _LEGACY_ALIASES)
@@ -355,7 +375,7 @@ def from_name(name: str, seed: Optional[int] = None) -> SpecimenConfig:
     Pattern names may omit the ``"Virtual Specimen - "`` prefix. Returns a fresh copy.
     """
     key = str(name).strip().lower()
-    for table in (PRESETS, PATTERNS):
+    for table in (PRESETS, CALIBRATION_STANDARDS, PATTERNS):
         for k, cfg in table.items():
             kl = k.lower()
             if key == kl or (kl.startswith("virtual specimen - ") and key == kl[len("virtual specimen - "):]):
