@@ -384,7 +384,8 @@ class Renderer:
         r_lo, r_hi = max(0, -dr), min(ny, ny - dr)
         c_lo, c_hi = max(0, -dc), min(nx, nx - dc)
         parts = [((r_lo, r_hi, c_lo, c_hi), old, (r_lo + dr, c_lo + dc))]
-        for r0, r1, c0, c1 in ((0, r_lo, 0, nx), (r_hi, ny, 0, nx), (r_lo, r_hi, 0, c_lo), (r_lo, r_hi, c_hi, nx)):
+        rects = ((0, r_lo, 0, nx), (r_hi, ny, 0, nx), (r_lo, r_hi, 0, c_lo), (r_lo, r_hi, c_hi, nx))
+        for r0, r1, c0, c1 in rects:
             if r1 > r0 and c1 > c0:
                 sub = self._rasterize(_sub_view(view, r0, r1, c0, c1), frozenset(TEM_LAYERS), max(ny, nx))
                 parts.append(((r0, r1, c0, c1), sub, (0, 0)))

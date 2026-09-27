@@ -26,6 +26,7 @@ from de_twin.twin import DigitalTwin
 PRESETS = ("Dense Au on holey C", "Ted Pella 607 - 2160 l/mm grating replica (waffle)")
 
 T = defaultdict(float)
+COLUMNS = ("total", "raster", "tem", "finish", "detector", "settled")
 
 
 def _timed(name, fn):
@@ -68,8 +69,10 @@ def _frame(tw, req):
         t0 = time.perf_counter()
         tw.flux(req)
         out["settled"] = time.perf_counter() - t0
-    out["how"] = "reuse" if getattr(tw.renderer, "rasters_reused", 0) > reused else ("crop" if tw.renderer.rasters_built == built
-                                                                     else "full")
+    if getattr(tw.renderer, "rasters_reused", 0) > reused:
+        out["how"] = "reuse"
+    else:
+        out["how"] = "crop" if tw.renderer.rasters_built == built else "full"
     return out
 
 
@@ -126,9 +129,8 @@ def main():
             if prof:
                 prof.enable()
             for name, r in scenarios(tw, req):
-                print(f"{preset[:28]:28s} {cam:6s} {name:26s} " + " ".join(
-                    f"{1000 * r[k]:7.0f}" for k in ("total", "raster", "tem", "finish", "detector", "settled")) + "  " + r["how"],
-                    flush=True)
+                cols = " ".join(f"{1000 * r[k]:7.0f}" for k in COLUMNS)
+                print(f"{preset[:28]:28s} {cam:6s} {name:26s} {cols}  {r['how']}", flush=True)
             if prof:
                 prof.disable()
     if prof:

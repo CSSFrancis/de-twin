@@ -106,7 +106,8 @@ class _BraggMemo:
                 m = effective_matrices(grains.matrices[np.asarray(new_g)], optics.alpha_rad, optics.beta_rad)
 
                 def geo(r0, r1):
-                    own, idx, gx, gy, s = lib.geometry(m[r0:r1], optics.wavelength_nm, optics.convergence_mrad)
+                    own, idx, gx, gy, s = lib.geometry(m[r0:r1], optics.wavelength_nm,
+                                                       optics.convergence_mrad)
                     cuts = np.searchsorted(own, np.arange(r1 - r0 + 1))
                     gxy = np.hypot(gx, gy)
                     for j in range(r1 - r0):
@@ -239,7 +240,8 @@ def bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max: float
                 for i, fi in zip(k[np.argsort(-f)], np.sort(f)[::-1]):
                     if len(waves) == MAX_FRINGE_BEAMS:
                         break
-                    if not any(abs(gx_all[i] + wx) < 1e-6 and abs(gy_all[i] + wy) < 1e-6 for wx, wy, _ in waves):
+                    if not any(abs(gx_all[i] + wx) < 1e-6 and abs(gy_all[i] + wy) < 1e-6
+                               for wx, wy, _ in waves):
                         # the Friedel pair (g, -g) carries 2 f: a phase grating 2 sqrt(f) cos(g r)
                         a = (cfg.lattice_fringe_efficiency * math.sqrt(2.0 * 2.0 * fi) if kin
                              else min(1.0, math.sqrt(fi / FRINGE_BEAM_FRACTION)))

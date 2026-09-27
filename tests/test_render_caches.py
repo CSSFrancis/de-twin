@@ -41,7 +41,10 @@ def _dense_loss(fm, optics, grains, crystallinity, cfg):
     return loss
 
 
-@pytest.mark.parametrize("name", ["Dense Au on holey C", "Ted Pella 607 - 2160 l/mm grating replica (waffle)"])
+GRATING = "Ted Pella 607 - 2160 l/mm grating replica (waffle)"
+
+
+@pytest.mark.parametrize("name", ["Dense Au on holey C", GRATING])
 def test_the_bragg_memo_is_the_dense_excitation_in_any_order(name):
     tw = DigitalTwin(name, camera="DESim", clock=ManualClock(), seed=1)
     req = tw.request()
@@ -55,7 +58,8 @@ def test_the_bragg_memo_is_the_dense_excitation_in_any_order(name):
     first = [tem.bragg_contrast(fm, o, r.grains, r.crystallinity, r.config) for o, fm in views]
     assert tem._BRAGG_MEMOS, "the excitations are kept"
     tem._BRAGG_MEMOS.clear()
-    again = [tem.bragg_contrast(fm, o, r.grains, r.crystallinity, r.config) for o, fm in reversed(views)][::-1]
+    again = [tem.bragg_contrast(fm, o, r.grains, r.crystallinity, r.config)
+             for o, fm in reversed(views)][::-1]
     for (o, fm), a, b in zip(views, first, again):
         np.testing.assert_array_equal(a.loss, b.loss)
         assert a.fringes.keys() == b.fringes.keys()
@@ -93,8 +97,7 @@ def _move(tw, dx_um, dy_um=0.0):
     tw.column.move_stage(x=s.x_um + dx_um, y=s.y_um + dy_um)
 
 
-@pytest.mark.parametrize("name", ["Dense Au on holey C", "Ted Pella 607 - 2160 l/mm grating replica (waffle)",
-                                  "Negative stain on carbon"])
+@pytest.mark.parametrize("name", ["Dense Au on holey C", GRATING, "Negative stain on carbon"])
 @pytest.mark.parametrize("dx,dy", [(0.3, 0.0), (0.0, -0.4), (-0.35, 0.3)])
 def test_a_reused_field_map_is_the_fresh_raster(name, dx, dy):
     tw = _twin(name)
@@ -120,7 +123,8 @@ def _same_raster(fm, ref):
     assert np.count_nonzero(fm.material_id != ref.material_id) <= 2e-5 * n
     assert np.count_nonzero(fm.grain_id != ref.grain_id) <= 1e-3 * n
     assert np.count_nonzero(~np.isclose(fm.thickness_nm, ref.thickness_nm, rtol=1e-5, atol=1e-2)) <= 1e-4 * n
-    assert (fm.under_thickness_nm is None) == (ref.under_thickness_nm is None) or not ref.under_thickness_nm.any()
+    assert ((fm.under_thickness_nm is None) == (ref.under_thickness_nm is None)
+            or not ref.under_thickness_nm.any())
     if ref.under_thickness_nm is not None and fm.under_thickness_nm is not None:
         assert np.count_nonzero(~np.isclose(fm.under_thickness_nm, ref.under_thickness_nm, rtol=1e-5,
                                             atol=1e-2)) <= 2e-5 * n
@@ -138,7 +142,8 @@ def test_a_turned_flipped_tilted_view_reuses_on_its_own_lattice(rotation):
     r = Renderer(tw.specimen, tw.renderer.config)
     a = r._padded_optics(dataclasses.replace(o, view=v))[0]
     r._panned_field_map(a, 0.0)
-    moved = dataclasses.replace(v, center_um=(v.center_um[0] + 0.25 * v.shape[1] * v.pixel_um, v.center_um[1] - 0.1))
+    step = 0.25 * v.shape[1] * v.pixel_um
+    moved = dataclasses.replace(v, center_um=(v.center_um[0] + step, v.center_um[1] - 0.1))
     b = r._padded_optics(dataclasses.replace(o, view=moved))[0]
     fm, _ = r._panned_field_map(b, 0.0)
     assert r.rasters_reused == 1
@@ -273,8 +278,7 @@ def test_a_crop_is_where_a_fresh_render_puts_the_view(dx_px, dy_px):
 
 
 # ------------------------------------------------------------------ strips
-@pytest.mark.parametrize("name", ["Dense Au on holey C", "Ted Pella 607 - 2160 l/mm grating replica (waffle)",
-                                  "Negative stain on carbon"])
+@pytest.mark.parametrize("name", ["Dense Au on holey C", GRATING, "Negative stain on carbon"])
 def test_a_raster_in_parallel_strips_is_the_serial_raster(name):
     from de_twin.specimen.model import _numba_threadsafe
 
@@ -315,7 +319,8 @@ def test_a_rotated_view_is_rasterised_whole():
     v = dataclasses.replace(o.view, rotation_rad=0.7)
     r = Renderer(tw.specimen, tw.renderer.config)
     r._panned_field_map(r._padded_optics(dataclasses.replace(o, view=v))[0], 0.0)
-    moved = dataclasses.replace(v, center_um=(v.center_um[0] + 0.25 * v.shape[1] * v.pixel_um, v.center_um[1]))
+    step = 0.25 * v.shape[1] * v.pixel_um
+    moved = dataclasses.replace(v, center_um=(v.center_um[0] + step, v.center_um[1]))
     fm, _ = r._panned_field_map(r._padded_optics(dataclasses.replace(o, view=moved))[0], 0.0)
     assert r.rasters_reused == 0 and "strips" not in tw.specimen.last_stats
     ref = tw.specimen.rasterize(fm.view)
