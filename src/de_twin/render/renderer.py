@@ -153,6 +153,7 @@ class Renderer:
         self.config = config or RenderConfig()
         self.cache = DiffractionCache(self.config.diffraction_cache_mb)
         self._fieldmaps: "OrderedDict[tuple, tuple]" = OrderedDict()
+        self._preview_fieldmaps: "OrderedDict[tuple, tuple]" = OrderedDict()
         self._tokens = itertools.count(1)
         self._tem_cache = TransferCache()
         self._frame: Optional[tuple] = None
@@ -193,25 +194,32 @@ class Renderer:
             td = fn() if callable(fn) else False
         return bool(td)
 
-    def field_map(self, optics, layers: frozenset = frozenset(), time_s: float = 0.0):
-        """(FieldMap, token): rasterise only when view / layers / generation / time change."""
+    def field_map(self, optics, layers: frozenset = frozenset(), time_s: float = 0.0, store=None):
+        """(FieldMap, token): rasterise only when view / layers / generation / time change.
+        ``store``: the cache to use (default the renderer's; previews keep their own, so
+        they do not push out the full-resolution field maps a stage move reuses)."""
+        store = self._fieldmaps if store is None else store
         tq = self.config.time_quantum_s
         tkey = round(time_s / tq) if (self._time_dependent() and tq > 0) else 0
         gen = getattr(self.specimen, "generation", 0)
         key = (optics.view, frozenset(layers), gen, tkey)
-        hit = self._fieldmaps.get(key)
+        hit = store.get(key)
         if hit is not None:
             fm, token, fgen = hit
             if getattr(fm, "generation", 0) == fgen:
-                self._fieldmaps.move_to_end(key)
+                store.move_to_end(key)
                 return fm, token
         fm = self.specimen.rasterize(optics.view, frozenset(layers))
         self.rasters_built += 1
         token = (next(self._tokens), getattr(fm, "generation", 0))
-        self._fieldmaps[key] = (fm, token, getattr(fm, "generation", 0))
-        while len(self._fieldmaps) > max(1, self.config.fieldmap_cache_size):
-            self._fieldmaps.popitem(last=False)
+        self._keep_field_map(store, key, fm, token)
         return fm, token
+
+    def _keep_field_map(self, store, key, fm, token) -> None:
+        store[key] = (fm, token, getattr(fm, "generation", 0))
+        store.move_to_end(key)
+        while len(store) > max(1, self.config.fieldmap_cache_size):
+            store.popitem(last=False)
 
     def _render_tem_panned(self, optics, time_s: float) -> np.ndarray:
         """TEM imaging through a padded raster, cropped to the view.
@@ -291,7 +299,7 @@ class Renderer:
         img = self._crop_pan(pkey, pview, "_pan_previews")
         if img is None:
             pad_optics, shift = self._padded_optics(poptics)
-            fm, token = self._panned_field_map(pad_optics, time_s)
+            fm, token = self._panned_field_map(pad_optics, time_s, self._preview_fieldmaps)
             raster = render_tem_raster(fm, pad_optics, self.grains, self.crystallinity,
                                        self.config, self.seed, self._tem_cache, token, shift)
             self._keep_pan("_pan_previews", pkey, pview.center_um, raster)
@@ -315,25 +323,26 @@ class Renderer:
         return (dataclasses.replace(optics, view=pview, output_shape=(py * d, px * d)),
                 (-(lr - kr), -(lc - kc)))
 
-    def _panned_field_map(self, optics, time_s: float):
+    def _panned_field_map(self, optics, time_s: float, store=None):
         """`field_map` of a padded (lattice-centred) view that takes the part it shares with
         a cached field map of the same sampling from that one and rasterises only the rest:
         a stage move rasterises the strips of specimen it brings into view. Only for a
         specimen whose raster is pixel-local (``raster_is_local``), for which the pieces
         are the pixels a whole raster has."""
+        store = self._fieldmaps if store is None else store
         if not getattr(self.specimen, "raster_is_local", False) or not self.config.reuse_rasters:
-            return self.field_map(optics, TEM_LAYERS, time_s)
+            return self.field_map(optics, TEM_LAYERS, time_s, store)
         tq = self.config.time_quantum_s
         tkey = round(time_s / tq) if (self._time_dependent() and tq > 0) else 0
         gen = getattr(self.specimen, "generation", 0)
         view = optics.view
-        if (view, frozenset(TEM_LAYERS), gen, tkey) in self._fieldmaps:
-            return self.field_map(optics, TEM_LAYERS, time_s)
+        if (view, frozenset(TEM_LAYERS), gen, tkey) in store:
+            return self.field_map(optics, TEM_LAYERS, time_s, store)
         ny, nx = view.shape
         base = dataclasses.replace(view, center_um=(0.0, 0.0))
         lc, lr = _lattice(view, *view.center_um)
         best, best_area = None, 0
-        for (v, layers, g, t), (fm, _, fgen) in self._fieldmaps.items():
+        for (v, layers, g, t), (fm, _, fgen) in store.items():
             if layers or g != gen or t != tkey or getattr(fm, "generation", 0) != fgen:
                 continue
             if dataclasses.replace(v, center_um=(0.0, 0.0)) != base:
@@ -347,7 +356,7 @@ class Renderer:
             if area > best_area:
                 best, best_area = (fm, dr, dc), area
         if best is None or best_area < self.config.reuse_min_overlap * ny * nx:
-            return self.field_map(optics, TEM_LAYERS, time_s)
+            return self.field_map(optics, TEM_LAYERS, time_s, store)
         old, dr, dc = best
         r_lo, r_hi = max(0, -dr), min(ny, ny - dr)
         c_lo, c_hi = max(0, -dc), min(nx, nx - dc)
@@ -372,9 +381,7 @@ class Renderer:
         self.rasters_built += 1
         self.rasters_reused += 1
         token = (next(self._tokens), fm.generation)
-        self._fieldmaps[(view, frozenset(TEM_LAYERS), gen, tkey)] = (fm, token, fm.generation)
-        while len(self._fieldmaps) > max(1, self.config.fieldmap_cache_size):
-            self._fieldmaps.popitem(last=False)
+        self._keep_field_map(store, (view, frozenset(TEM_LAYERS), gen, tkey), fm, token)
         return fm, token
 
     def _keep_pan(self, slot: str, key, center_um, raster) -> None:
@@ -400,6 +407,7 @@ class Renderer:
         self._pan_previews = []
         self._last_req = None
         self._fieldmaps.clear()
+        self._preview_fieldmaps.clear()
         self._tem_cache = TransferCache()
         self._frame = None
         self.cache.clear()

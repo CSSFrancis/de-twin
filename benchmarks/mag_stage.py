@@ -44,16 +44,33 @@ tem.render_tem_raster = _timed("tem", _orig["tem"])
 tem.finish_tem = _timed("finish", _orig["finish"])
 
 
+def _settle(tw, req):
+    """The full render of the current view (interactive mode: after it settles)."""
+    tw.flux(req)
+    if tw.renderer.config.interactive:
+        time.sleep(tw.renderer.config.settle_s + 0.02)
+        tw.flux(req)
+
+
 def _frame(tw, req):
     T.clear()
+    reused, built = tw.renderer.rasters_reused, tw.renderer.rasters_built
     t0 = time.perf_counter()
     flux = tw.flux(req)
     t1 = time.perf_counter()
     tw.detector.expose(flux, req.frame_time_s, req, 0, ht_kv=tw.column.state().ht_kv)
     t2 = time.perf_counter()
     # the TEM raster time includes neither the rasterisation (done before) nor the finish
-    return {"total": t1 - t0, "raster": T["raster"], "tem": T["tem"], "finish": T["finish"],
-            "detector": t2 - t1}
+    out = {"total": t1 - t0, "raster": T["raster"], "tem": T["tem"], "finish": T["finish"],
+           "detector": t2 - t1, "settled": float("nan")}
+    if tw.renderer.config.interactive:  # the full render once the view has settled
+        time.sleep(tw.renderer.config.settle_s + 0.02)
+        t0 = time.perf_counter()
+        tw.flux(req)
+        out["settled"] = time.perf_counter() - t0
+    out["how"] = "reuse" if tw.renderer.rasters_reused > reused else ("crop" if tw.renderer.rasters_built == built
+                                                                     else "full")
+    return out
 
 
 def _move(tw, dx_um, dy_um=0.0):
@@ -67,12 +84,12 @@ def scenarios(tw, req):
     for m0, m1 in ((2000.0, 2500.0), (20000.0, 25000.0)):
         col.move_stage(x=home.x_um, y=home.y_um)
         col.set("Magnification", m0)
-        tw.flux(req)
+        _settle(tw, req)
         col.set("Magnification", m1)
         yield f"mag {m0:g}->{m1:g}", _frame(tw, req)
     col.move_stage(x=home.x_um, y=home.y_um)
     col.set("Magnification", 20000.0)
-    tw.flux(req)
+    _settle(tw, req)
     opt = tw.optics(req)
     px_um = opt.specimen_pixel_nm / 1000.0 * max(1, opt.raster_downsample)
     ny = opt.view.shape[0]
@@ -98,18 +115,19 @@ def main():
     cfg = RenderConfig(interactive=args.interactive)
     prof = cProfile.Profile() if args.profile else None
     print(f"{'preset':28s} {'camera':6s} {'scenario':26s} {'total':>7s} {'raster':>7s} {'tem':>7s} "
-          f"{'finish':>7s} {'detect':>7s}  (ms)")
+          f"{'finish':>7s} {'detect':>7s} {'settled':>7s}  (ms)  raster")
     for preset in args.presets:
         for cam in args.cameras:
             tw = DigitalTwin(preset, camera=cam, clock=ManualClock(), seed=0, render_config=cfg)
             req = tw.request()
             f = tw.flux(req)  # warm: imports, numba, populated areas
+            _settle(tw, req)
             tw.detector.expose(f, req.frame_time_s, req, 0, ht_kv=tw.column.state().ht_kv)
             if prof:
                 prof.enable()
             for name, r in scenarios(tw, req):
                 print(f"{preset[:28]:28s} {cam:6s} {name:26s} " + " ".join(
-                    f"{1000 * r[k]:7.0f}" for k in ("total", "raster", "tem", "finish", "detector")),
+                    f"{1000 * r[k]:7.0f}" for k in ("total", "raster", "tem", "finish", "detector", "settled")) + "  " + r["how"],
                     flush=True)
             if prof:
                 prof.disable()

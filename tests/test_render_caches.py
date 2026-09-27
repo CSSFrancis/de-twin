@@ -195,3 +195,51 @@ def test_a_jump_back_is_a_crop():
     built = tw.renderer.rasters_built
     np.testing.assert_array_equal(tw.flux(req), home)
     assert tw.renderer.rasters_built == built
+
+
+# ------------------------------------------------------------------ interactive
+def test_a_magnification_step_previews_then_settles_to_the_full_render():
+    import time
+
+    tw = _twin(interactive=True, settle_s=0.05)
+    ref = _twin()
+    req = tw.request()
+    tw.flux(req)
+    for t in (tw, ref):
+        t.column.set("Magnification", 25000.0)
+    moving = tw.flux(req)
+    assert tw.renderer.previews_rendered == 1
+    full = ref.flux(req)
+    assert moving.shape == full.shape
+    assert moving.mean() == pytest.approx(full.mean(), rel=0.05)
+    time.sleep(0.06)
+    np.testing.assert_array_equal(tw.flux(req), full)
+    assert tw.renderer.previews_rendered == 1
+
+
+def test_previews_do_not_push_out_the_field_maps_a_move_reuses():
+    import time
+
+    tw = _twin(interactive=True, settle_s=0.05)
+    req = tw.request()
+    tw.flux(req)
+    n = tw.optics(req).view.shape[0]
+    px = tw.optics(req).view.pixel_um
+    for _ in range(3):
+        _move(tw, 0.3 * n * px)
+        tw.flux(req)  # a preview
+        time.sleep(0.06)
+        tw.flux(req)  # the full render, from the last full field map plus a strip
+    assert tw.renderer.rasters_reused >= 3
+
+
+def test_serve_interactive_flag():
+    import argparse
+
+    from de_twin.cli import _build_twin
+
+    args = argparse.Namespace(specimen="Dense Au on holey C", camera="DESim", seed=0, holder="none",
+                              time_scale=1.0, mirror_temchannel=None, corrector="none", interactive=True)
+    assert _build_twin(args).renderer.config.interactive
+    args.interactive = False
+    assert not _build_twin(args).renderer.config.interactive
