@@ -246,6 +246,45 @@ def block_labels(W, offx, offy, r0, r1, c0, c1, s, nr_n, nc_n, SX, SY, x0, y0, L
             out[i, j] = _label1(X, Y, SX, SY, x0, y0, L, gw, small)
 
 
+# ------------------------------------------------------------------ grid bars
+@njit(parallel=True)
+def mesh_bulk(r0, r1, nx, LC, W, pitch, half, corner, disk2, usable2, bar_mat, bar_t, origin, ncell, cell_area,
+              mat, thick, area):
+    """`Holder._sample_bulk` of a mesh / waffle grid: bars, rounded holes and the placement
+    area of each hole, for rows r0:r1."""
+    inv = 1.0 / pitch
+    for i in prange(r1 - r0):
+        r = float(r0 + i)
+        for c in range(nx):
+            cf = float(c)
+            lx = LC[0] + LC[1] * cf + LC[2] * r
+            ly = LC[3] + LC[4] * cf + LC[5] * r
+            qx = math.floor(lx * inv + 0.5)
+            qy = math.floor(ly * inv + 0.5)
+            u = abs(lx - qx * pitch)
+            v = abs(ly - qy * pitch)
+            hole = u < half and v < half
+            if corner > 0:
+                ic = half - corner
+                du = max(u - ic, 0.0)
+                dv = max(v - ic, 0.0)
+                hole = hole and (du * du + dv * dv) < corner ** 2
+            X = W[0] + W[2] * cf + W[4] * r
+            Y = W[1] + W[3] * cf + W[5] * r
+            r2 = X * X + Y * Y
+            in_disk = r2 <= disk2
+            hole = hole and r2 <= usable2
+            bar = in_disk and not hole
+            mat[i, c] = bar_mat if bar else np.uint8(0)
+            thick[i, c] = bar_t if bar else np.float32(0.0)
+            ci = qx - origin
+            cj = qy - origin
+            if hole and ci >= 0 and ci < ncell and cj >= 0 and cj < ncell:
+                area[i, c] = cell_area[int(cj), int(ci)]
+            else:
+                area[i, c] = -1
+
+
 # ------------------------------------------------------------------ protein fields
 @njit(parallel=True)
 def protein_block(thick, material, grain, nx, ra, rb, c0, c1, W, O, labels, SX, SY, x0, y0, diam, stained,
@@ -389,8 +428,8 @@ def _h_texture(xx, yy, FS, FC, FSN, FA, FN, crumple_on, rough_term, crumple_nm, 
 
 @njit(parallel=True)
 def replica_block(thick, material, grain, uthick, umat, used, nx, ra, rb, c0, c1, W, O, FL, R, stack,
-                  FS, FC, FSN, FA, FN, TX, scx, scy, sr, sstart, smem, SP, SN, D, M, I, tiles, fseed, cseed,
-                  covs, lvx, levels, table, offsets):
+                  FS, FC, FSN, FA, FN, TX, scx, scy, sr, sstart_all, smem, SPB, SNB, BSO, bstep, D, M, I, tiles,
+                  fseed, cseed, covs, lvx, levels, table, offsets):
     """`ShadowedReplicaStructure.fill` for the raster rows ra:rb, columns c0:c1 of one owner
     (the relief, the replica's texture, latex spheres, the angled metal deposit and its
     island film; see the NumPy code in `standards.replica` for the physics)."""
@@ -442,7 +481,11 @@ def replica_block(thick, material, grain, uthick, umat, used, nx, ra, rb, c0, c1
             gy = np.float64(gy32) + (hy - h0) / (e * 1000.0)
             top = 0.0
             chord = 0.0
-            if has_spheres:
+            if has_spheres:  # the sphere set of this pixel's row block (as the NumPy fill builds them)
+                kb = (r - ra) // bstep
+                SP = SPB[kb]
+                SN = SNB[kb]
+                sstart = sstart_all[BSO[kb, 0]:BSO[kb, 1]]
                 t_, c_ = top_chord1(lx, ly, scx, scy, sr, sstart, smem, SP[0], SP[1], SP[2], SN[0], SN[1])
                 top = t_ * 1000.0
                 chord = c_ * 1000.0
@@ -458,6 +501,10 @@ def replica_block(thick, material, grain, uthick, umat, used, nx, ra, rb, c0, c1
                 dep = metal_nm * max(sin_e - cos_e * (gx * ux + gy * uy), 0.0)
                 dep = min(dep, 12.0 * flat)
                 if has_spheres and shadowed:
+                    kb = (r - ra) // bstep
+                    SP = SPB[kb]
+                    SN = SNB[kb]
+                    sstart = sstart_all[BSO[kb, 0]:BSO[kb, 1]]
                     occ = occlusion1(lx, ly, h / 1000.0, scx, scy, sr, sstart, smem, SP[0], SP[1], SP[2], SN[0],
                                      SN[1], SP[5], SP[6], SP[7], SP[8], SP[9], SP[10])
                     lit = min(np.float64(lit32), 1.0 - occ)

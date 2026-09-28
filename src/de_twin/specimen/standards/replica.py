@@ -377,10 +377,17 @@ class ShadowedReplicaStructure(StandardStructure):
         uthick = np.zeros(ctx.npix, np.float32) if new_under else ctx.under_thick
         umat = np.zeros(ctx.npix, np.uint8) if new_under else ctx.under_material
         used = np.zeros(1, np.uint8)
-        blocks = ([(a, bb) for a, bb in ctx.row_blocks(r0, r1, c1 - c0)] if spheres else [(r0, r1)])
-        empty = np.zeros(0)
-        for a, bb in blocks:
-            if spheres:  # the spheres of the block's pixels, as the NumPy fill builds them per block
+        bstep = max(1, ctx.BLOCK_PIXELS // max(1, c1 - c0))  # ctx.row_blocks
+        nblk = (r1 - r0 + bstep - 1) // bstep if spheres else 1
+        SPB = np.zeros((nblk, 11))
+        SNB = np.ones((nblk, 2), np.int64)
+        BSO = np.zeros((nblk, 2), np.int64)
+        cxs, cys, rs, starts, members = [], [], [], [], []
+        n_sph = n_mem = 0
+        if spheres:  # the spheres of each row block's pixels, as the NumPy fill builds them per block
+            ce, se = math.cos(self.elev), math.sin(self.elev)
+            step = max(px, 1.0 / NM_PER_UM)
+            for kb, (a, bb) in enumerate(ctx.row_blocks(r0, r1, c1 - c0)):
                 rows = np.arange(a, bb)[:, None]
                 cols = np.arange(c0, c1)[None, :]
                 X, Y = ctx.world(rows, cols)
@@ -388,24 +395,31 @@ class ShadowedReplicaStructure(StandardStructure):
                 lx = dx * O[2] - dy * O[3]
                 ly = dx * O[3] + dy * O[2]
                 m = (np.abs(lx) <= owner.rx) & (np.abs(ly) <= owner.ry)
+                s0 = sum(len(x) for x in starts)
                 if not m.any():
+                    starts.append(np.zeros(2, np.int64) + n_mem)
+                    BSO[kb] = (s0, s0 + 2)
                     continue
                 ss = self._sphere_set(seed, lx[m], ly[m])
-                ce, se = math.cos(self.elev), math.sin(self.elev)
                 rmax = float(ss.r.max()) if ss.r.size else 0.0
                 reach = 2.0 * rmax / max(math.tan(self.elev), 1e-3) + rmax
-                step = max(px, 1.0 / NM_PER_UM)
-                SP = np.array([ss.x0, ss.y0, 1.0 / ss.bin, step, step * NM_PER_UM, ux * ce, uy * ce, se, reach,
-                               0.5 * ss.bin, SHADOW_PENUMBRA_RAD])
-                sarr = (ss.cx, ss.cy, ss.r, ss.start, ss.members)
-                SN = np.array([ss.nx, ss.ny], np.int64)
-            else:
-                SP = np.zeros(11)
-                sarr = (empty, empty, empty, np.zeros(2, np.int64), np.zeros(0, np.int64))
-                SN = np.ones(2, np.int64)
-            _rnb.replica_block(ctx.thick, ctx.material, ctx.grain, uthick, umat, used, ctx.nx, a, bb, c0, c1, W, O,
-                               FL, R, stack, FS, FC, FSN, FA, FN, TX, *sarr, SP, SN, D, M, I, tiles, fseed, cseed,
-                               covs, lvx, levels, table, _OFFSETS)
+                SPB[kb] = (ss.x0, ss.y0, 1.0 / ss.bin, step, step * NM_PER_UM, ux * ce, uy * ce, se, reach,
+                           0.5 * ss.bin, SHADOW_PENUMBRA_RAD)
+                SNB[kb] = (ss.nx, ss.ny)
+                cxs.append(ss.cx)
+                cys.append(ss.cy)
+                rs.append(ss.r)
+                starts.append(ss.start + n_mem)
+                members.append(ss.members + n_sph)
+                BSO[kb] = (s0, s0 + len(ss.start))
+                n_sph += ss.cx.size
+                n_mem += ss.members.size
+        cat = (lambda xs, dt: np.ascontiguousarray(np.concatenate(xs), dt) if xs else np.zeros(1, dt))
+        sarr = (cat(cxs, np.float64), cat(cys, np.float64), cat(rs, np.float64), cat(starts, np.int64),
+                cat(members, np.int64))
+        _rnb.replica_block(ctx.thick, ctx.material, ctx.grain, uthick, umat, used, ctx.nx, r0, r1, c0, c1, W, O,
+                           FL, R, stack, FS, FC, FSN, FA, FN, TX, *sarr, SPB, SNB, BSO, bstep, D, M, I, tiles, fseed,
+                           cseed, covs, lvx, levels, table, _OFFSETS)
         if new_under and used[0]:
             ctx.under_material, ctx.under_thick = umat, uthick
 

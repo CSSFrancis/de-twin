@@ -581,6 +581,23 @@ class Holder:
             k = self._mesh_block_single_hole(ctx, r0, r1)
             if k is not None:
                 return (np.zeros(shape, np.uint8), np.zeros(shape, np.float32), np.full(shape, k, np.int32))
+            if _rnb.AVAILABLE and shape[1] == ctx.nx:
+                c, s = self._cos, self._sin
+                ox, oy = m.offset_um
+                LC = np.empty(6)
+                for q, (p1, p2, kk) in enumerate(((c, s, -ox), (-s, c, -oy))):
+                    LC[3 * q] = kk + p1 * ctx.ox + p2 * ctx.oy
+                    LC[3 * q + 1] = p1 * ctx.axc + p2 * ctx.ayc
+                    LC[3 * q + 2] = p1 * ctx.axr + p2 * ctx.ayr
+                mat = np.empty(shape, np.uint8)
+                thick = np.empty(shape, np.float32)
+                area = np.empty(shape, np.int32)
+                _rnb.mesh_bulk(r0, r1, ctx.nx, LC, np.array([ctx.ox, ctx.oy, ctx.axc, ctx.ayc, ctx.axr, ctx.ayr]),
+                               float(m.pitch_um), float(self._half), float(self._corner), float(self._disk2),
+                               float(self._usable2), np.uint8(m.bar_material), np.float32(m.bar_thickness_nm),
+                               float(self._cell_origin), float(self._cell_count),
+                               np.ascontiguousarray(self._cell_area, np.int32), mat, thick, area)
+                return mat, thick, area
             lx, ly = self._lattice(ctx, rows, cols)
             inv = 1.0 / m.pitch_um
             qx = np.floor(lx * inv + 0.5)
