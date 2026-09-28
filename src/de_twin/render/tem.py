@@ -52,6 +52,7 @@ from ..optics.physics import interaction_constant
 from ..optics.state import image_aberrations_of
 from ..specimen.materials import (GRAINS_PER_MATERIAL, MATERIALS, MaterialId, absorption_lengths_nm,
                                   material_array)
+from . import fastpath as _fp
 from .diffraction import MAX_THICKNESS_BIN, THICKNESS_BIN_NM, bragg_fraction, thickness_bin_for
 from .samples import DIFFUSE_CUTOFF_LENGTHS
 from .util import (chi_and_gradient, disk_profile, gaussian_filter_threaded, parallel_rows, pool, upsample_to,
@@ -94,7 +95,8 @@ class _BraggMemo:
         self.geom: dict = {}
         self.pair: dict = {}
         self._table = None
-        self.min_gxy = 0.0
+        self._done = None
+        self.min_gxy = math.inf
 
     def _ensure_geometry(self, lib, grains, gids, optics) -> None:
         new_g = [int(g) for g in gids if int(g) not in self.geom]
@@ -111,23 +113,35 @@ class _BraggMemo:
                 self.geom[new_g[r0 + j]] = (idx[a:b], gx[a:b], gy[a:b], s[a:b], gxy[a:b])
         parallel_rows(geo, len(new_g), min_chunk=16)
 
-    def table(self, lib, grains, mid: int, optics) -> np.ndarray:
-        """(GRAINS_PER_MATERIAL, MAX_THICKNESS_BIN + 1) loss per unit crystallinity of every
-        grain of material ``mid`` at every thickness bin (:mod:`.bragg_table`), built once."""
-        if self._table is None:
-            from .bragg_table import loss_table
+    def table(self, lib, grains, mid: int, optics, need=None) -> np.ndarray:
+        """(GRAINS_PER_MATERIAL, MAX_THICKNESS_BIN + 1) loss per unit crystallinity of the
+        grains of material ``mid`` at the thickness bins (:mod:`.bragg_table`). Filled lazily:
+        ``need[k]`` is the largest bin wanted for grain ``k`` of the material (-1 none; None:
+        every grain, every bin); rows and bins already computed are kept."""
+        from .bragg_table import loss_table
 
-            ids = [g for g in range(mid * GRAINS_PER_MATERIAL, (mid + 1) * GRAINS_PER_MATERIAL)
-                   if g < len(grains)]
+        nbins = MAX_THICKNESS_BIN + 1
+        if self._table is None:
+            self._table = np.zeros((GRAINS_PER_MATERIAL, nbins))
+            self._done = np.full(GRAINS_PER_MATERIAL, -1, np.int64)
+            self.min_gxy = math.inf
+        g0 = mid * GRAINS_PER_MATERIAL
+        count = max(0, min(GRAINS_PER_MATERIAL, len(grains) - g0))
+        need = (np.full(count, nbins - 1, np.int64) if need is None
+                else np.asarray(need, np.int64)[:count])
+        todo = np.flatnonzero(need > self._done[:count])
+        if todo.size:
+            top = int(need[todo].max())
+            ids = [g0 + int(k) for k in todo]
             self._ensure_geometry(lib, grains, ids, optics)
             geom = [self.geom[g] for g in ids]
-            tab, _ = loss_table(lib, geom, optics, self._g_obj, MAX_THICKNESS_BIN + 1)
-            full = np.zeros((GRAINS_PER_MATERIAL, MAX_THICKNESS_BIN + 1))
-            full[:len(ids)] = tab
+            tab, _ = loss_table(lib, geom, optics, self._g_obj, top + 1)
+            self._table[todo, :top + 1] = tab
+            self._done[todo] = top
             gxy = np.concatenate([g[4] for g in geom]) if geom else np.zeros(0)
             gxy = gxy[gxy > 1e-6]
-            self.min_gxy = float(gxy.min()) if gxy.size else math.inf
-            self._table = full
+            if gxy.size:
+                self.min_gxy = min(self.min_gxy, float(gxy.min()))
         return self._table
 
     def values(self, lib, grains, gids, ps, tbs, optics) -> np.ndarray:
@@ -202,10 +216,18 @@ def bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max: float
         gid[r0:r1] = np.where(ok, g, -1)
         tb = thickness_bin_for(fm.thickness_nm[r0:r1].astype(np.float32) * f_t)
         pix_all[r0:r1] = np.where(ok, g * nb + tb, -1)
-    parallel_rows(pixel_rows, mat.shape[0])
+    maxbin = None  # the largest thickness bin of each grain in view (numba path)
+    if _fp.AVAILABLE and n > 0:
+        maxb = np.full((max(1, min(64, mat.shape[0] // 16)), n), -1, np.int16)
+        _fp.bragg_pixels(fm.grain_id, mat, fm.thickness_nm, f_t, n, nb, GRAINS_PER_MATERIAL, gid, pix_all,
+                         maxb)
+        maxbin = maxb.max(axis=0)
+    else:
+        parallel_rows(pixel_rows, mat.shape[0])
     loss = np.zeros(mat.shape, np.float32)
     fringes: dict = {}
-    if not (gid >= 0).any():
+    present = np.flatnonzero(maxbin >= 0) if maxbin is not None else None
+    if (present.size == 0) if present is not None else not (gid >= 0).any():
         return BraggContrast(loss, gid, fringes)
     lam = optics.wavelength_nm
     g_obj = optics.objective_aperture_mrad / (1000.0 * lam) if optics.objective_aperture_mrad > 0 else 0.0
@@ -218,21 +240,26 @@ def bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max: float
     # the loss: a gather from each material's (grain, thickness bin) table for this tilt / beam
     lut = np.zeros(n * nb + 1, np.float32)  # the last entry: no crystal (-1)
     fringe_mids = []
-    for mid in np.flatnonzero(np.bincount(gid[gid >= 0] // GRAINS_PER_MATERIAL)):
+    mids = (np.unique(present // GRAINS_PER_MATERIAL) if present is not None
+            else np.flatnonzero(np.bincount(gid[gid >= 0] // GRAINS_PER_MATERIAL)))
+    for mid in mids:
         lib = library_for(int(mid), cfg.max_g_inv_nm)
         if lib is None:
             continue  # an amorphous material: no Bragg contrast (the FIB-liftout pattern's "auto" post)
         memo = _bragg_memo(grains, int(mid), cfg.max_g_inv_nm, optics, g_obj)
-        tab = memo.table(lib, grains, int(mid), optics)
         g0 = int(mid) * GRAINS_PER_MATERIAL
         g1 = min(g0 + GRAINS_PER_MATERIAL, n)
+        tab = memo.table(lib, grains, int(mid), optics, None if maxbin is None else maxbin[g0:g1])
         ids = np.arange(g0, g1)
         crm = np.ones(len(ids)) if crystallinity is None else np.asarray(crystallinity(ids), float).reshape(-1)
         lut[g0 * nb:g1 * nb] = (cfg.diffraction_contrast_scale * (crm[:, None] * tab[:g1 - g0])).ravel()
         # fringes need beams the raster resolves (and the aperture passes)
         if coherent or (cfg.lattice_fringes and memo.min_gxy <= g_res):
             fringe_mids.append(int(mid))
-    parallel_rows(lambda r0, r1: loss.__setitem__(slice(r0, r1), lut[pix_all[r0:r1]]), mat.shape[0])
+    if _fp.AVAILABLE:
+        _fp.gather(lut, pix_all, loss)
+    else:
+        parallel_rows(lambda r0, r1: loss.__setitem__(slice(r0, r1), lut[pix_all[r0:r1]]), mat.shape[0])
     if not fringe_mids:
         return BraggContrast(loss, gid, fringes, coherent, t_typ,
                              coherent or (cfg.lattice_fringes and cfg.lattice_fringe_model == "kinematic"))
@@ -452,6 +479,19 @@ def transfer_function(shape, pitch_nm, optics) -> np.ndarray | None:
 
     ny, nx = shape
     H = np.empty((ny, nx), np.complex64)
+    if _fp.AVAILABLE and set(ab.coeffs) <= {"C1", "A1", "C3", "C5"}:
+        f = np.float32
+        s = 2.0 * math.pi / lam
+        l2 = lam * lam
+        c1, c3, c5 = (ab[n].real for n in ("C1", "C3", "C5"))
+        a1 = ab["A1"]
+        _fp.transfer_c1a1c3c5(
+            kx1.astype(np.float64), ky1.astype(np.float64), float(tx), float(ty),
+            f(s * l2 * c1 / 2), f(s * l2 * l2 * c3 / 4), f(s * l2 ** 3 * c5 / 6),
+            f(s * l2 * a1.real / 2), f(s * l2 * a1.imag), f(s * l2 * c1), f(s * l2 * l2 * c3),
+            f(s * l2 ** 3 * c5), f(s * l2 * a1.real), f(s * l2 * a1.imag), f(c0), f(gx0), f(gy0),
+            f(es), f(et), f(kt2), f(kap * kap), H)
+        return H
     KX = (kx1 + tx).astype(np.float32)[None, :]
     kyf = (ky1 + ty).astype(np.float32)
 
@@ -596,6 +636,9 @@ def transmission_function(fm, optics, grains, crystallinity, cfg, seed: int, *,
     mip = None
     loss = None
     taper_px = cfg.edge_taper_nm / p_nm
+    if _fp.AVAILABLE and keep_diffuse is None:
+        return _transmission_fast(fm, optics, cfg, bc, noise, sigma, mip_v, amorphous, tex_k, kappa,
+                                  inv_dens, p_nm, taper_px, return_contrast)
     if cfg.mip_phase:
         # mean-inner-potential phase with rounded (not ideal-step) edges
         f_t = np.float32(optics.thickness_tilt_factor)
@@ -688,6 +731,50 @@ def transmission_function(fm, optics, grains, crystallinity, cfg, seed: int, *,
     return (psi, bc) if return_contrast else psi
 
 
+def _transmission_fast(fm, optics, cfg, bc, noise, sigma, mip_v, amorphous, tex_k, kappa, inv_dens, p_nm,
+                       taper_px, return_contrast):
+    """`transmission_function` (TEM: no coherent diffuse part) through :mod:`.fastpath`."""
+    ny, nx = fm.material_id.shape
+    f_t = np.float32(optics.thickness_tilt_factor)
+    has_under = fm.under_thickness_nm is not None
+    umat = fm.under_material if has_under else fm.material_id
+    uthick = fm.under_thickness_nm if has_under else fm.thickness_nm
+    mip = np.zeros((1, 1), np.float32)
+    refraction = False
+    inv_gc2 = np.float32(0.0)
+    if cfg.mip_phase:
+        mip = np.empty((ny, nx), np.float32)
+        _fp.mip_phase(fm.material_id, fm.thickness_nm, umat, uthick, has_under, f_t, np.float32(sigma),
+                      mip_v, mip)
+        if taper_px > 0.3:
+            mip = gaussian_filter_threaded(mip, min(taper_px, 16.0), mode="nearest", truncate=3.0)
+        if cfg.refraction_loss:
+            g_c = 0.5 * math.pi
+            if optics.objective_aperture_mrad > 0:
+                g_c = min(g_c, 2.0 * math.pi * p_nm * optics.objective_aperture_mrad * 1e-3
+                          / optics.wavelength_nm)
+            inv_gc2 = np.float32(1.0 / (g_c * g_c))
+            refraction = bool(_fp.refraction_qmax(mip, inv_gc2) > 0.01)
+    psi = np.empty((ny, nx), np.complex64)
+    t_full = np.empty((ny, nx), np.float32)
+    lam_abs = absorption_lengths_nm(optics.ht_kv)
+    _fp.exit_wave(fm.material_id, fm.thickness_nm, umat, uthick, has_under, f_t, lam_abs, bc.loss, mip,
+                  bool(cfg.mip_phase), refraction, inv_gc2,
+                  noise if noise is not None else np.zeros((1, 1), np.float32), noise is not None,
+                  amorphous, np.float32(tex_k), mip_v, inv_dens, np.float32(kappa), psi, t_full)
+    if bc.phase_grating or bc.kinematic or (cfg.lattice_fringes and cfg.lattice_phase_rad > 0):
+        lat = lattice_field(fm, optics, bc, t_full)
+        if lat is not None:
+            (rows, cols), val, _ = lat
+            scale = np.float32(1.0 if (bc.phase_grating or bc.kinematic) else cfg.lattice_phase_rad)
+
+            def fringe(a, b):
+                r, c = rows[a:b], cols[a:b]
+                psi[r, c] *= np.exp(1j * scale * val[a:b]).astype(np.complex64)
+            parallel_rows(fringe, len(rows), 16384)
+    return (psi, bc) if return_contrast else psi
+
+
 def exit_wave(fm, optics, grains, crystallinity, cfg, seed: int) -> np.ndarray:
     """TEM exit wave under plane-wave illumination: the transmission function itself."""
     return transmission_function(fm, optics, grains, crystallinity, cfg, seed)
@@ -734,6 +821,15 @@ def render_physical(fm, optics, grains, crystallinity, cfg, seed: int, cache: Tr
         H = transfer_function(shape, p_nm, optics)
         cache._put(cache.transfer, hkey, H)
     ramps = _shift_ramps(shape, shift_px)
+    if _fp.AVAILABLE:
+        prod = np.empty_like(spec)
+        one = np.ones(1, np.complex64)
+        _fp.spectrum_product(spec, H if H is not None else np.ones((1, 1), np.complex64), H is not None,
+                             ramps[0] if ramps else one, ramps[1] if ramps else one, ramps is not None, prod)
+        psi = sfft.ifft2(prod, workers=-1, overwrite_x=True)
+        out = np.empty(shape, np.float32)
+        _fp.intensity(psi, out)
+        return out
     if H is None and ramps is None:
         psi = sfft.ifft2(spec, workers=-1)
     else:

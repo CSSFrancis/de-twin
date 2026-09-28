@@ -362,3 +362,35 @@ def test_a_tilt_series_keeps_its_tables():
     tw.renderer.invalidate()  # not a crop: the frame is rendered again, the table is reused
     tw.flux(req)
     assert dict(tem._BRAGG_MEMOS) == kept, "a return to a tilt reuses its table"
+
+
+# ------------------------------------------------------------------ fused kernels
+@pytest.mark.parametrize("name,mag,defocus", [("Dense Au on holey C", 20000.0, -1.0),
+                                              ("Apoferritin in ice", 50000.0, -2.0),
+                                              ("Negative stain on carbon", 100000.0, -0.5),
+                                              (GRATING, 150000.0, -0.3)])
+def test_the_fused_kernels_are_the_numpy_reference(name, mag, defocus, monkeypatch):
+    """The numba exit wave, Bragg lookup, transfer function and |psi|^2 against the NumPy
+    reference: float rounding only."""
+    from de_twin.render import fastpath
+    from de_twin.render.tem import TransferCache
+
+    if not fastpath.AVAILABLE:
+        pytest.skip("no numba")
+    tw = DigitalTwin(name, camera="DESim", clock=ManualClock(), seed=2)
+    tw.column.set("Magnification", mag)
+    tw.column.set_defocus_um(defocus)
+    tw.column.set("ObjectiveStig", (0.3, -0.2))  # A1: the transfer function's astigmatic terms
+    req = tw.request()
+    r = tw.renderer
+    po, sh = r._padded_optics(tw.optics(req))
+    fm, tok = r.field_map(po)
+    out = []
+    for fast in (False, True):
+        monkeypatch.setattr(tem._fp, "AVAILABLE", fast)
+        tem._BRAGG_MEMOS.clear()
+        out.append(tem.render_tem_raster(fm, po, r.grains, r.crystallinity, r.config, r.seed, TransferCache(),
+                                         tok, sh))
+    ref, fast = out
+    d = np.abs(fast - ref) / ref.mean()
+    assert d.max() < 1e-4 and np.sqrt((d * d).mean()) < 1e-5
