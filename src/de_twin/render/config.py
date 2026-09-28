@@ -35,7 +35,7 @@ class RenderConfig:
     #: rigidly with the specimen, so a joystick nudge costs a crop, not a render. 0 off.
     pan_margin: float = 0.15
     #: Padded rasters kept for cropping (a jump back to a recent place is a crop too).
-    pan_cache_size: int = 4
+    pan_cache_size: int = 6
     #: A new padded raster takes the specimen it shares with a cached one (same sampling, on
     #: the same world-fixed pixel lattice) from that one's field map when they overlap by at
     #: least ``reuse_min_overlap`` of its area, and rasterises only the rest.
@@ -50,6 +50,10 @@ class RenderConfig:
     #: again — the next frame after you stop — it is rendered in full. Off by default,
     #: so a library caller always gets the full render.
     interactive: bool = False
+    #: Live view: after each new view, render the view that repeating the last change would
+    #: give (the next magnification rung, tilt, focus or stage step) in the background, so
+    #: stepping through a series is a crop. One view at a time; the latest wins.
+    prefetch: bool = False
     preview_side: int = 256
     #: How long (wall-clock seconds) the view must stay put before it counts as stopped
     #: and is rendered in full. Live view asks for several frames per drag step, so

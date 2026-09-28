@@ -394,3 +394,33 @@ def test_the_fused_kernels_are_the_numpy_reference(name, mag, defocus, monkeypat
     ref, fast = out
     d = np.abs(fast - ref) / ref.mean()
     assert d.max() < 1e-4 and np.sqrt((d * d).mean()) < 1e-5
+
+
+# ------------------------------------------------------------------ prefetch
+def test_a_series_is_prefetched_and_is_the_exact_render():
+    """With prefetch on, the view that repeating the last change gives is rendered in the
+    background; asking for it is a crop, and the image is the one rendered on demand."""
+    live, ref = _twin(prefetch=True), _twin()
+    req = live.request()
+    for t in (live, ref):
+        t.flux(req)
+    for mag in (25000.0, 30000.0, 40000.0):
+        for t in (live, ref):
+            t.column.set("Magnification", mag)
+        img = live.flux(req)
+        live._pf_future.result()
+        np.testing.assert_allclose(img, ref.flux(req), rtol=1e-5, atol=1e-5)
+    assert live.renderer.prefetched >= 2
+    built = live.renderer.rasters_built
+    live.column.set("Magnification", 50000.0)  # the next rung: prefetched
+    live.flux(req)
+    assert live.renderer.rasters_built == built
+
+
+def test_prefetch_is_off_by_default():
+    tw = _twin()
+    req = tw.request()
+    tw.flux(req)
+    tw.column.set("Magnification", 25000.0)
+    tw.flux(req)
+    assert getattr(tw, "_pf_future", None) is None

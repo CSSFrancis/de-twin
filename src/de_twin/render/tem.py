@@ -39,6 +39,7 @@ power spectrum of a carbon film shows Thon rings at ``chi = atan(kappa) + n pi``
 from __future__ import annotations
 
 import math
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 
@@ -194,7 +195,16 @@ def _bragg_memo(grains, mid: int, max_g: float, optics, g_obj: float) -> _BraggM
     return memo
 
 
+#: The Bragg memos are shared by every renderer (and a prefetching thread): one at a time.
+_BRAGG_LOCK = threading.RLock()
+
+
 def bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max: float = 0.0) -> BraggContrast:
+    with _BRAGG_LOCK:
+        return _bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max)
+
+
+def _bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max: float = 0.0) -> BraggContrast:
     """Per-pixel Bragg loss from the grain at its effective orientation and thickness bin,
     and the lattice fringes (strongest excited, resolvable, transmitted beams) per grain.
 

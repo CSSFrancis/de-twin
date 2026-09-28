@@ -20,6 +20,7 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import math
+import threading
 from collections import OrderedDict
 from typing import Optional
 
@@ -174,6 +175,10 @@ class Renderer:
         self._stem = StemRenderer(self.cache, self.config, self.seed)
         self._coherent = CoherentStem(self.cache, self.config, self.seed)
         self._grains_fallback: Optional[GrainTable] = None
+        self._lock = threading.RLock()  # render() and a prefetching thread share the caches
+        self._prefetch_tem = TransferCache()
+        self._inflight = None  # (optics, threading.Event) of the view being prefetched
+        self.prefetched = 0
         self.rasters_built = 0
         self.rasters_reused = 0  # of rasters_built: assembled from a cached field map + new strips
         self.frames_from_cache = 0
@@ -431,6 +436,10 @@ class Renderer:
 
     def invalidate(self) -> None:
         """Drop every cached raster, frame and pattern (e.g. after the specimen changed)."""
+        with self._lock:
+            self._invalidate()
+
+    def _invalidate(self) -> None:
         self._pans = []
         self._pan_out = None
         self._pan_previews = []
@@ -452,6 +461,60 @@ class Renderer:
 
         Returns zeros when the beam is blanked (the caller may map that to ``flux=None``).
         """
+        inflight = self._inflight
+        if inflight is not None and inflight[0] == optics:
+            inflight[1].wait(10.0)  # being prefetched: its result is a crop in a moment
+        with self._lock:
+            return self._render(optics, frame_index=frame_index, scan_point=scan_point, time_s=time_s)
+
+    def prefetch(self, optics, time_s: float = 0.0) -> bool:
+        """Render the TEM view ``optics`` into the caches, off the caller's thread: the padded
+        raster and its field map, so asking for that view later is a crop. The heavy work
+        runs without the renderer's lock (a live frame is not held up); only looking up and
+        storing take it. Returns whether anything was rendered."""
+        if (optics.beam_blanked or optics.render_mode != RenderMode.TEM_IMAGING or self.config.pan_margin <= 0
+                or self._time_dependent()):
+            return False
+        tkey = 0  # not time dependent
+        gen = getattr(self.specimen, "generation", 0)
+        view = optics.view
+        base = dataclasses.replace(optics, view=dataclasses.replace(view, center_um=(0.0, 0.0)),
+                                   beam_offset_px=(0.0, 0.0))
+        key = (base, self.config.tem_model, gen, tkey)
+        poptics, shift = self._padded_optics(optics)
+        fkey = (poptics.view, frozenset(TEM_LAYERS), gen, tkey)
+        with self._lock:
+            if any(k == key and _crop(raster, c0, view) is not None
+                   for k, c0, raster, _ in getattr(self, "_pans", None) or []):
+                return False
+            hit = self._fieldmaps.get(fkey)
+            done = threading.Event()
+            self._inflight = (optics, done)
+        try:
+            return self._prefetch(optics, key, view, poptics, shift, fkey, hit)
+        finally:
+            done.set()
+            self._inflight = None
+
+    def _prefetch(self, optics, key, view, poptics, shift, fkey, hit) -> bool:
+        from .tem import render_tem_raster
+
+        if hit is not None and getattr(hit[0], "generation", 0) == hit[2]:
+            fm, token = hit[0], hit[1]
+        else:
+            fm = self._rasterize(poptics.view, frozenset(TEM_LAYERS))
+            token = (next(self._tokens), getattr(fm, "generation", 0))
+        raster = render_tem_raster(fm, poptics, self.grains, self.crystallinity, self.config, self.seed,
+                                   self._prefetch_tem, token, shift)
+        with self._lock:
+            self._keep_field_map(self._fieldmaps, fkey, fm, token)
+            pans = getattr(self, "_pans", None) or []
+            pans.insert(1 if pans else 0, (key, view.center_um, raster, poptics.view))  # behind the live view
+            self._pans = pans[:max(1, self.config.pan_cache_size)]
+            self.prefetched += 1
+        return True
+
+    def _render(self, optics, *, frame_index: int = 0, scan_point=None, time_s: float = 0.0) -> np.ndarray:
         h, w = optics.output_shape
         if optics.beam_blanked:
             return np.zeros((h, w), np.float32)

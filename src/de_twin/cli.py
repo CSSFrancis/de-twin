@@ -52,7 +52,7 @@ def _build_twin(args):
     if getattr(args, "interactive", False):
         from .render import RenderConfig
 
-        render_config = RenderConfig(interactive=True)
+        render_config = RenderConfig(interactive=True, prefetch=True)
     return DigitalTwin(
         specimen=args.specimen,
         camera=args.camera,
