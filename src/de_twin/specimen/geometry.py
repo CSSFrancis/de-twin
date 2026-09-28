@@ -312,6 +312,15 @@ class JitteredLattice:
         cr = np.minimum(cr, r0 + max(H, (nr_n - 1) * s + 1))
         cx, cy = world(np.r_[cr, r1], np.r_[cc, c1])
         grid = self._grid(cx.min(), cx.max(), cy.min(), cy.max())
+        from . import raster_nb as _rnb
+
+        if _rnb.AVAILABLE:
+            SX, SY, _HH, imin, jmin, gw, x0, y0 = grid
+            out = np.empty((H, Wd), np.int32)
+            _rnb.block_labels(np.array([ctx.ox, ctx.oy, ctx.axc, ctx.ayc, ctx.axr, ctx.ayr]), ox, oy, r0, r1, c0,
+                              c1, s, nr_n, nc_n, SX, SY, float(x0), float(y0), float(self.cell_um), int(gw),
+                              self.jitter_frac <= 0.25, out)
+            return out, grid
         rows = np.arange(r0, r1)
         cols = np.arange(c0, c1)
         if s < 2 or H < 3 or Wd < 3:
@@ -417,6 +426,25 @@ def value_noise(seed: int, x, y):
     a = n00 + (n10 - n00) * tx
     b = n01 + (n11 - n01) * tx
     return a + (b - a) * ty
+
+
+def _separable_noise_tables(seed: int, xs, ys):
+    """``value_noise_separable``'s lattice table and per-row / per-column indices and
+    fractions (G, ix, tx, iy, ty), or None when it would fall back to ``value_noise``."""
+    xs = np.asarray(xs, np.float64)
+    ys = np.asarray(ys, np.float64)
+    fx, fy = np.floor(xs), np.floor(ys)
+    tx, ty = xs - fx, ys - fy
+    ix, iy = fx.astype(np.int64), fy.astype(np.int64)
+    imin, imax = int(ix.min()), int(ix.max()) + 1
+    jmin, jmax = int(iy.min()), int(iy.max()) + 1
+    s = np.uint64(int(seed) & ((1 << 64) - 1))
+    gi = np.arange(imin, imax + 1, dtype=np.int64)
+    gj = np.arange(jmin, jmax + 1, dtype=np.int64)
+    if gi.size * gj.size > 4 * xs.size * ys.size + 4096:
+        return None
+    G = uniform_from_hash(hash_seed(s, SeedKind.SUPPORT_FILM, gi[None, :], gj[:, None]))
+    return G, ix - imin, tx, iy - jmin, ty
 
 
 def value_noise_separable(seed: int, xs, ys):

@@ -179,6 +179,129 @@ def level_offset1(c, cov1, covh, covs, lvx, levels, table, offsets):
     return levels[row], interp1(c, table[row], offsets)
 
 
+# ------------------------------------------------------------------ jittered-lattice labels
+@njit()
+def _label1(x, y, SX, SY, x0, y0, L, gw, small):
+    """`JitteredLattice._label` at one point: the flat site-table index of the nearest site."""
+    u = (x - x0) * (1.0 / L)
+    v = (y - y0) * (1.0 / L)
+    ci = math.floor(u)
+    cj = math.floor(v)
+    if small:
+        if (u - ci) < 0.5:
+            ci -= 1.0
+        if (v - cj) < 0.5:
+            cj -= 1.0
+        n = 2
+    else:
+        ci -= 1.0
+        cj -= 1.0
+        n = 3
+    base = np.int32(cj * gw + ci)
+    xf = np.float32(u * L)
+    yf = np.float32(v * L)
+    best = np.float32(np.inf)
+    bf = base
+    for dj in range(n):
+        for di in range(n):
+            f = base + np.int32(dj * gw + di)
+            ddx = SX[f] - xf
+            ddy = SY[f] - yf
+            d2 = ddx * ddx + ddy * ddy
+            if d2 < best:
+                best = d2
+                bf = f
+    return bf
+
+
+@njit(parallel=True)
+def block_labels(W, offx, offy, r0, r1, c0, c1, s, nr_n, nc_n, SX, SY, x0, y0, L, gw, small, out):
+    """`JitteredLattice.block_labels`: labels on a node grid of stride ``s``; a block whose four
+    corner nodes agree takes that label, the others are labelled per pixel (s < 2: all)."""
+    H = r1 - r0
+    Wd = c1 - c0
+    coarse = s >= 2 and H >= 3 and Wd >= 3
+    Ln = np.empty((max(nr_n, 1), max(nc_n, 1)), np.int32)
+    if coarse:
+        for a in prange(nr_n):
+            r = float(r0 + s * a)
+            for b in range(nc_n):
+                c = float(c0 + s * b)
+                X = W[0] + W[2] * c + W[4] * r - offx
+                Y = W[1] + W[3] * c + W[5] * r - offy
+                Ln[a, b] = _label1(X, Y, SX, SY, x0, y0, L, gw, small)
+    for i in prange(H):
+        r = float(r0 + i)
+        for j in range(Wd):
+            if coarse:
+                a = i // s
+                b = j // s
+                lab = Ln[a, b]
+                if Ln[a + 1, b] == lab and Ln[a, b + 1] == lab and Ln[a + 1, b + 1] == lab:
+                    out[i, j] = lab
+                    continue
+            c = float(c0 + j)
+            X = W[0] + W[2] * c + W[4] * r - offx
+            Y = W[1] + W[3] * c + W[5] * r - offy
+            out[i, j] = _label1(X, Y, SX, SY, x0, y0, L, gw, small)
+
+
+# ------------------------------------------------------------------ support films
+@njit(parallel=True)
+def film_block(thick, material, area, nx, r0, r1, same, film_ok, film_nm, removed, has_removed, holey, LC, p,
+               hole_r2, ice, ahx, ahy, acx, acy, W, ice_grad, noise_mode, lodg, G, gix, gtx, giy, gty, narr,
+               film_mat):
+    """`Holder._film_block` over rows r0:r1: the support film's thickness added where the
+    placement area carries film (holey perforations, the ice meniscus and the film's
+    granularity noise), vacuum claimed by the film material."""
+    for r in prange(r0, r1):
+        for c in range(nx):
+            f = r * nx + c
+            if same >= 0:
+                ai = same
+            else:
+                a = area[f]
+                if a < 0:
+                    continue
+                ai = a
+                if not film_ok[ai]:
+                    continue
+                if has_removed and removed[(r - r0) * nx + c]:
+                    continue
+            t = film_nm[ai]
+            if holey:
+                lx = LC[0] + LC[1] * float(c) + LC[2] * float(r)
+                ly = LC[3] + LC[4] * float(c) + LC[5] * float(r)
+                hu = lx - math.floor(lx / p + 0.5) * p
+                hv = ly - math.floor(ly / p + 0.5) * p
+                if not (hu * hu + hv * hv >= hole_r2):
+                    continue
+            if ice:
+                X = W[0] + W[2] * float(c) + W[4] * float(r)
+                Y = W[1] + W[3] * float(c) + W[5] * float(r)
+                hx = ahx[ai] if ahx[ai] > 0 else 1.0
+                hy = ahy[ai] if ahy[ai] > 0 else 1.0
+                d = min(max(math.hypot((X - acx[ai]) / hx, (Y - acy[ai]) / hy), 0.0), 1.0)
+                t = t * (1.0 + ice_grad * d * d)
+            if noise_mode == 1:  # value_noise_separable: along y on the lattice rows, then x
+                i = r - r0
+                j0 = giy[i]
+                k = gix[c]
+                g0a = G[j0, k]
+                g1a = G[j0 + 1, k]
+                ra = g0a + (g1a - g0a) * gty[i]
+                g0b = G[j0, k + 1]
+                g1b = G[j0 + 1, k + 1]
+                rb = g0b + (g1b - g0b) * gty[i]
+                t = t + lodg * ((ra + (rb - ra) * gtx[c]) - 0.5)
+            elif noise_mode == 2:
+                t = t + lodg * (narr[(r - r0) * nx + c] - 0.5)
+            t = max(t, 0.0)
+            add_thickness1(thick, f, t)
+            if material[f] == 0:
+                material[f] = film_mat
+
+
 # ------------------------------------------------------------------ polycrystalline films
 @njit(parallel=True)
 def polycrystal_film(thick, material, grain, nx, ra, rb, c0, c1, W, O, S1, C1, N1, A1, S2, C2, N2, A2,
