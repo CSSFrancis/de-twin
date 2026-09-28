@@ -279,9 +279,11 @@ def test_a_crop_is_where_a_fresh_render_puts_the_view(dx_px, dy_px):
 
 # ------------------------------------------------------------------ strips
 @pytest.mark.parametrize("name", ["Dense Au on holey C", GRATING, "Negative stain on carbon"])
-def test_a_raster_in_parallel_strips_is_the_serial_raster(name):
-    from de_twin.specimen.model import _numba_threadsafe
+def test_a_raster_in_parallel_strips_is_the_serial_raster(name, monkeypatch):
+    from de_twin.specimen.model import Specimen, _numba_threadsafe
 
+    # strips are only used where NumPy work remains; force them here
+    monkeypatch.setattr(Specimen, "_numpy_work", lambda self, view, span: True)
     tw = _twin(name)
     req = tw.request()
     tw.flux(req)  # runs the numba kernels (the threading layer is known after)
@@ -424,3 +426,19 @@ def test_prefetch_is_off_by_default():
     tw.column.set("Magnification", 25000.0)
     tw.flux(req)
     assert getattr(tw, "_pf_future", None) is None
+
+
+def test_strips_only_where_numpy_work_remains():
+    """A specimen drawn entirely by numba kernels is rasterised whole (its kernels are
+    parallel); one with NumPy structures in strips. Decided per view, so a view is always
+    rasterised the same way."""
+    from de_twin.specimen import raster_nb
+
+    if not raster_nb.AVAILABLE:
+        pytest.skip("no numba")
+    au = _twin()
+    v = au.renderer._padded_optics(au.optics(au.request()))[0].view
+    assert not au.specimen._numpy_work(v, max(v.shape))
+    film = _twin("Au thin film 20 nm")
+    v = film.renderer._padded_optics(film.optics(film.request()))[0].view
+    assert film.specimen._numpy_work(v, max(v.shape))

@@ -39,6 +39,9 @@ class PolycrystalFilmStructure(StandardStructure):
         frac = min(1.0, 3.4 * self.groove_w / self.grain_nm)  # boundary area fraction (~3.4 w / d)
         return (self.t - 0.5 * self.groove * frac) * carbon_equivalent(self.base_material)
 
+    def numba_fill(self) -> bool:
+        return _rnb.AVAILABLE
+
     def fill(self, ctx, owner):
         if not _resolved(self.grain_nm / NM_PER_UM, ctx):
             return
@@ -58,6 +61,7 @@ class PolycrystalFilmStructure(StandardStructure):
             _rnb.polycrystal_film(ctx.thick, ctx.material, ctx.grain, ctx.nx, win[0], win[1], win[2], win[3], W, O,
                                   *p1, *p2, L, 0.2 * L, cseed, self.groove, self.grain_nm, self.groove_w,
                                   self.base_material, GRAINS_PER_MATERIAL)
+            ctx.stats["fast_fills"] = ctx.stats.get("fast_fills", 0) + 1
             return
         for B in _owner_pixels(ctx, owner):
             wx = B.lx + 0.2 * L * fbm(seed ^ 0xC1, B.lx, B.ly, L, 1)

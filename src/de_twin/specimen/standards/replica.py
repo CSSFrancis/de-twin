@@ -323,6 +323,9 @@ class ShadowedReplicaStructure(StandardStructure):
         h0 = h(x, y)
         return h0, (h(x + e, y) - h0) / (e * NM_PER_UM), (h(x, y + e) - h0) / (e * NM_PER_UM)
 
+    def numba_fill(self) -> bool:
+        return _rnb.AVAILABLE and (self.crumple_nm > 0 or self.rough_nm > 0)
+
     def _fill_fast(self, ctx, owner, seed, px, mean_c, flat, rough, islands, tile):
         """`fill` through the numba kernel (:func:`..raster_nb.replica_block`): the same
         per-pixel arithmetic, in parallel rows."""
@@ -440,6 +443,7 @@ class ShadowedReplicaStructure(StandardStructure):
         sin_e, cos_e, tan_e = math.sin(self.elev), math.cos(self.elev), math.tan(self.elev)
         if _rnb.AVAILABLE and (rough or self.crumple_nm > 0):
             self._fill_fast(ctx, owner, seed, px, mean_c, flat, rough, islands, tile)
+            ctx.stats["fast_fills"] = ctx.stats.get("fast_fills", 0) + 1
             return
         for B in _owner_pixels(ctx, owner):
             lx, ly = B.lx, B.ly

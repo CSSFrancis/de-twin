@@ -13,6 +13,7 @@ from ..state import HolderState
 from .fieldmap import OPTIONAL_LAYERS, FieldMap, GrainTable, ViewWindow
 from .materials import MaterialId
 from .options import CLEARS_POPULATION, NON_REGENERATING, SpecimenConfig
+from . import raster_nb as _raster_nb
 from .raster import RasterContext, rasterize_scene
 from .scene import Feature, Scene
 
@@ -266,7 +267,7 @@ class Specimen:
             drifted = dataclasses.replace(view, center_um=(view.center_um[0] - dx, view.center_um[1] - dy))
         span = int(span_px) if span_px else max(view.shape)
         n = max(1, min(int(threads), max(view.shape) // MIN_STRIP_ROWS))
-        if n > 1 and _numba_threadsafe():
+        if n > 1 and _numba_threadsafe() and self._numpy_work(drifted, span):
             fm = self._rasterize_strips(drifted, layers, span, n)
         else:
             ctx = self._rasterize_ctx(drifted, layers, span)
@@ -282,6 +283,33 @@ class Specimen:
                             lod_threshold_px=self.options.lod_threshold_px, span_px=span)
         rasterize_scene(self.scene, ctx, curtain_depth=min(max(self.options.curtain_depth, 0.0), 1.0))
         return ctx
+
+    def _numpy_work(self, view: ViewWindow, span: int) -> bool:
+        """Whether rasterising ``view`` runs NumPy code (a structure or primitive profile without
+        a numba kernel): only then are parallel strips worth their overhead, the numba kernels
+        being parallel already. A function of the view alone (the same scene query the raster
+        makes), so a view is always rasterised the same way."""
+        from types import SimpleNamespace
+
+        from .geometry import AABB, DUST_THRESHOLD_PX
+        from .raster import Profile
+
+        if not _raster_nb.AVAILABLE or self.scene.holder.kind not in ("mesh_grid", "waffle_grid", "none"):
+            return True
+        ny, nx = view.shape
+        px = float(view.pixel_um)
+        probe = SimpleNamespace(aabb=AABB(*view.bounds_um()), ny=ny, nx=nx, span_px=span, pixel_um=px,
+                                lod_threshold_px=self.options.lod_threshold_px,
+                                diameter_px=lambda r: 2.0 * np.asarray(r) / px)
+        P = self.scene.query(probe)
+        dpx = probe.diameter_px(P.bound_r)
+        draw = P.intersects(probe.aabb) & (dpx >= probe.lod_threshold_px) & (dpx >= DUST_THRESHOLD_PX)
+        if np.any(P.profile[draw] == Profile.CURTAIN):
+            return True
+        for i in np.flatnonzero(draw & (P.structure >= 0)):
+            if not P.structures[P.structure[i]].numba_fill():
+                return True
+        return False
 
     def _rasterize_strips(self, view: ViewWindow, layers: frozenset, span: int, n: int) -> FieldMap:
         """``n`` strips across the longer side of the view (rows of a tall view, columns of a

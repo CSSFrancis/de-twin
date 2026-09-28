@@ -617,6 +617,8 @@ def paint_drawn(ctx: RasterContext, P: PrimitiveSet, idx: np.ndarray, curtain_de
         for profile in np.unique(profiles[shapes == shape]):
             grp = idx[(shapes == shape) & (profiles == profile)]
             fast = _nb.AVAILABLE and int(profile) != Profile.CURTAIN
+            if not fast:
+                ctx.stats["numpy_prims"] = ctx.stats.get("numpy_prims", 0) + 1
             for sub, rows, cols, valid in iter_patches(ctx, P.xmin[grp], P.ymin[grp], P.xmax[grp], P.ymax[grp]):
                 sel = grp[sub]
                 if fast:

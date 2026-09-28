@@ -126,6 +126,10 @@ class Structure:
     def fill(self, ctx: RasterContext, owner: Owner) -> None:  # pragma: no cover - interface
         raise NotImplementedError
 
+    def numba_fill(self) -> bool:
+        """Whether `fill` runs as a numba kernel (see `Specimen._numpy_work`)."""
+        return False
+
 
 # ---------------------------------------------------------------------------------------------
 # Proteins (design 5.1)
@@ -161,6 +165,9 @@ class ProteinFieldStructure(Structure):
         self.patch = float(crystal_patch_fraction)
         self.dose = float(dose_sensitivity)
         self.time_dependent = self.dose > 0
+
+    def numba_fill(self) -> bool:
+        return _rnb.AVAILABLE and self.patch <= 0
 
     def _fill_fast(self, ctx, owner, blobs, fade, stain_nm):
         """`fill` without crystal patches through :func:`.raster_nb.protein_block`: the same
@@ -204,6 +211,7 @@ class ProteinFieldStructure(Structure):
         med, sig, stain = self.median, self.sigma, self.stain
         if _rnb.AVAILABLE and self.patch <= 0:
             self._fill_fast(ctx, owner, blobs, fade, stain_nm)
+            ctx.stats["fast_fills"] = ctx.stats.get("fast_fills", 0) + 1
             return
         for B in _owner_pixels(ctx, owner):
             flat = B.flat
