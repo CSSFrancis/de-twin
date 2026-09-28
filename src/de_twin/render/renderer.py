@@ -113,9 +113,9 @@ def _pad_len(n: int, margin: float, margin_px: int | None = None) -> int:
     return p
 
 
-#: Guard bands (pixels a side) the adaptive padding picks from: a few sizes, so a focus or
+#: Guard bands (pixels a side) the adaptive padding picks from: a few coarse sizes, so a focus or
 #: magnification change mostly keeps the padded raster's shape (and its field map).
-GUARD_LEVELS_PX = (32, 48, 64, 96, 128, 192, 256, 384, 512)
+GUARD_LEVELS_PX = (64, 128, 256, 512)
 
 
 #: The guard band holds all but this fraction of the objective's point-spread energy, with

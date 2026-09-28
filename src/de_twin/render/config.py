@@ -39,7 +39,7 @@ class RenderConfig:
     #: smaller raster and FFT near focus and at low magnification, a wider guard at large
     #: defocus and high magnification. ``pan_margin`` is then unused.
     adaptive_margin: bool = True
-    min_margin_px: int = 32
+    min_margin_px: int = 64
     max_margin_px: int = 256
     #: Padded rasters kept for cropping (a jump back to a recent place is a crop too).
     pan_cache_size: int = 6
