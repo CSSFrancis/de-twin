@@ -246,6 +246,49 @@ def block_labels(W, offx, offy, r0, r1, c0, c1, s, nr_n, nc_n, SX, SY, x0, y0, L
             out[i, j] = _label1(X, Y, SX, SY, x0, y0, L, gw, small)
 
 
+# ------------------------------------------------------------------ protein fields
+@njit(parallel=True)
+def protein_block(thick, material, grain, nx, ra, rb, c0, c1, W, O, labels, SX, SY, x0, y0, diam, stained,
+                  has_stain, thickness, fade, stain_nm, inner, maxr, mat_id, stain_mat):
+    """`ProteinFieldStructure.fill` for one row block (no crystal patches): each pixel's
+    nearest blob (``labels`` into the site table), its projected sphere, the negative-stain
+    rim, and the claim."""
+    for r in prange(ra, rb):
+        i = r - ra
+        for c in range(c0, c1):
+            X = W[0] + W[2] * float(c) + W[4] * float(r)
+            Y = W[1] + W[3] * float(c) + W[5] * float(r)
+            dx0 = X - O[0]
+            dy0 = Y - O[1]
+            lx = dx0 * O[2] - dy0 * O[3]
+            ly = dx0 * O[3] + dy0 * O[2]
+            if not (abs(lx) <= O[4] and abs(ly) <= O[5]):
+                continue
+            site = labels[i, c - c0]
+            dx = (X - x0) - np.float64(SX[site])
+            dy = (Y - y0) - np.float64(SY[site])
+            d2 = dx * dx + dy * dy
+            rad = 0.5 * diam[site] / 1000.0
+            m = min(rad, maxr)
+            if not d2 < m * m:
+                continue
+            rn = math.sqrt(d2) / rad
+            add = thickness * math.sqrt(max(0.0, 1.0 - rn * rn)) * fade
+            mat = mat_id
+            if has_stain and rn > inner and stained[site]:
+                add = add + stain_nm
+                mat = stain_mat
+            if not add > 0:
+                continue
+            f = r * nx + c
+            existing = np.float64(thick[f])
+            wasvac = material[f] == 0
+            add_thickness1(thick, f, add)
+            if wasvac or add >= existing:
+                grain[f] = -1
+                material[f] = mat
+
+
 # ------------------------------------------------------------------ support films
 @njit(parallel=True)
 def film_block(thick, material, area, nx, r0, r1, same, film_ok, film_nm, removed, has_removed, holey, LC, p,

@@ -25,6 +25,7 @@ from .geometry import (ANALYTIC_CELL_MIN_PX, NM_PER_UM, BlockHit, JitteredLattic
                        lognormal_from_hash, rough_ellipse_signed_dist, smoothstep, value_noise,
                        value_noise_separable, ROUGH_PEAK)
 from .materials import MaterialId, absorption_lengths_nm
+from . import raster_nb as _rnb
 from .raster import Owner, RasterContext, Shape
 
 U64 = np.uint64
@@ -161,6 +162,27 @@ class ProteinFieldStructure(Structure):
         self.dose = float(dose_sensitivity)
         self.time_dependent = self.dose > 0
 
+    def _fill_fast(self, ctx, owner, blobs, fade, stain_nm):
+        """`fill` without crystal patches through :func:`.raster_nb.protein_block`: the same
+        row blocks and site tables, the per-pixel work in one kernel."""
+        b = owner.bounds
+        win = ctx.window(b.xmin, b.ymin, b.xmax, b.ymax)
+        if win is None:
+            return
+        r0, r1, c0, c1 = win
+        W = np.array([ctx.ox, ctx.oy, ctx.axc, ctx.ayc, ctx.axr, ctx.ayr])
+        O = np.array([owner.cx, owner.cy, math.cos(-owner.rot), math.sin(-owner.rot), owner.rx, owner.ry])
+        med, sig, stain = self.median, self.sigma, self.stain
+        for a, bb in ctx.row_blocks(r0, r1, c1 - c0):
+            labels, grid = blobs.block_labels(ctx, a, bb, c0, c1)
+            SX, SY, HH, _, _, _, x0, y0 = grid
+            diam = np.asarray(lognormal_from_hash(HH, med, sig, PROTEIN_MIN_D_NM, PROTEIN_MAX_D_NM), np.float64)
+            stained = (uniform_from_hash(HH ^ STAIN_MIX) < stain) if stain > 0 else np.zeros(1, bool)
+            _rnb.protein_block(ctx.thick, ctx.material, ctx.grain, ctx.nx, a, bb, c0, c1, W, O,
+                               np.ascontiguousarray(labels, np.int32), SX, SY, float(x0), float(y0), diam,
+                               np.ascontiguousarray(stained), stain > 0, self.thickness, fade, stain_nm,
+                               NEG_STAIN_INNER, PROTEIN_MAX_R_UM, np.uint8(self.material), np.uint8(MaterialId.PLATINUM))
+
     def fill(self, ctx, owner):
         if self.density <= 0 or self.thickness <= 0:
             return
@@ -180,6 +202,9 @@ class ProteinFieldStructure(Structure):
         thr = U64(int(min(max(self.patch, 0.0), 1.0) * 256.0))
         stain_nm = NEG_STAIN_GAIN * self.thickness * fade
         med, sig, stain = self.median, self.sigma, self.stain
+        if _rnb.AVAILABLE and self.patch <= 0:
+            self._fill_fast(ctx, owner, blobs, fade, stain_nm)
+            return
         for B in _owner_pixels(ctx, owner):
             flat = B.flat
             hit = B.nearest(ctx, blobs)
