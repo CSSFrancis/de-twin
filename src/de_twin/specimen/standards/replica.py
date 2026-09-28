@@ -33,6 +33,8 @@ from ..fieldmap import grain_id_from_hash
 from ..geometry import NM_PER_UM, JitteredLattice
 from ..materials import MaterialId, absorption_lengths_nm
 from ..noise import FastLattice, cells, fbm
+from .. import raster_nb as _rnb
+from ..fieldmap import GRAINS_PER_MATERIAL
 from ..structures import _claim, _owner_pixels, _resolved
 from .common import StandardStructure
 
@@ -321,6 +323,92 @@ class ShadowedReplicaStructure(StandardStructure):
         h0 = h(x, y)
         return h0, (h(x + e, y) - h0) / (e * NM_PER_UM), (h(x, y + e) - h0) / (e * NM_PER_UM)
 
+    def _fill_fast(self, ctx, owner, seed, px, mean_c, flat, rough, islands, tile):
+        """`fill` through the numba kernel (:func:`..raster_nb.replica_block`): the same
+        per-pixel arithmetic, in parallel rows."""
+        from ..noise import fbm_params
+        from ..stamps import LABYRINTH, _OFFSETS, _coverage_table, period_px_cached, phase_tiles
+
+        b = owner.bounds
+        win = ctx.window(b.xmin, b.ymin, b.xmax, b.ymax)
+        if win is None:
+            return
+        r0, r1, c0, c1 = win
+        relief = self.relief
+        specs = [(seed ^ 0x51, relief.wavy_um if relief else 1.0, 2, 0.5),
+                 (seed ^ 0x52, relief.wavy_um if relief else 1.0, 2, 0.5),
+                 (seed ^ 0x61, relief.edge_corr if relief else 1.0, 2, 0.5),
+                 (seed ^ 0x62, relief.edge_corr if relief else 1.0, 2, 0.5),
+                 (seed ^ 0x93, self.crumple_um, 2, 0.5), (seed ^ 0x91, self.rough_um, 4, 0.6)]
+        FS = np.zeros((6, 4), np.uint64)
+        FC, FSN, FA = (np.zeros((6, 4)) for _ in range(3))
+        FN = np.zeros(6, np.int64)
+        for k, (sd, sc, octs, gain) in enumerate(specs):
+            a, c, sn, am = fbm_params(sd, sc, octs, gain)
+            FS[k, :octs], FC[k, :octs], FSN[k, :octs], FA[k, :octs], FN[k] = a, c, sn, am, octs
+        has_relief = tile is not None
+        spheres = self.spheres is not None
+        FL = np.array([has_relief, self.crumple_nm > 0, rough and self.rough_nm > 0, spheres, self.spheres_shadowed,
+                       self.metal_nm > 0, islands, bool(relief and relief.wavy > 0),
+                       bool(relief and relief.edge > 0)], np.bool_)
+        R = np.array([relief.wavy if relief else 0.0, relief.edge if relief else 0.0,
+                      relief.P if relief else 1.0, WAVY_ACROSS])
+        stack = (np.stack([tile.h, tile.gx, tile.gy, tile.lit]) if has_relief
+                 else np.zeros((4, 1, 1), np.float32))
+        TX = np.array([self.crumple_nm, self.rough_nm, 0.002])
+        ux, uy = self.u
+        D = np.array([self.metal_nm, math.sin(self.elev), math.cos(self.elev), ux, uy, flat, self.shadow_leak,
+                      self.base, mean_c, carbon_equivalent(self.sphere_material)])
+        M = np.array([self.metal, self.sphere_material, int(MaterialId.AMORPHOUS_CARBON), GRAINS_PER_MATERIAL],
+                     np.int64)
+        tiles, cov = phase_tiles()
+        half = int(np.argmin(np.abs(cov - LABYRINTH)))
+        levels, table = _coverage_table()
+        feat = self.island_nm / NM_PER_UM
+        I = np.array([self.coverage, period_px_cached() / feat, 1.0 / (12.0 * feat), 6.0,
+                      self.grain_nm / NM_PER_UM, cov[1], cov[half]])
+        fseed = np.uint64(int(seed) & 0xFFFFFFFFFFFFFFFF)
+        cseed = np.uint64(((int(seed) ^ 0x1F) * 0xC2B2AE3D27D4EB4F) & 0xFFFFFFFFFFFFFFFF)
+        covs = np.ascontiguousarray(cov[1:half + 1], np.float64)
+        lvx = np.arange(1, half + 1, dtype=np.float64)
+        W = np.array([ctx.ox, ctx.oy, ctx.axc, ctx.ayc, ctx.axr, ctx.ayr])
+        O = np.array([owner.cx, owner.cy, math.cos(-owner.rot), math.sin(-owner.rot), owner.rx, owner.ry])
+        new_under = ctx.under_thick is None
+        uthick = np.zeros(ctx.npix, np.float32) if new_under else ctx.under_thick
+        umat = np.zeros(ctx.npix, np.uint8) if new_under else ctx.under_material
+        used = np.zeros(1, np.uint8)
+        blocks = ([(a, bb) for a, bb in ctx.row_blocks(r0, r1, c1 - c0)] if spheres else [(r0, r1)])
+        empty = np.zeros(0)
+        for a, bb in blocks:
+            if spheres:  # the spheres of the block's pixels, as the NumPy fill builds them per block
+                rows = np.arange(a, bb)[:, None]
+                cols = np.arange(c0, c1)[None, :]
+                X, Y = ctx.world(rows, cols)
+                dx, dy = X - owner.cx, Y - owner.cy
+                lx = dx * O[2] - dy * O[3]
+                ly = dx * O[3] + dy * O[2]
+                m = (np.abs(lx) <= owner.rx) & (np.abs(ly) <= owner.ry)
+                if not m.any():
+                    continue
+                ss = self._sphere_set(seed, lx[m], ly[m])
+                ce, se = math.cos(self.elev), math.sin(self.elev)
+                rmax = float(ss.r.max()) if ss.r.size else 0.0
+                reach = 2.0 * rmax / max(math.tan(self.elev), 1e-3) + rmax
+                step = max(px, 1.0 / NM_PER_UM)
+                SP = np.array([ss.x0, ss.y0, 1.0 / ss.bin, step, step * NM_PER_UM, ux * ce, uy * ce, se, reach,
+                               0.5 * ss.bin, SHADOW_PENUMBRA_RAD])
+                sarr = (ss.cx, ss.cy, ss.r, ss.start, ss.members)
+                SN = np.array([ss.nx, ss.ny], np.int64)
+            else:
+                SP = np.zeros(11)
+                sarr = (empty, empty, empty, np.zeros(2, np.int64), np.zeros(0, np.int64))
+                SN = np.ones(2, np.int64)
+            _rnb.replica_block(ctx.thick, ctx.material, ctx.grain, uthick, umat, used, ctx.nx, a, bb, c0, c1, W, O,
+                               FL, R, stack, FS, FC, FSN, FA, FN, TX, *sarr, SP, SN, D, M, I, tiles, fseed, cseed,
+                               covs, lvx, levels, table, _OFFSETS)
+        if new_under and used[0]:
+            ctx.under_material, ctx.under_thick = umat, uthick
+
     def fill(self, ctx, owner):
         seed = int(hash_seed(owner.seed, SeedKind.STRUCTURE, 0)) & 0xFFFFFFFF
         px = ctx.pixel_um
@@ -336,6 +424,9 @@ class ShadowedReplicaStructure(StandardStructure):
         tile = self.tile()
         ux, uy = self.u
         sin_e, cos_e, tan_e = math.sin(self.elev), math.cos(self.elev), math.tan(self.elev)
+        if _rnb.AVAILABLE and (rough or self.crumple_nm > 0):
+            self._fill_fast(ctx, owner, seed, px, mean_c, flat, rough, islands, tile)
+            return
         for B in _owner_pixels(ctx, owner):
             lx, ly = B.lx, B.ly
             # the relief (looked up) and the replica's own crumpled surface (noise)

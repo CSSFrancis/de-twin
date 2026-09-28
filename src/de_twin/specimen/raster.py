@@ -27,6 +27,7 @@ from typing import Optional
 import numpy as np
 
 from ..hashing import SeedKind, hash_seed, uniform_from_hash
+from . import raster_nb as _nb
 from .fieldmap import LAYER_DESCAN, LAYER_STRAIN, FieldMap, GrainTable, ViewWindow
 from .geometry import AABB, DUST_THRESHOLD_PX, ROUGH_PEAK, rough_rmod
 
@@ -570,6 +571,13 @@ def paint_large(ctx: RasterContext, P: PrimitiveSet, i: int, curtain_depth: floa
     if win is None:
         return
     co = _affine_coeffs(ctx, P, i)
+    profile = int(P.profile[i])
+    if _nb.AVAILABLE and profile != Profile.CURTAIN:
+        _nb.paint_large(ctx.thick, ctx.material, ctx.grain, ctx.nx, win[0], win[1], np.array(co, np.float64),
+                        shape == Shape.RECT, float(P.inner_frac[i]) ** 2 if shape == Shape.RING else -1.0,
+                        profile, float(P.thickness[i]), np.uint8(P.material[i]), int(P.grain[i]),
+                        bool(P.layer[i] != Layer.SUPPORT_FILM))
+        return
     sel = np.array([i])
     step = max(1, max_px // max(1, win[3] - win[2]))
     for a in range(win[0], win[1], step):
