@@ -29,7 +29,7 @@ import numpy as np
 from ..hashing import SeedKind, hash_seed, uniform_from_hash
 from . import raster_nb as _nb
 from .fieldmap import LAYER_DESCAN, LAYER_STRAIN, FieldMap, GrainTable, ViewWindow
-from .geometry import AABB, DUST_THRESHOLD_PX, ROUGH_PEAK, rough_rmod
+from .geometry import AABB, DUST_THRESHOLD_PX, ROUGH_PEAK, ROUGH_PERIOD, rough_rmod
 
 
 class Shape(IntEnum):
@@ -616,8 +616,12 @@ def paint_drawn(ctx: RasterContext, P: PrimitiveSet, idx: np.ndarray, curtain_de
     for shape in np.unique(shapes):
         for profile in np.unique(profiles[shapes == shape]):
             grp = idx[(shapes == shape) & (profiles == profile)]
+            fast = _nb.AVAILABLE and int(profile) != Profile.CURTAIN
             for sub, rows, cols, valid in iter_patches(ctx, P.xmin[grp], P.ymin[grp], P.xmax[grp], P.ymax[grp]):
                 sel = grp[sub]
+                if fast:
+                    _paint_patch_fast(ctx, P, sel, rows, cols, valid, int(shape), int(profile))
+                    continue
                 lx, ly = _local_frame(ctx, P, sel, rows, cols)
                 r2 = lx * lx + ly * ly
                 inside = _inside(P, sel, int(shape), lx, ly, r2) & valid
@@ -632,6 +636,33 @@ def paint_drawn(ctx: RasterContext, P: PrimitiveSet, idx: np.ndarray, curtain_de
                 overwrite = P.layer[sel] != Layer.SUPPORT_FILM
                 ctx.apply(flat, np.broadcast_to(t, m.shape)[m], P.material[sel][owner],
                           P.grain[sel][owner], overwrite=overwrite[owner])
+
+
+def _paint_patch_fast(ctx, P, sel, rows, cols, valid, shape: int, profile: int):
+    """One patch of `paint_drawn` through :func:`.raster_nb.paint_patch`."""
+    n = len(sel)
+    ang = -P.rot[sel]
+    c = np.cos(ang)
+    s = np.sin(ang)
+    rx = P.rx[sel]
+    ry = P.ry[sel]
+    irx = np.where(rx > 0, 1.0 / np.where(rx > 0, rx, 1.0), 0.0)
+    iry = np.where(ry > 0, 1.0 / np.where(ry > 0, ry, 1.0), 0.0)
+    dx0 = ctx.ox - P.cx[sel]
+    dy0 = ctx.oy - P.cy[sel]
+    co = np.stack([irx * (c * dx0 - s * dy0), irx * (c * ctx.axc - s * ctx.ayc), irx * (c * ctx.axr - s * ctx.ayr),
+                   iry * (s * dx0 + c * dy0), iry * (s * ctx.axc + c * ctx.ayc), iry * (s * ctx.axr + c * ctx.ayr)], 1)
+    vb = np.broadcast_to(valid, (n, rows.shape[1], cols.shape[2]))
+    hs = vb[:, :, 0].sum(1).astype(np.int64)
+    ws = vb[:, 0, :].sum(1).astype(np.int64)
+    r0s = np.ascontiguousarray(rows[:, 0, 0], np.int64)
+    c0s = np.ascontiguousarray(cols[:, 0, 0], np.int64)
+    fj = np.ascontiguousarray(P.facet_j[sel], np.float64).reshape(n, -1)
+    _nb.paint_patch(ctx, np.ascontiguousarray(co), r0s, c0s, hs, ws, shape, profile,
+                    P.thickness[sel].astype(np.float64), P.inner_frac[sel].astype(np.float64),
+                    P.facet_n[sel].astype(np.int64), fj, P.material[sel].astype(np.uint8),
+                    P.grain[sel].astype(np.int32), P.layer[sel] != Layer.SUPPORT_FILM, float(ROUGH_PERIOD),
+                    (1.0 - ROUGH_PEAK) ** 2, (1.0 + ROUGH_PEAK) ** 2)
 
 
 def paint_dust(ctx: RasterContext, P: PrimitiveSet, idx: np.ndarray):
