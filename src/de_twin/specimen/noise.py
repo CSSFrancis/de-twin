@@ -73,6 +73,40 @@ def fbm1(xv, yv, seeds, cs, sn, amps):
     return acc
 
 
+@_njit()
+def fbm1_grad(xv, yv, seeds, cs, sn, amps):
+    """`fbm1` and its analytic gradient (d/dx, d/dy, per unit of x and y): the same octaves,
+    the smoothstep's derivative instead of finite differences (one evaluation, not three)."""
+    acc = 0.0
+    gx = 0.0
+    gy = 0.0
+    for o in range(seeds.size):
+        u = xv * cs[o] - yv * sn[o]
+        v = xv * sn[o] + yv * cs[o]
+        fu, fv = math.floor(u), math.floor(v)
+        tu, tv = u - fu, v - fv
+        su = tu * tu * (3.0 - 2.0 * tu)
+        sv = tv * tv * (3.0 - 2.0 * tv)
+        du = 6.0 * tu * (1.0 - tu)
+        dv = 6.0 * tv * (1.0 - tv)
+        i, j = np.int64(fu), np.int64(fv)
+        s = seeds[o]
+        a = _corner(s, i, j)
+        b = _corner(s, i + 1, j)
+        c = _corner(s, i, j + 1)
+        d = _corner(s, i + 1, j + 1)
+        ab = a + (b - a) * su
+        cd = c + (d - c) * su
+        acc += amps[o] * (2.0 * (ab + (cd - ab) * sv) - 1.0)
+        k = a - b - c + d
+        dVu = ((b - a) + k * sv) * du
+        dVv = ((c - a) + k * su) * dv
+        # u = x cs - y sn, v = x sn + y cs
+        gx += 2.0 * amps[o] * (dVu * cs[o] + dVv * sn[o])
+        gy += 2.0 * amps[o] * (-dVu * sn[o] + dVv * cs[o])
+    return acc, gx, gy
+
+
 @_njit(parallel=True)
 def _fbm_nb(x, y, out, seeds, cs, sn, amps):
     for k in _prange(x.size):

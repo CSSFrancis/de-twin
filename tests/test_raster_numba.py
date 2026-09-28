@@ -24,6 +24,11 @@ SPECIMENS = [
 
 
 def _raster(tw, view, fast, monkeypatch):
+    from de_twin.specimen.standards import replica
+
+    # the replica's exact arithmetic (finite-difference slope, per-pixel noise); its fast mode
+    # is checked statistically in test_calibration_standards / below
+    monkeypatch.setattr(replica, "ANALYTIC_SLOPE", False)
     monkeypatch.setattr(raster_nb, "AVAILABLE", fast)
     return tw.specimen.rasterize(view)
 
@@ -61,3 +66,38 @@ def test_a_rotated_tilted_view(monkeypatch):
     np.testing.assert_array_equal(new.material_id, ref.material_id)
     np.testing.assert_array_equal(new.grain_id, ref.grain_id)
     np.testing.assert_allclose(new.thickness_nm, ref.thickness_nm, rtol=1e-6, atol=1e-5)
+
+
+@pytest.mark.skipif(not raster_nb.AVAILABLE, reason="no numba")
+@pytest.mark.parametrize("name", ["Ted Pella 607 - 2160 l/mm grating replica (waffle)",
+                                  "Ted Pella 628-B - Gold-shadowed latex"])
+@pytest.mark.parametrize("mag", [25000.0, 150000.0])
+def test_the_fast_replica_is_statistically_the_exact_one(name, mag, monkeypatch):
+    """The fast replica (analytic texture slope, node grids for the smooth noise, the island
+    film's quick lookups) against the exact arithmetic: thickness RMS and its spectrum's slope
+    within 2 %, the fields close pixel by pixel."""
+    import dataclasses
+
+    from de_twin.specimen.standards import replica
+
+    tw = DigitalTwin(name, camera="DESim", clock=ManualClock(), seed=4)
+    tw.column.set("Magnification", mag)
+    view = dataclasses.replace(tw.optics(tw.request()).view, shape=(512, 512))
+    out = []
+    for fast in (False, True):
+        monkeypatch.setattr(replica, "ANALYTIC_SLOPE", fast)
+        out.append(tw.specimen.rasterize(view).thickness_nm.astype(float))
+    a, b = out
+
+    def slope(t):
+        t = t - t.mean()
+        F = np.abs(np.fft.fft2(t * np.outer(np.hanning(512), np.hanning(512)))) ** 2
+        k = (np.hypot(*np.meshgrid(np.fft.fftfreq(512), np.fft.fftfreq(512))) * 512).astype(int)
+        rad = np.bincount(k.ravel(), F.ravel()) / np.maximum(np.bincount(k.ravel()), 1)
+        ks = np.arange(10, 170)
+        return np.polyfit(np.log(ks), np.log(rad[ks]), 1)[0]
+
+    assert b.std() == pytest.approx(a.std(), rel=0.02)
+    assert slope(b) == pytest.approx(slope(a), rel=0.02)
+    # pixel by pixel close (island edges and the 3x3 grain search move a few pixels)
+    assert np.corrcoef(a.ravel(), b.ravel())[0, 1] > 0.85

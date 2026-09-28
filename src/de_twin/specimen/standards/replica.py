@@ -32,7 +32,7 @@ from ...hashing import SeedKind, hash_seed, normal_from_hash, splitmix64, unifor
 from ..fieldmap import grain_id_from_hash
 from ..geometry import NM_PER_UM, JitteredLattice
 from ..materials import MaterialId, absorption_lengths_nm
-from ..noise import FastLattice, cells, fbm
+from ..noise import LACUNARITY, FastLattice, cells, fbm
 from .. import raster_nb as _rnb
 from ..fieldmap import GRAINS_PER_MATERIAL
 from ..structures import _claim, _owner_pixels, _resolved
@@ -66,6 +66,34 @@ def island_film(seed: int, X_um, Y_um, deposit_nm, mean_deposit_nm: float, islan
         _, _, h = cells(seed ^ 0x1F, X_um[inside] / G, Y_um[inside] / G, 0.0)
         grain = grain_id_from_hash(metal, h)
     return inside, t, grain
+
+
+_LEVEL_LUT: list = []
+
+
+def _lattice_index(ctx, r: int, c: int) -> tuple[int, int]:
+    """(column, row) of raster pixel (r, c) on the view's world-fixed pixel lattice (the
+    renderer's `_lattice`: pixel units along the view's own axes from the world origin)."""
+    view = ctx.view
+    x, y = ctx.world(float(r), float(c))
+    x, y = float(x), float(y)
+    rot = float(getattr(view, "rotation_rad", 0.0))
+    if rot:
+        cr, sr = math.cos(rot), math.sin(rot)
+        x, y = cr * x + sr * y, -sr * x + cr * y
+    sx = -1.0 if getattr(view, "flip_x", False) else 1.0
+    sy = -1.0 if getattr(view, "flip_y", False) else 1.0
+    lc = sx * x * max(view.cos_beta, 0.1) / view.pixel_um
+    lr = sy * y * max(view.cos_alpha, 0.1) / view.pixel_um
+    return math.floor(lc + 1e-6), math.floor(lr + 1e-6)
+
+
+def _level_lut(cov, half, levels, table):
+    """`stamps._level_offset` on a fine coverage grid (built once: 8192 x 3 floats)."""
+    if not _LEVEL_LUT:
+        _LEVEL_LUT.append(_rnb.level_offset_lut(cov, half, levels, table, __import__(
+            "de_twin.specimen.stamps", fromlist=["_OFFSETS"])._OFFSETS))
+    return _LEVEL_LUT[0]
 
 
 def carbon_equivalent(metal: int, ht_kv: float = 200.0) -> float:
@@ -208,6 +236,14 @@ class LatexSpheres:
 
 
 # ------------------------------------------------------------------ the replica structure
+#: The replica texture's slope (which sets the angled metal deposit) from the noise's own
+#: derivative, one evaluation per pixel; False: finite differences over 2 nm, three (the
+#: NumPy fill's arithmetic).
+ANALYTIC_SLOPE = True
+#: In that mode the replica's aperiodic noise is evaluated on node grids this many nodes per
+#: wavelength of each field's finest octave and interpolated per pixel.
+NODES_PER_WAVELENGTH = 12
+
 #: Angular size of the evaporation source seen from the specimen (radians): the penumbra.
 SHADOW_PENUMBRA_RAD = math.radians(4.0)
 
@@ -353,7 +389,7 @@ class ShadowedReplicaStructure(StandardStructure):
         spheres = self.spheres is not None
         FL = np.array([has_relief, self.crumple_nm > 0, rough and self.rough_nm > 0, spheres, self.spheres_shadowed,
                        self.metal_nm > 0, islands, bool(relief and relief.wavy > 0),
-                       bool(relief and relief.edge > 0)], np.bool_)
+                       bool(relief and relief.edge > 0), ANALYTIC_SLOPE], np.bool_)
         R = np.array([relief.wavy if relief else 0.0, relief.edge if relief else 0.0,
                       relief.P if relief else 1.0, WAVY_ACROSS])
         stack = (np.stack([tile.h, tile.gx, tile.gy, tile.lit]) if has_relief
@@ -420,9 +456,30 @@ class ShadowedReplicaStructure(StandardStructure):
         cat = (lambda xs, dt: np.ascontiguousarray(np.concatenate(xs), dt) if xs else np.zeros(1, dt))
         sarr = (cat(cxs, np.float64), cat(cys, np.float64), cat(rs, np.float64), cat(starts, np.int64),
                 cat(members, np.int64))
+        # node grids of the aperiodic noise (analytic mode): strides a fraction of each field's
+        # finest octave, in raster pixels (1: every pixel, as at low magnification)
+        finest = [((relief.wavy_um if relief else 1.0) / LACUNARITY, bool(FL[7])),
+                  ((relief.edge_corr if relief else 1.0) / LACUNARITY, bool(FL[8])),
+                  (self.crumple_um / LACUNARITY, bool(FL[1])),
+                  (self.rough_um / LACUNARITY ** 3, bool(FL[2]))]
+        ST = np.array([max(1, min(32, int(sc / (px * NODES_PER_WAVELENGTH)))) if (on and ANALYTIC_SLOPE) else 1
+                       for sc, on in finest], np.int64)
+        # the node lattice is world-fixed: raster pixel (r0, c0) is lattice pixel (gr, gc) of the
+        # view's pixel lattice, and nodes sit on its multiples of s, so the pieces of a raster
+        # (strips, the part a stage move brings in) interpolate the same nodes as the whole
+        gc, gr = _lattice_index(ctx, r0, c0)
+        OFF = np.array([[gr - (gr // s) * s, gc - (gc // s) * s] for s in ST], np.int64)
+        nodes = []
+        for q, (s, (_, on)) in enumerate(zip(ST, finest)):
+            shape = ((r1 - 1 - r0 + OFF[q, 0]) // s + 2, (c1 - 1 - c0 + OFF[q, 1]) // s + 2, 2 if q < 2 else 3) \
+                if (on and ANALYTIC_SLOPE and s > 1) else (1, 1, 3)  # stride 1: evaluated per pixel
+            nodes.append(np.zeros(shape))
+        if ANALYTIC_SLOPE:
+            _rnb.replica_nodes(r0, r1, c0, c1, W, O, FS, FC, FSN, FA, FN, R, TX,
+                               ST, OFF, *nodes)
         _rnb.replica_block(ctx.thick, ctx.material, ctx.grain, uthick, umat, used, ctx.nx, r0, r1, c0, c1, W, O,
                            FL, R, stack, FS, FC, FSN, FA, FN, TX, *sarr, SPB, SNB, BSO, bstep, D, M, I, tiles, fseed,
-                           cseed, covs, lvx, levels, table, _OFFSETS)
+                           cseed, covs, lvx, levels, table, _OFFSETS, ST, OFF, *nodes, *_level_lut(cov, half, levels, table))
         if new_under and used[0]:
             ctx.under_material, ctx.under_thick = umat, uthick
 
