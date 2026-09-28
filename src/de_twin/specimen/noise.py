@@ -166,40 +166,43 @@ def nearest_site_hash(xv, yv, seed, jitter):
     return bh
 
 
+@_njit()
+def cell1(xv, yv, seed, merge, jitter):
+    """`cells` at one point: (distance to the nearest site, gap, the site's hash)."""
+    ci, cj = np.int64(math.floor(xv)), np.int64(math.floor(yv))
+    best, bx, by = 1e30, 0.0, 0.0
+    bh = np.uint64(0)
+    for di in range(-2, 3):
+        for dj in range(-2, 3):
+            sx, sy, h = _site(seed, ci + di, cj + dj, jitter)
+            d = (sx - xv) ** 2 + (sy - yv) ** 2
+            if d < best:
+                best, bx, by, bh = d, sx, sy, h
+    # distance to the nearest bisector with a neighbour the island has not merged with
+    gap = 1e30
+    for di in range(-2, 3):
+        for dj in range(-2, 3):
+            sx, sy, h = _site(seed, ci + di, cj + dj, jitter)
+            if h == bh:
+                continue
+            mx, my = sx - bx, sy - by
+            L = math.sqrt(mx * mx + my * my)
+            if L < 1e-9:
+                continue
+            pair = (bh ^ h) * np.uint64(0x9E3779B97F4A7C15)
+            u = float(pair >> np.uint64(40)) / 16777216.0
+            if u < merge:
+                continue  # the two islands have coalesced
+            t = ((xv - 0.5 * (sx + bx)) * mx + (yv - 0.5 * (sy + by)) * my) / L
+            if -t < gap:
+                gap = -t
+    return math.sqrt(best), gap, bh
+
+
 @_njit(parallel=True)
 def _cells_nb(x, y, seed, merge, jitter, d1o, gapo, ho):
     for k in _prange(x.size):
-        xv, yv = x[k], y[k]
-        ci, cj = np.int64(math.floor(xv)), np.int64(math.floor(yv))
-        best, bx, by = 1e30, 0.0, 0.0
-        bh = np.uint64(0)
-        for di in range(-2, 3):
-            for dj in range(-2, 3):
-                sx, sy, h = _site(seed, ci + di, cj + dj, jitter)
-                d = (sx - xv) ** 2 + (sy - yv) ** 2
-                if d < best:
-                    best, bx, by, bh = d, sx, sy, h
-        # distance to the nearest bisector with a neighbour the island has not merged with
-        gap = 1e30
-        for di in range(-2, 3):
-            for dj in range(-2, 3):
-                sx, sy, h = _site(seed, ci + di, cj + dj, jitter)
-                if h == bh:
-                    continue
-                mx, my = sx - bx, sy - by
-                L = math.sqrt(mx * mx + my * my)
-                if L < 1e-9:
-                    continue
-                pair = (bh ^ h) * np.uint64(0x9E3779B97F4A7C15)
-                u = float(pair >> np.uint64(40)) / 16777216.0
-                if u < merge[k]:
-                    continue  # the two islands have coalesced
-                t = ((xv - 0.5 * (sx + bx)) * mx + (yv - 0.5 * (sy + by)) * my) / L
-                if -t < gap:
-                    gap = -t
-        d1o[k] = math.sqrt(best)
-        gapo[k] = gap
-        ho[k] = bh
+        d1o[k], gapo[k], ho[k] = cell1(x[k], y[k], seed, merge[k], jitter)
 
 
 def cells(seed: int, x, y, merge) -> tuple:

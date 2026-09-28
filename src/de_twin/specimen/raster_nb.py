@@ -179,9 +179,34 @@ def level_offset1(c, cov1, covh, covs, lvx, levels, table, offsets):
     return levels[row], interp1(c, table[row], offsets)
 
 
+# ------------------------------------------------------------------ polycrystalline films
+@njit(parallel=True)
+def polycrystal_film(thick, material, grain, nx, ra, rb, c0, c1, W, O, S1, C1, N1, A1, S2, C2, N2, A2,
+                     L, amp, cseed, groove, grain_nm, groove_w, base_material, gpm):
+    """`PolycrystalFilmStructure.fill`: warped cells, grooved boundaries, one grain each."""
+    for r in prange(ra, rb):
+        for c in range(c0, c1):
+            X = W[0] + W[2] * float(c) + W[4] * float(r)
+            Y = W[1] + W[3] * float(c) + W[5] * float(r)
+            dx = X - O[0]
+            dy = Y - O[1]
+            lx = dx * O[2] - dy * O[3]
+            ly = dx * O[3] + dy * O[2]
+            if not (abs(lx) <= O[4] and abs(ly) <= O[5]):
+                continue
+            f = r * nx + c
+            wx = lx + amp * fbm1(lx, ly, S1, C1, N1, A1)
+            wy = ly + amp * fbm1(lx, ly, S2, C2, N2, A2)
+            _, gap, h = cell1(wx / L, wy / L, cseed, 0.0, 0.8)
+            g = gap * grain_nm / groove_w
+            add_thickness1(thick, f, -(groove * math.exp(-0.5 * (g * g))))
+            grain[f] = grain_from_hash(base_material, h, gpm)
+            material[f] = base_material
+
+
 # ------------------------------------------------------------------ shadowed replicas
 if AVAILABLE:
-    from .noise import fbm1, nearest_site_hash
+    from .noise import cell1, fbm1, nearest_site_hash
     from .spheres import occlusion1, top_chord1
     from .stamps import field1, periodic1
 
