@@ -325,3 +325,40 @@ def test_a_rotated_view_is_rasterised_whole():
     assert r.rasters_reused == 0 and "strips" not in tw.specimen.last_stats
     ref = tw.specimen.rasterize(fm.view)
     np.testing.assert_array_equal(fm.grain_id, ref.grain_id)
+
+
+@pytest.mark.parametrize("name", ["Dense Au on holey C", GRATING])
+def test_the_bragg_table_is_the_exact_excitation(name):
+    """Every (grain, thickness bin) entry of a material's table matches the exact (scipy sici)
+    evaluation to 1e-6 relative."""
+    tw = DigitalTwin(name, camera="DESim", clock=ManualClock(), seed=1)
+    r = tw.renderer
+    o = tw.optics(tw.request())
+    fm = r.field_map(o)[0]
+    g = fm.grain_id[fm.grain_id >= 0]
+    mid = int(np.bincount(g // GRAINS_PER_MATERIAL).argmax())
+    lib = library_for(mid, r.config.max_g_inv_nm)
+    memo = tem._BraggMemo(r.grains)
+    memo._g_obj = 0.0
+    table = memo.table(lib, r.grains, mid, o)
+    rng = np.random.default_rng(0)
+    gids = mid * GRAINS_PER_MATERIAL + rng.integers(0, GRAINS_PER_MATERIAL, 400)
+    tbs = rng.integers(0, table.shape[1], 400)
+    exact = memo.values(lib, r.grains, gids, np.arange(400), tbs, o)
+    np.testing.assert_allclose(table[gids - mid * GRAINS_PER_MATERIAL, tbs], exact, rtol=1e-6, atol=1e-12)
+
+
+def test_a_tilt_series_keeps_its_tables():
+    tw = _twin()
+    req = tw.request()
+    tw.flux(req)
+    tem._BRAGG_MEMOS.clear()
+    for a in (0.5, 1.0):
+        tw.column.move_stage(alpha=a)
+        tw.flux(req)
+    kept = dict(tem._BRAGG_MEMOS)
+    assert len(kept) == 2
+    tw.column.move_stage(alpha=0.5)
+    tw.renderer.invalidate()  # not a crop: the frame is rendered again, the table is reused
+    tw.flux(req)
+    assert dict(tem._BRAGG_MEMOS) == kept, "a return to a tilt reuses its table"

@@ -93,6 +93,42 @@ class _BraggMemo:
         self.grains = grains
         self.geom: dict = {}
         self.pair: dict = {}
+        self._table = None
+        self.min_gxy = 0.0
+
+    def _ensure_geometry(self, lib, grains, gids, optics) -> None:
+        new_g = [int(g) for g in gids if int(g) not in self.geom]
+        if not new_g:
+            return
+        m = effective_matrices(grains.matrices[np.asarray(new_g)], optics.alpha_rad, optics.beta_rad)
+
+        def geo(r0, r1):
+            own, idx, gx, gy, s = lib.geometry(m[r0:r1], optics.wavelength_nm, optics.convergence_mrad)
+            cuts = np.searchsorted(own, np.arange(r1 - r0 + 1))
+            gxy = np.hypot(gx, gy)
+            for j in range(r1 - r0):
+                a, b = cuts[j], cuts[j + 1]
+                self.geom[new_g[r0 + j]] = (idx[a:b], gx[a:b], gy[a:b], s[a:b], gxy[a:b])
+        parallel_rows(geo, len(new_g), min_chunk=16)
+
+    def table(self, lib, grains, mid: int, optics) -> np.ndarray:
+        """(GRAINS_PER_MATERIAL, MAX_THICKNESS_BIN + 1) loss per unit crystallinity of every
+        grain of material ``mid`` at every thickness bin (:mod:`.bragg_table`), built once."""
+        if self._table is None:
+            from .bragg_table import loss_table
+
+            ids = [g for g in range(mid * GRAINS_PER_MATERIAL, (mid + 1) * GRAINS_PER_MATERIAL)
+                   if g < len(grains)]
+            self._ensure_geometry(lib, grains, ids, optics)
+            geom = [self.geom[g] for g in ids]
+            tab, _ = loss_table(lib, geom, optics, self._g_obj, MAX_THICKNESS_BIN + 1)
+            full = np.zeros((GRAINS_PER_MATERIAL, MAX_THICKNESS_BIN + 1))
+            full[:len(ids)] = tab
+            gxy = np.concatenate([g[4] for g in geom]) if geom else np.zeros(0)
+            gxy = gxy[gxy > 1e-6]
+            self.min_gxy = float(gxy.min()) if gxy.size else math.inf
+            self._table = full
+        return self._table
 
     def values(self, lib, grains, gids, ps, tbs, optics) -> np.ndarray:
         """Loss per unit crystallinity (``frac * p_out``) of the pairs (gids[ps], tbs)."""
@@ -101,19 +137,7 @@ class _BraggMemo:
         keys = [(int(gids[i]), int(tb)) for i, tb in zip(ps, tbs)]
         missing = [k for k in keys if k not in self.pair]
         if missing:
-            new_g = sorted({g for g, _ in missing if g not in self.geom})
-            if new_g:
-                m = effective_matrices(grains.matrices[np.asarray(new_g)], optics.alpha_rad, optics.beta_rad)
-
-                def geo(r0, r1):
-                    own, idx, gx, gy, s = lib.geometry(m[r0:r1], optics.wavelength_nm,
-                                                       optics.convergence_mrad)
-                    cuts = np.searchsorted(own, np.arange(r1 - r0 + 1))
-                    gxy = np.hypot(gx, gy)
-                    for j in range(r1 - r0):
-                        a, b = cuts[j], cuts[j + 1]
-                        self.geom[new_g[r0 + j]] = (idx[a:b], gx[a:b], gy[a:b], s[a:b], gxy[a:b])
-                parallel_rows(geo, len(new_g), min_chunk=16)
+            self._ensure_geometry(lib, grains, sorted({g for g, _ in missing}), optics)
             lens = np.array([len(self.geom[g][0]) for g, _ in missing], np.int64)
             idx = np.concatenate([self.geom[g][0] for g, _ in missing])
             s = np.concatenate([self.geom[g][3] for g, _ in missing])
@@ -137,6 +161,9 @@ class _BraggMemo:
 
 
 _BRAGG_MEMOS: "OrderedDict[tuple, _BraggMemo]" = OrderedDict()
+#: Tilt / beam states whose Bragg tables are kept (a tilt series back and forth, a wobbler):
+#: ~1 MB each per crystalline material.
+BRAGG_TABLES_KEPT = 16
 
 
 def _bragg_memo(grains, mid: int, max_g: float, optics, g_obj: float) -> _BraggMemo:
@@ -147,7 +174,7 @@ def _bragg_memo(grains, mid: int, max_g: float, optics, g_obj: float) -> _BraggM
         memo = _BraggMemo(grains)
         memo._g_obj = float(g_obj)
         _BRAGG_MEMOS[key] = memo
-        while len(_BRAGG_MEMOS) > 6:
+        while len(_BRAGG_MEMOS) > BRAGG_TABLES_KEPT:
             _BRAGG_MEMOS.popitem(last=False)
     _BRAGG_MEMOS.move_to_end(key)
     return memo
@@ -188,7 +215,30 @@ def bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max: float
     if coherent:
         g_obj = min(coherent_k_max, g_res)
     t_typ: dict = {}
-    pair_count = np.bincount(pix_all[pix_all >= 0], minlength=n * nb)
+    # the loss: a gather from each material's (grain, thickness bin) table for this tilt / beam
+    lut = np.zeros(n * nb + 1, np.float32)  # the last entry: no crystal (-1)
+    fringe_mids = []
+    for mid in np.flatnonzero(np.bincount(gid[gid >= 0] // GRAINS_PER_MATERIAL)):
+        lib = library_for(int(mid), cfg.max_g_inv_nm)
+        if lib is None:
+            continue  # an amorphous material: no Bragg contrast (the FIB-liftout pattern's "auto" post)
+        memo = _bragg_memo(grains, int(mid), cfg.max_g_inv_nm, optics, g_obj)
+        tab = memo.table(lib, grains, int(mid), optics)
+        g0 = int(mid) * GRAINS_PER_MATERIAL
+        g1 = min(g0 + GRAINS_PER_MATERIAL, n)
+        ids = np.arange(g0, g1)
+        crm = np.ones(len(ids)) if crystallinity is None else np.asarray(crystallinity(ids), float).reshape(-1)
+        lut[g0 * nb:g1 * nb] = (cfg.diffraction_contrast_scale * (crm[:, None] * tab[:g1 - g0])).ravel()
+        # fringes need beams the raster resolves (and the aperture passes)
+        if coherent or (cfg.lattice_fringes and memo.min_gxy <= g_res):
+            fringe_mids.append(int(mid))
+    parallel_rows(lambda r0, r1: loss.__setitem__(slice(r0, r1), lut[pix_all[r0:r1]]), mat.shape[0])
+    if not fringe_mids:
+        return BraggContrast(loss, gid, fringes, coherent, t_typ,
+                             coherent or (cfg.lattice_fringes and cfg.lattice_fringe_model == "kinematic"))
+    pix = pix_all[pix_all >= 0]
+    pix = pix[np.isin(pix // (nb * GRAINS_PER_MATERIAL), fringe_mids)]
+    pair_count = np.bincount(pix, minlength=n * nb)
     nz = np.flatnonzero(pair_count)
     pg, ptb = np.divmod(nz, nb)
     g_u = np.unique(pg)
@@ -198,20 +248,13 @@ def bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max: float
     counts = np.zeros((len(g_u), len(tb_u)), np.int64)
     counts[pgi, pti] = pair_count[nz]
     typical = counts.argmax(axis=1)  # most common thickness bin of each grain (for the fringes)
-    table = np.zeros((len(g_u), len(tb_u)))
     for mid in np.unique(g_u // GRAINS_PER_MATERIAL):
         sel = np.flatnonzero(g_u // GRAINS_PER_MATERIAL == mid)
         lib = library_for(int(mid), cfg.max_g_inv_nm)
-        if lib is None:
-            continue  # an amorphous material: no Bragg contrast (the FIB-liftout pattern's "auto" post)
         memo = _bragg_memo(grains, int(mid), cfg.max_g_inv_nm, optics, g_obj)
-        # only the (grain, thickness bin) pairs present in the view, each computed once per
-        # tilt / beam: a stage move or a magnification step reuses the grains it saw before
-        ps, pt = np.nonzero(counts[sel])
-        table[sel[ps], pt] = cr[sel[ps]] * memo.values(lib, grains, g_u[sel], ps, tb_u[pt], optics)
+        # the per-beam intensities at each grain's typical thickness (exact, few)
+        memo.values(lib, grains, g_u[sel], np.arange(len(sel)), tb_u[typical[sel]], optics)
         for j, gi in enumerate(sel):
-            if not (coherent or cfg.lattice_fringes):
-                break
             geo = memo.geom[int(g_u[gi])]
             inten, frac = memo.pair[(int(g_u[gi]), int(tb_u[typical[gi]]))][2:]
             gx_all, gy_all, gxy = geo[1], geo[2], geo[4]
@@ -250,9 +293,6 @@ def bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max: float
                     w = np.array(waves)
                     fringes[int(g_u[gi])] = (2 * math.pi * w[:, 0], 2 * math.pi * w[:, 1], w[:, 2])
                     t_typ[int(g_u[gi])] = max(float(tb_u[typical[gi]]) * THICKNESS_BIN_NM, THICKNESS_BIN_NM)
-    lut = np.zeros(len(pair_count) + 1, np.float32)  # the last entry: no crystal (-1)
-    lut[nz] = cfg.diffraction_contrast_scale * table[pgi, pti]
-    parallel_rows(lambda r0, r1: loss.__setitem__(slice(r0, r1), lut[pix_all[r0:r1]]), mat.shape[0])
     kinematic = coherent or (cfg.lattice_fringes and cfg.lattice_fringe_model == "kinematic")
     return BraggContrast(loss, gid, fringes, coherent, t_typ, kinematic)
 
