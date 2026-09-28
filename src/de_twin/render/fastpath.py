@@ -194,3 +194,46 @@ def intensity(psi, out):
         for j in range(nx):
             v = psi[i, j]
             out[i, j] = v.real * v.real + v.imag * v.imag
+
+
+# ------------------------------------------------------------------ gaussian (mode "nearest")
+@_njit(parallel=True)
+def _gauss_rows(a, w, out):
+    ny, nx = a.shape
+    r = (w.shape[0] - 1) // 2
+    for i in _prange(ny):
+        for j in range(nx):
+            acc = np.float32(0.0)
+            for k in range(-r, r + 1):
+                jj = min(max(j + k, 0), nx - 1)
+                acc += w[k + r] * a[i, jj]
+            out[i, j] = acc
+
+
+@_njit(parallel=True)
+def _gauss_cols(a, w, out):
+    ny, nx = a.shape
+    r = (w.shape[0] - 1) // 2
+    for i in _prange(ny):
+        for j in range(nx):
+            out[i, j] = np.float32(0.0)
+        for k in range(-r, r + 1):
+            ii = min(max(i + k, 0), ny - 1)
+            wk = w[k + r]
+            for j in range(nx):
+                out[i, j] += wk * a[ii, j]
+
+
+def gaussian_nearest(a: np.ndarray, sigma: float, truncate: float = 4.0) -> np.ndarray:
+    """``scipy.ndimage.gaussian_filter(a, sigma, mode="nearest", truncate=truncate)`` of a
+    float32 image (the same kernel weights; float32 sums)."""
+    radius = int(truncate * float(sigma) + 0.5)
+    x = np.arange(-radius, radius + 1, dtype=np.float64)
+    w = np.exp(-0.5 * (x / float(sigma)) ** 2)
+    w = (w / w.sum()).astype(np.float32)
+    a = np.ascontiguousarray(a, np.float32)
+    tmp = np.empty_like(a)
+    out = np.empty_like(a)
+    _gauss_cols(a, w, tmp)
+    _gauss_rows(tmp, w, out)
+    return out

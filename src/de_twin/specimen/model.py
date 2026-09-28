@@ -265,7 +265,7 @@ class Specimen:
         if dx or dy:  # the specimen moved by (dx, dy): look at world - drift
             drifted = dataclasses.replace(view, center_um=(view.center_um[0] - dx, view.center_um[1] - dy))
         span = int(span_px) if span_px else max(view.shape)
-        n = max(1, min(int(threads), view.shape[0] // MIN_STRIP_ROWS))
+        n = max(1, min(int(threads), max(view.shape) // MIN_STRIP_ROWS))
         if n > 1 and _numba_threadsafe():
             fm = self._rasterize_strips(drifted, layers, span, n)
         else:
@@ -284,35 +284,39 @@ class Specimen:
         return ctx
 
     def _rasterize_strips(self, view: ViewWindow, layers: frozenset, span: int, n: int) -> FieldMap:
+        """``n`` strips across the longer side of the view (rows of a tall view, columns of a
+        wide one: the strip a stage move brings in is wide and short), in parallel."""
         from concurrent.futures import ThreadPoolExecutor
 
         ny, nx = view.shape
-        edges = np.linspace(0, ny, n + 1).astype(int)
+        by_rows = ny >= nx
+        edges = np.linspace(0, ny if by_rows else nx, n + 1).astype(int)
 
         def strip(i):
             import numba
 
             numba.set_num_threads(max(1, numba.config.NUMBA_NUM_THREADS // n))  # thread-local
-            r0, r1 = int(edges[i]), int(edges[i + 1])
-            x, y = view.pixel_to_world(np.array([(r0 + r1 - 1) / 2.0]), np.array([(nx - 1) / 2.0]))
-            sub = dataclasses.replace(view, center_um=(float(x[0]), float(y[0])), shape=(r1 - r0, nx))
-            return r0, r1, self._rasterize_ctx(sub, layers, span).to_fieldmap(time_s=self._time_s)
+            a0, a1 = int(edges[i]), int(edges[i + 1])
+            r0, r1, c0, c1 = (a0, a1, 0, nx) if by_rows else (0, ny, a0, a1)
+            x, y = view.pixel_to_world(np.array([(r0 + r1 - 1) / 2.0]), np.array([(c0 + c1 - 1) / 2.0]))
+            sub = dataclasses.replace(view, center_um=(float(x[0]), float(y[0])), shape=(r1 - r0, c1 - c0))
+            return (r0, r1, c0, c1), self._rasterize_ctx(sub, layers, span).to_fieldmap(time_s=self._time_s)
         with ThreadPoolExecutor(n, thread_name_prefix="de-twin-raster") as ex:
             parts = list(ex.map(strip, range(n)))
         fm = FieldMap.empty(view, layers)
         fm.time_s = self._time_s
-        if any(p.under_thickness_nm is not None for _, _, p in parts):
+        if any(p.under_thickness_nm is not None for _, p in parts):
             fm.under_material = np.zeros((ny, nx), np.uint8)
             fm.under_thickness_nm = np.zeros((ny, nx), np.float32)
-        for r0, r1, p in parts:
+        for (r0, r1, c0, c1), p in parts:
             for name in ("material_id", "thickness_nm", "grain_id", "under_material", "under_thickness_nm"):
                 a = getattr(p, name)
                 if a is not None:
-                    getattr(fm, name)[r0:r1] = a
+                    getattr(fm, name)[r0:r1, c0:c1] = a
             for name in ("descan", "strain"):
                 a = getattr(p, name)
                 if a is not None and getattr(fm, name) is not None:
-                    getattr(fm, name)[:, r0:r1] = a
+                    getattr(fm, name)[:, r0:r1, c0:c1] = a
         self.last_stats = dict(self.scene.last_stats, strips=n)
         return fm
 

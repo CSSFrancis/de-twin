@@ -757,7 +757,7 @@ def _transmission_fast(fm, optics, cfg, bc, noise, sigma, mip_v, amorphous, tex_
         _fp.mip_phase(fm.material_id, fm.thickness_nm, umat, uthick, has_under, f_t, np.float32(sigma),
                       mip_v, mip)
         if taper_px > 0.3:
-            mip = gaussian_filter_threaded(mip, min(taper_px, 16.0), mode="nearest", truncate=3.0)
+            mip = _fp.gaussian_nearest(mip, min(taper_px, 16.0), truncate=3.0)
         if cfg.refraction_loss:
             g_c = 0.5 * math.pi
             if optics.objective_aperture_mrad > 0:

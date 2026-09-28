@@ -176,7 +176,7 @@ class Renderer:
         self._coherent = CoherentStem(self.cache, self.config, self.seed)
         self._grains_fallback: Optional[GrainTable] = None
         self._lock = threading.RLock()  # render() and a prefetching thread share the caches
-        self._prefetch_tem = TransferCache()
+        self._prefetch_tem = TransferCache(size=1)
         self._inflight = None  # (optics, threading.Event) of the view being prefetched
         self.prefetched = 0
         self.rasters_built = 0
