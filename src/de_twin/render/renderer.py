@@ -488,6 +488,10 @@ class Renderer:
                    for k, c0, raster, _ in getattr(self, "_pans", None) or []):
                 return False
             hit = self._fieldmaps.get(fkey)
+            if hit is not None:  # the live view's exit-wave spectra (a focus step reuses one)
+                self._prefetch_tem = TransferCache(size=len(self._tem_cache.spectra) + 1)
+                for k, v in self._tem_cache.spectra.items():
+                    self._prefetch_tem.spectra[k] = v
             done = threading.Event()
             self._inflight = (optics, done)
         try:
@@ -511,6 +515,9 @@ class Renderer:
             pans = getattr(self, "_pans", None) or []
             pans.insert(1 if pans else 0, (key, view.center_um, raster, poptics.view))  # behind the live view
             self._pans = pans[:max(1, self.config.pan_cache_size)]
+            # its exit-wave spectrum too: a focus step of the prefetched view is a multiply + FFT
+            for k, v in list(self._prefetch_tem.spectra.items()):
+                self._tem_cache._put(self._tem_cache.spectra, k, v)
             self.prefetched += 1
         return True
 
