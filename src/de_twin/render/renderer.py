@@ -101,15 +101,71 @@ def _axis_aligned(view) -> bool:
     return abs(math.sin(2.0 * rot)) < 1e-9
 
 
-def _pad_len(n: int, margin: float) -> int:
-    """``n`` plus ``margin`` of it on both sides, rounded up (keeping the parity of ``n``,
-    so the padded raster's pixels sit on the view's lattice) to a fast FFT length."""
+def _pad_len(n: int, margin: float, margin_px: int | None = None) -> int:
+    """``n`` plus ``margin`` of it (or ``margin_px`` pixels) on both sides, rounded up
+    (keeping the parity of ``n``, so the padded raster's pixels sit on the view's lattice) to
+    a fast FFT length."""
     from scipy.fft import next_fast_len
 
-    p = n + 2 * int(round(margin * n))
+    p = n + 2 * (int(margin_px) if margin_px is not None else int(round(margin * n)))
     while next_fast_len(p) != p:
         p += 2
     return p
+
+
+#: Guard bands (pixels a side) the adaptive padding picks from: a few sizes, so a focus or
+#: magnification change mostly keeps the padded raster's shape (and its field map).
+GUARD_LEVELS_PX = (32, 48, 64, 96, 128, 192, 256, 384, 512)
+
+
+#: The guard band holds all but this fraction of the objective's point-spread energy, with
+#: a safety factor (calibrated on Au on carbon, the strongest contrast, against a 1024-pixel
+#: guard: <5e-4 RMS at 3k-25k, <1e-3 to 100k; see tests/test_render_caches.py).
+GUARD_LEAK = 1e-4
+GUARD_FACTOR = 1.3
+_SPREAD_CACHE: "OrderedDict[tuple, float]" = OrderedDict()
+_RADII: dict = {}
+
+
+def transfer_spread_px(optics, leak: float = GUARD_LEAK, N: int = 512) -> float:
+    """The radius (raster pixels) holding all but ``leak`` of the energy of the objective
+    transfer's point-spread function |F^-1 H|^2 on this sampling (measured on an N^2 grid, so
+    at most ~0.4 N): how far the image of a point spreads, i.e. how wide a guard band the
+    periodic FFT needs for the view not to see the far edge of the raster wrapped in.
+    Cached per transfer function."""
+    from scipy import fft as sfft
+
+    from ..optics.state import image_aberrations_of
+    from .tem import _raster_tilt, transfer_function
+
+    view = optics.view
+    key = (view.pixel_um, optics.wavelength_nm, image_aberrations_of(optics).key(), _raster_tilt(optics),
+           optics.illumination_mrad, optics.focal_spread_nm, optics.objective_aperture_mrad, float(leak), N)
+    hit = _SPREAD_CACHE.get(key)
+    if hit is not None:
+        return hit
+    H = transfer_function((N, N), view.pixel_um * 1000.0, optics)
+    r = 0.0
+    if H is not None:
+        rad = _RADII.get(N)
+        if rad is None:
+            yy = np.minimum(np.arange(N), N - np.arange(N))
+            rad = _RADII[N] = np.hypot(yy[:, None], yy[None, :]).astype(np.int64).ravel()
+        psf = np.abs(sfft.ifft2(H, workers=-1)).ravel() ** 2
+        cum = np.cumsum(np.bincount(rad, weights=psf))
+        r = float(np.searchsorted(cum / cum[-1], 1.0 - leak))
+    _SPREAD_CACHE[key] = r
+    while len(_SPREAD_CACHE) > 64:
+        _SPREAD_CACHE.popitem(last=False)
+    return r
+
+
+def _guard_px(optics, minimum: int, maximum: int) -> int:
+    need = max(float(minimum), GUARD_FACTOR * transfer_spread_px(optics))
+    for g in GUARD_LEVELS_PX:
+        if g >= need or g >= maximum:
+            return min(g, maximum)
+    return maximum
 
 
 def _sub_view(view, r0: int, r1: int, c0: int, c1: int):
@@ -342,7 +398,11 @@ class Renderer:
         point nearest the view's centre, and the (rows, cols) translation that puts the
         view's own centre back in the middle of it."""
         view = optics.view
-        py, px = (_pad_len(n, self.config.pan_margin) for n in view.shape)
+        if self.config.adaptive_margin:  # a guard band as wide as the transfer delocalises
+            g = _guard_px(optics, self.config.min_margin_px, self.config.max_margin_px)
+            py, px = (_pad_len(n, 0.0, g) for n in view.shape)
+        else:
+            py, px = (_pad_len(n, self.config.pan_margin) for n in view.shape)
         lc, lr = _lattice(view, *view.center_um)
         kc, kr = round(lc), round(lr)
         pview = dataclasses.replace(view, shape=(py, px), center_um=_from_lattice(view, kc, kr))
@@ -367,27 +427,31 @@ class Renderer:
         if (view, frozenset(TEM_LAYERS), gen, tkey) in store:
             return self.field_map(optics, TEM_LAYERS, time_s, store)
         ny, nx = view.shape
-        base = dataclasses.replace(view, center_um=(0.0, 0.0))
+        base = dataclasses.replace(view, center_um=(0.0, 0.0), shape=(1, 1))
         lc, lr = _lattice(view, *view.center_um)
         best, best_area = None, 0
         for (v, layers, g, t), (fm, _, fgen) in store.items():
             if layers or g != gen or t != tkey or getattr(fm, "generation", 0) != fgen:
                 continue
-            if dataclasses.replace(v, center_um=(0.0, 0.0)) != base:
+            if dataclasses.replace(v, center_um=(0.0, 0.0), shape=(1, 1)) != base:
+                continue
+            oy, ox = v.shape  # a cached raster of another size (another guard band) serves too
+            if (oy - ny) % 2 or (ox - nx) % 2:
                 continue
             oc, orow = _lattice(view, *v.center_um)
             dc, dr = lc - oc, lr - orow
             if abs(dc - round(dc)) > 1e-3 or abs(dr - round(dr)) > 1e-3:
                 continue  # not on the same lattice
-            dc, dr = int(round(dc)), int(round(dr))
-            area = max(0, nx - abs(dc)) * max(0, ny - abs(dr))
+            dc = int(round(dc)) + (ox - nx) // 2  # new pixel (r, c) is old pixel (r + dr, c + dc)
+            dr = int(round(dr)) + (oy - ny) // 2
+            area = (max(0, min(ny, oy - dr) - max(0, -dr))) * (max(0, min(nx, ox - dc) - max(0, -dc)))
             if area > best_area:
-                best, best_area = (fm, dr, dc), area
+                best, best_area = (fm, dr, dc, oy, ox), area
         if best is None or best_area < self.config.reuse_min_overlap * ny * nx:
             return self.field_map(optics, TEM_LAYERS, time_s, store)
-        old, dr, dc = best
-        r_lo, r_hi = max(0, -dr), min(ny, ny - dr)
-        c_lo, c_hi = max(0, -dc), min(nx, nx - dc)
+        old, dr, dc, oy, ox = best
+        r_lo, r_hi = max(0, -dr), min(ny, oy - dr)
+        c_lo, c_hi = max(0, -dc), min(nx, ox - dc)
         parts = [((r_lo, r_hi, c_lo, c_hi), old, (r_lo + dr, c_lo + dc))]
         rects = ((0, r_lo, 0, nx), (r_hi, ny, 0, nx), (r_lo, r_hi, 0, c_lo), (r_lo, r_hi, c_hi, nx))
         for r0, r1, c0, c1 in rects:
@@ -395,12 +459,15 @@ class Renderer:
                 sub = self._rasterize(_sub_view(view, r0, r1, c0, c1), frozenset(TEM_LAYERS), max(ny, nx))
                 parts.append(((r0, r1, c0, c1), sub, (0, 0)))
         last = parts[-1][1]
-        fm = FieldMap(view=view, material_id=np.zeros((ny, nx), np.uint8),
-                      thickness_nm=np.zeros((ny, nx), np.float32), grain_id=np.full((ny, nx), -1, np.int32),
+        from .. import buffers
+
+        fm = FieldMap(view=view, material_id=buffers.zeros((ny, nx), np.uint8),
+                      thickness_nm=buffers.zeros((ny, nx), np.float32),
+                      grain_id=buffers.full((ny, nx), -1, np.int32),
                       generation=getattr(last, "generation", 0), time_s=getattr(last, "time_s", 0.0))
         if any(p.under_thickness_nm is not None for _, p, _ in parts):
-            fm.under_material = np.zeros((ny, nx), np.uint8)
-            fm.under_thickness_nm = np.zeros((ny, nx), np.float32)
+            fm.under_material = buffers.zeros((ny, nx), np.uint8)
+            fm.under_thickness_nm = buffers.zeros((ny, nx), np.float32)
         for (r0, r1, c0, c1), src, (sr, sc) in parts:
             h, w = r1 - r0, c1 - c0
             for name in ("material_id", "thickness_nm", "grain_id", "under_material", "under_thickness_nm"):

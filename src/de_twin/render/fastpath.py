@@ -152,26 +152,39 @@ def exit_wave(mat, thick, umat, uthick, has_under, f_t, lam_abs, bragg, mip, has
 # ------------------------------------------------------------------ transfer
 @_njit(parallel=True)
 def transfer_c1a1c3c5(kx1, ky1, tx, ty, radial, poly3, poly5, a_re, a_im, g1, g3, g5, ga_re, ga_im,
-                      c0, gx0, gy0, es, et, kt2, kap2, H):
-    """H(k) of an aberration set of C1, A1, C3 and C5 (`tem.transfer_function`)."""
+                      c0, gx0, gy0, es, et, kt2, kap2, H, transposed=False):
+    """H(k) of an aberration set of C1, A1, C3 and C5 (`tem.transfer_function`); with
+    ``transposed``, H.T (shape (nx, ny), for the transposed spectra of :func:`fft2_t`)."""
     ny = ky1.shape[0]
     nx = kx1.shape[0]
-    for i in _prange(ny):
-        KY = np.float32(ky1[i] + ty)
-        for j in range(nx):
-            KX = np.float32(kx1[j] + tx)
-            k2 = KX * KX + KY * KY
-            chi = k2 * (radial + k2 * (poly3 + poly5 * k2)) + a_re * (KX * KX - KY * KY) + a_im * (KX * KY)
-            rad = g1 + k2 * (g3 + g5 * k2)
-            gx = rad * KX + ga_re * KX + ga_im * KY - gx0
-            gy = rad * KY - ga_re * KY + ga_im * KX - gy0
-            chi = chi - c0
-            k2t = k2 - kt2
-            if kap2 > 0.0 and k2 > kap2:
-                H[i, j] = 0.0
-                continue
-            env = math.exp(-(es * (gx * gx + gy * gy) + et * k2t * k2t))
-            H[i, j] = complex(env * math.cos(chi), -env * math.sin(chi))
+    if transposed:
+        for j in _prange(nx):
+            for i in range(ny):
+                H[j, i] = _h1(kx1[j], ky1[i], tx, ty, radial, poly3, poly5, a_re, a_im, g1, g3, g5, ga_re, ga_im,
+                              c0, gx0, gy0, es, et, kt2, kap2)
+    else:
+        for i in _prange(ny):
+            for j in range(nx):
+                H[i, j] = _h1(kx1[j], ky1[i], tx, ty, radial, poly3, poly5, a_re, a_im, g1, g3, g5, ga_re, ga_im,
+                              c0, gx0, gy0, es, et, kt2, kap2)
+
+
+@_njit()
+def _h1(kx, ky, tx, ty, radial, poly3, poly5, a_re, a_im, g1, g3, g5, ga_re, ga_im, c0, gx0, gy0, es, et, kt2,
+        kap2):
+    KY = np.float32(ky + ty)
+    KX = np.float32(kx + tx)
+    k2 = KX * KX + KY * KY
+    chi = k2 * (radial + k2 * (poly3 + poly5 * k2)) + a_re * (KX * KX - KY * KY) + a_im * (KX * KY)
+    rad = g1 + k2 * (g3 + g5 * k2)
+    gx = rad * KX + ga_re * KX + ga_im * KY - gx0
+    gy = rad * KY - ga_re * KY + ga_im * KX - gy0
+    chi = chi - c0
+    k2t = k2 - kt2
+    if kap2 > 0.0 and k2 > kap2:
+        return complex(0.0, 0.0)
+    env = math.exp(-(es * (gx * gx + gy * gy) + et * k2t * k2t))
+    return complex(env * math.cos(chi), -env * math.sin(chi))
 
 
 @_njit(parallel=True)
@@ -232,8 +245,82 @@ def gaussian_nearest(a: np.ndarray, sigma: float, truncate: float = 4.0) -> np.n
     w = np.exp(-0.5 * (x / float(sigma)) ** 2)
     w = (w / w.sum()).astype(np.float32)
     a = np.ascontiguousarray(a, np.float32)
-    tmp = np.empty_like(a)
-    out = np.empty_like(a)
+    tmp = scratch("gauss_tmp", a.shape, np.float32)
+    out = scratch("gauss_out", a.shape, np.float32)
     _gauss_cols(a, w, tmp)
     _gauss_rows(tmp, w, out)
     return out
+
+
+# ------------------------------------------------------------------ 2-D FFTs, threaded
+@_njit(parallel=True)
+def transpose(x, out):
+    """``out[:] = x.T`` in cache-sized blocks."""
+    n0, n1 = x.shape
+    B = 32
+    for bi in _prange((n0 + B - 1) // B):
+        i0 = bi * B
+        i1 = min(i0 + B, n0)
+        for j0 in range(0, n1, B):
+            j1 = min(j0 + B, n1)
+            for i in range(i0, i1):
+                for j in range(j0, j1):
+                    out[j, i] = x[i, j]
+
+
+def _rows(x, inverse: bool) -> None:
+    """1-D FFTs of every row of ``x``, in place, in row chunks on the shared pool (scipy's own
+    ``workers`` barely helps a single 2-D transform: its column pass is memory-bound)."""
+    from scipy import fft as sfft
+
+    from .util import pool
+
+    f = sfft.ifft if inverse else sfft.fft
+    n = x.shape[0]
+    k = max(1, min(pool()._max_workers, n // 32))
+    e = np.linspace(0, n, k + 1).astype(int)
+
+    def one(i):
+        a, b = int(e[i]), int(e[i + 1])
+        r = f(x[a:b], axis=1, overwrite_x=True)
+        if r.ctypes.data != x[a:b].ctypes.data:
+            x[a:b] = r
+    list(pool().map(one, range(k)))
+
+
+_SCRATCH = __import__("threading").local()
+
+
+def scratch(name: str, shape, dtype) -> np.ndarray:
+    """A per-thread, reused array for a temporary of one render (uninitialised). Fresh large
+    arrays cost their page faults on first touch (~4 ms per 14 MB here), which for the
+    imaging path's 1344^2 complex temporaries was most of an FFT's time."""
+    d = getattr(_SCRATCH, "d", None)
+    if d is None:
+        d = _SCRATCH.d = {}
+    key = (name, tuple(int(v) for v in shape), np.dtype(dtype).str)
+    a = d.get(key)
+    if a is None:
+        for k in [k for k in d if k[0] == name]:  # one size per name: a view change frees the old
+            del d[k]
+        a = d[key] = np.empty(shape, dtype)
+    return a
+
+
+def fft2_t(x: np.ndarray, out: np.ndarray | None = None) -> np.ndarray:
+    """The 2-D FFT of complex64 ``x`` (overwritten), returned TRANSPOSED (into ``out`` if
+    given): rows, transpose, rows. Keeping the spectrum transposed saves a transpose each way."""
+    _rows(x, False)
+    t = out if out is not None else np.empty((x.shape[1], x.shape[0]), x.dtype)
+    transpose(x, t)
+    _rows(t, False)
+    return t
+
+
+def ifft2_t(t: np.ndarray, out: np.ndarray | None = None) -> np.ndarray:
+    """Inverse of :func:`fft2_t`: from a transposed spectrum (overwritten) to the image."""
+    _rows(t, True)
+    x = out if out is not None else np.empty((t.shape[1], t.shape[0]), t.dtype)
+    transpose(t, x)
+    _rows(x, True)
+    return x

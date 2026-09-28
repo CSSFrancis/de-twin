@@ -67,6 +67,17 @@ class _Sfft:  # the forward FFT of the exit wave, timed on its own
 
 _real = tem.sfft
 tem.sfft = _Sfft()
+if tem._fp.AVAILABLE:  # the transposed FFTs of the fast path
+    for _name, _label in (("fft2_t", "fft"), ("ifft2_t", "ifft_only")):
+        _f = getattr(tem._fp, _name)
+
+        def _w(*a, _f=_f, _label=_label, **k):
+            t0 = time.perf_counter()
+            try:
+                return _f(*a, **k)
+            finally:
+                T[_label] += time.perf_counter() - t0
+        setattr(tem._fp, _name, _w)
 
 COLS = ("total", "raster", "bragg", "noise", "exit", "fft", "ctf", "ifft", "finish", "detector", "other")
 
@@ -80,7 +91,7 @@ def _frame(tw, req):
     t2 = time.perf_counter()
     total = t1 - t0
     exit_rest = T["exitwave"] - T["bragg"] - T["noise"]
-    ifft = T["tem"] - T["exitwave"] - T["fft"] - T["ctf"]
+    ifft = T["tem"] - T["exitwave"] - T["fft"] - T["ctf"]  # inverse FFT, |psi|^2, the product
     r = {"total": total + (t2 - t1), "raster": T["raster"], "bragg": T["bragg"], "noise": T["noise"],
          "exit": exit_rest, "fft": T["fft"], "ctf": T["ctf"], "ifft": ifft, "finish": T["finish"],
          "detector": t2 - t1}

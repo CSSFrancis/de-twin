@@ -199,12 +199,14 @@ def _bragg_memo(grains, mid: int, max_g: float, optics, g_obj: float) -> _BraggM
 _BRAGG_LOCK = threading.RLock()
 
 
-def bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max: float = 0.0) -> BraggContrast:
+def bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max: float = 0.0,
+                   _scratch: bool = False) -> BraggContrast:
     with _BRAGG_LOCK:
-        return _bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max)
+        return _bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max, _scratch)
 
 
-def _bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max: float = 0.0) -> BraggContrast:
+def _bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max: float = 0.0,
+                    _scratch: bool = False) -> BraggContrast:
     """Per-pixel Bragg loss from the grain at its effective orientation and thickness bin,
     and the lattice fringes (strongest excited, resolvable, transmitted beams) per grain.
 
@@ -216,9 +218,11 @@ def _bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max: floa
     f_t = np.float32(optics.thickness_tilt_factor)
     n = len(grains) if grains is not None else 0
     nb = MAX_THICKNESS_BIN + 1
-    gid = np.empty(mat.shape, np.int64)
+    # a render's temporaries (not kept by the caller): reused buffers, see fastpath.scratch
+    alloc = _fp.scratch if (_scratch and _fp.AVAILABLE) else (lambda name, shape, dt: np.empty(shape, dt))
+    gid = alloc("bragg_gid", mat.shape, np.int64)
     # (grain, thickness bin) of every crystal pixel as one integer (-1 none); the pairs are few
-    pix_all = np.empty(mat.shape, np.int64)
+    pix_all = alloc("bragg_pix", mat.shape, np.int64)
 
     def pixel_rows(r0, r1):
         g = fm.grain_id[r0:r1].astype(np.int64)
@@ -234,7 +238,8 @@ def _bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max: floa
         maxbin = maxb.max(axis=0)
     else:
         parallel_rows(pixel_rows, mat.shape[0])
-    loss = np.zeros(mat.shape, np.float32)
+    loss = alloc("bragg_loss", mat.shape, np.float32)
+    loss.fill(0.0)
     fringes: dict = {}
     present = np.flatnonzero(maxbin >= 0) if maxbin is not None else None
     if (present.size == 0) if present is not None else not (gid >= 0).any():
@@ -248,7 +253,8 @@ def _bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max: floa
         g_obj = min(coherent_k_max, g_res)
     t_typ: dict = {}
     # the loss: a gather from each material's (grain, thickness bin) table for this tilt / beam
-    lut = np.zeros(n * nb + 1, np.float32)  # the last entry: no crystal (-1)
+    lut = alloc("bragg_lut", (n * nb + 1,), np.float32)  # the last entry: no crystal (-1)
+    lut.fill(0.0)
     fringe_mids = []
     mids = (np.unique(present // GRAINS_PER_MATERIAL) if present is not None
             else np.flatnonzero(np.bincount(gid[gid >= 0] // GRAINS_PER_MATERIAL)))
@@ -429,6 +435,12 @@ class TransferCache:
         while len(d) > self.size:
             d.popitem(last=False)
 
+    def buffer(self, shape, dtype) -> np.ndarray:
+        """An array for a new spectrum (`de_twin.buffers`: recycled when one is free)."""
+        from .. import buffers
+
+        return buffers.empty(shape, dtype)
+
 
 def _kgrid(shape, pitch_nm):
     ny, nx = shape
@@ -455,7 +467,7 @@ def _raster_tilt(optics) -> tuple[float, float]:
     return wx, wy
 
 
-def transfer_function(shape, pitch_nm, optics) -> np.ndarray | None:
+def transfer_function(shape, pitch_nm, optics, transposed: bool = False) -> np.ndarray | None:
     """Objective transfer H(k) (complex64, FFT layout) or None when it is ~identity.
 
     chi comes from ``optics.image_aberrations`` (CEOS set incl. C1 = defocus and A1 = objective
@@ -488,8 +500,10 @@ def transfer_function(shape, pitch_nm, optics) -> np.ndarray | None:
         return None
 
     ny, nx = shape
-    H = np.empty((ny, nx), np.complex64)
     if _fp.AVAILABLE and set(ab.coeffs) <= {"C1", "A1", "C3", "C5"}:
+        from .. import buffers
+
+        H = buffers.empty((nx, ny) if transposed else (ny, nx), np.complex64)
         f = np.float32
         s = 2.0 * math.pi / lam
         l2 = lam * lam
@@ -500,8 +514,12 @@ def transfer_function(shape, pitch_nm, optics) -> np.ndarray | None:
             f(s * l2 * c1 / 2), f(s * l2 * l2 * c3 / 4), f(s * l2 ** 3 * c5 / 6),
             f(s * l2 * a1.real / 2), f(s * l2 * a1.imag), f(s * l2 * c1), f(s * l2 * l2 * c3),
             f(s * l2 ** 3 * c5), f(s * l2 * a1.real), f(s * l2 * a1.imag), f(c0), f(gx0), f(gy0),
-            f(es), f(et), f(kt2), f(kap * kap), H)
+            f(es), f(et), f(kt2), f(kap * kap), H, transposed)
         return H
+    if transposed:
+        H = transfer_function(shape, pitch_nm, optics)
+        return None if H is None else np.ascontiguousarray(H.T)
+    H = np.empty((ny, nx), np.complex64)
     KX = (kx1 + tx).astype(np.float32)[None, :]
     kyf = (ky1 + ty).astype(np.float32)
 
@@ -524,7 +542,7 @@ def transfer_function(shape, pitch_nm, optics) -> np.ndarray | None:
     return H
 
 
-def _world_locked_noise(view, seed: int, salt: int) -> np.ndarray:
+def _world_locked_noise(view, seed: int, salt: int, _scratch: bool = False) -> np.ndarray:
     """Unit white noise on the raster of *view*, each pixel the value of the world cell under
     it (cells of pitch (px / cos_beta, px / cos_alpha)), so it moves with the specimen. An
     unrotated view reads a block of cells directly; a rotated one (a realistic column's
@@ -536,7 +554,8 @@ def _world_locked_noise(view, seed: int, salt: int) -> np.ndarray:
         # the nearest cell, ties (a view centred on the pixel lattice) broken upwards
         ix0 = math.floor(view.center_um[0] / pitch_x + (0.5 - nx / 2.0) + 0.5 + 1e-6)
         iy0 = math.floor(view.center_um[1] / pitch_y + (0.5 - ny / 2.0) + 0.5 + 1e-6)
-        return world_normal_noise(ix0, iy0, ny, nx, seed, salt)
+        return world_normal_noise(ix0, iy0, ny, nx, seed, salt,
+                                  _fp.scratch("noise", (ny, nx), np.float32) if (_scratch and _fp.AVAILABLE) else None)
     rows, cols = np.mgrid[0:ny, 0:nx]
     x, y = view.pixel_to_world(rows.ravel(), cols.ravel())
     ix = np.floor(np.asarray(x) / pitch_x).astype(np.int64)
@@ -546,12 +565,12 @@ def _world_locked_noise(view, seed: int, salt: int) -> np.ndarray:
     return block[iy - y0, ix - x0].reshape(ny, nx)
 
 
-def texture_noise(optics, cfg, seed: int) -> np.ndarray:
+def texture_noise(optics, cfg, seed: int, _scratch: bool = False) -> np.ndarray:
     """World-locked unit white noise on the raster, band-limited by the atomic form factor."""
     view = optics.view
     p_nm = view.pixel_um * 1000.0
     salt = cfg.texture_seed_salt ^ (int(round(math.log2(max(p_nm, 1e-6)) * 64)) & 0xFFFF)
-    noise = _world_locked_noise(view, seed, salt)
+    noise = _world_locked_noise(view, seed, salt, _scratch)
     sb = cfg.texture_bandlimit_nm / p_nm
     if sb > 0.3:
         noise = gaussian_filter_threaded(noise, sb, mode="wrap")
@@ -590,7 +609,7 @@ def diffuse_phase(fm, optics, cfg, seed: int, weights: dict, k_max: float) -> np
 
 
 def transmission_function(fm, optics, grains, crystallinity, cfg, seed: int, *,
-                          return_contrast: bool = False, coherent_k_max: float = 0.0):
+                          return_contrast: bool = False, coherent_k_max: float = 0.0, _scratch: bool = False):
     """The specimen's complex transmission ``t(r) = A(r) exp(i phi(r))`` on ``fm.view``
     (complex64, built in threaded row chunks), shared by TEM imaging and coherent STEM::
 
@@ -620,7 +639,8 @@ def transmission_function(fm, optics, grains, crystallinity, cfg, seed: int, *,
     ny, nx = view.shape
     p_nm = view.pixel_um * 1000.0
     sigma = np.float32(interaction_constant(optics.ht_kv))
-    bc = bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max)
+    bc = bragg_contrast(fm, optics, grains, crystallinity, cfg, coherent_k_max,
+                        _scratch=_scratch and not return_contrast)
     amorphous = np.array([m.amorphous for m in MATERIALS])
     keep_diffuse = None
     if coherent_k_max > 0 and cfg.diffuse_scattering:
@@ -636,7 +656,7 @@ def transmission_function(fm, optics, grains, crystallinity, cfg, seed: int, *,
     mip_v = material_array("mean_inner_potential_v")
     use_tex = cfg.phase_texture_scale > 0 and (bool(amorphous[np.unique(fm.material_id[::7, ::7])].any())
                                                or fm.under_thickness_nm is not None)
-    noise = texture_noise(optics, cfg, seed) if use_tex else None
+    noise = texture_noise(optics, cfg, seed, _scratch and not return_contrast) if use_tex else None
     tex_k = np.float32(sigma * cfg.phase_texture_scale / p_nm)
     w = cfg.amplitude_contrast
     kappa = np.float32(w / math.sqrt(max(1e-9, 1.0 - w * w))) if w > 0 else np.float32(0.0)
@@ -648,7 +668,7 @@ def transmission_function(fm, optics, grains, crystallinity, cfg, seed: int, *,
     taper_px = cfg.edge_taper_nm / p_nm
     if _fp.AVAILABLE and keep_diffuse is None:
         return _transmission_fast(fm, optics, cfg, bc, noise, sigma, mip_v, amorphous, tex_k, kappa,
-                                  inv_dens, p_nm, taper_px, return_contrast)
+                                  inv_dens, p_nm, taper_px, return_contrast, _scratch and not return_contrast)
     if cfg.mip_phase:
         # mean-inner-potential phase with rounded (not ideal-step) edges
         f_t = np.float32(optics.thickness_tilt_factor)
@@ -742,7 +762,7 @@ def transmission_function(fm, optics, grains, crystallinity, cfg, seed: int, *,
 
 
 def _transmission_fast(fm, optics, cfg, bc, noise, sigma, mip_v, amorphous, tex_k, kappa, inv_dens, p_nm,
-                       taper_px, return_contrast):
+                       taper_px, return_contrast, use_scratch=False):
     """`transmission_function` (TEM: no coherent diffuse part) through :mod:`.fastpath`."""
     ny, nx = fm.material_id.shape
     f_t = np.float32(optics.thickness_tilt_factor)
@@ -752,8 +772,9 @@ def _transmission_fast(fm, optics, cfg, bc, noise, sigma, mip_v, amorphous, tex_
     mip = np.zeros((1, 1), np.float32)
     refraction = False
     inv_gc2 = np.float32(0.0)
+    alloc = _fp.scratch if use_scratch else (lambda name, shape, dt: np.empty(shape, dt))
     if cfg.mip_phase:
-        mip = np.empty((ny, nx), np.float32)
+        mip = alloc("mip", (ny, nx), np.float32)
         _fp.mip_phase(fm.material_id, fm.thickness_nm, umat, uthick, has_under, f_t, np.float32(sigma),
                       mip_v, mip)
         if taper_px > 0.3:
@@ -765,8 +786,8 @@ def _transmission_fast(fm, optics, cfg, bc, noise, sigma, mip_v, amorphous, tex_
                           / optics.wavelength_nm)
             inv_gc2 = np.float32(1.0 / (g_c * g_c))
             refraction = bool(_fp.refraction_qmax(mip, inv_gc2) > 0.01)
-    psi = np.empty((ny, nx), np.complex64)
-    t_full = np.empty((ny, nx), np.float32)
+    psi = alloc("psi", (ny, nx), np.complex64)
+    t_full = alloc("t_full", (ny, nx), np.float32)
     lam_abs = absorption_lengths_nm(optics.ht_kv)
     _fp.exit_wave(fm.material_id, fm.thickness_nm, umat, uthick, has_under, f_t, lam_abs, bc.loss, mip,
                   bool(cfg.mip_phase), refraction, inv_gc2,
@@ -815,6 +836,35 @@ def render_physical(fm, optics, grains, crystallinity, cfg, seed: int, cache: Tr
             cfg.diffraction_contrast_scale, cfg.mip_phase, cfg.edge_taper_nm, cfg.refraction_loss, cfg.phase_texture_scale,
             cfg.texture_bandlimit_nm, cfg.amplitude_contrast, cfg.lattice_fringes,
             cfg.lattice_phase_rad, cfg.lattice_fringe_model, cfg.lattice_fringe_efficiency, seed)
+    hkey = (shape, p_nm, optics.wavelength_nm, image_aberrations_of(optics).key(), _raster_tilt(optics),
+            optics.illumination_mrad, optics.focal_spread_nm, optics.objective_aperture_mrad)
+    if _fp.AVAILABLE:  # spectra and transfer kept TRANSPOSED (fastpath.fft2_t), buffers reused
+        skey = skey + ("T",)
+        spec = cache.spectra.get(skey)
+        if spec is None:
+            psi = transmission_function(fm, optics, grains, crystallinity, cfg, seed, _scratch=True)
+            spec = _fp.fft2_t(psi, out=cache.buffer((shape[1], shape[0]), np.complex64))
+            cache._put(cache.spectra, skey, spec)
+        else:
+            cache.spectra.move_to_end(skey)
+        hkey = hkey + ("T",)
+        if hkey in cache.transfer:
+            HT = cache.transfer[hkey]
+            cache.transfer.move_to_end(hkey)
+        else:
+            HT = transfer_function(shape, p_nm, optics, transposed=True)
+            cache._put(cache.transfer, hkey, HT)
+        ramps = _shift_ramps(shape, shift_px)
+        prod = _fp.scratch("prod", spec.shape, np.complex64)
+        one = np.ones(1, np.complex64)
+        _fp.spectrum_product(spec, HT if HT is not None else np.ones((1, 1), np.complex64), HT is not None,
+                             ramps[1] if ramps else one, ramps[0] if ramps else one, ramps is not None, prod)
+        img = _fp.ifft2_t(prod, out=_fp.scratch("img", shape, np.complex64))
+        from .. import buffers
+
+        out = buffers.empty(shape, np.float32)
+        _fp.intensity(img, out)
+        return out
     spec = cache.spectra.get(skey)
     if spec is None:
         psi = exit_wave(fm, optics, grains, crystallinity, cfg, seed)
@@ -822,8 +872,6 @@ def render_physical(fm, optics, grains, crystallinity, cfg, seed: int, cache: Tr
         cache._put(cache.spectra, skey, spec)
     else:
         cache.spectra.move_to_end(skey)
-    hkey = (shape, p_nm, optics.wavelength_nm, image_aberrations_of(optics).key(), _raster_tilt(optics),
-            optics.illumination_mrad, optics.focal_spread_nm, optics.objective_aperture_mrad)
     if hkey in cache.transfer:
         H = cache.transfer[hkey]
         cache.transfer.move_to_end(hkey)
@@ -831,15 +879,6 @@ def render_physical(fm, optics, grains, crystallinity, cfg, seed: int, cache: Tr
         H = transfer_function(shape, p_nm, optics)
         cache._put(cache.transfer, hkey, H)
     ramps = _shift_ramps(shape, shift_px)
-    if _fp.AVAILABLE:
-        prod = np.empty_like(spec)
-        one = np.ones(1, np.complex64)
-        _fp.spectrum_product(spec, H if H is not None else np.ones((1, 1), np.complex64), H is not None,
-                             ramps[0] if ramps else one, ramps[1] if ramps else one, ramps is not None, prod)
-        psi = sfft.ifft2(prod, workers=-1, overwrite_x=True)
-        out = np.empty(shape, np.float32)
-        _fp.intensity(psi, out)
-        return out
     if H is None and ramps is None:
         psi = sfft.ifft2(spec, workers=-1)
     else:

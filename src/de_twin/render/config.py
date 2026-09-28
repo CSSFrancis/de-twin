@@ -34,6 +34,13 @@ class RenderConfig:
     #: serves a stage move that stays inside the margin by cropping it: the image moves
     #: rigidly with the specimen, so a joystick nudge costs a crop, not a render. 0 off.
     pan_margin: float = 0.15
+    #: Pad by the objective's point spread instead (`renderer.transfer_spread_px`, x1.3,
+    #: rounded up to one of a few guard sizes, ``min_margin_px`` to ``max_margin_px``): a
+    #: smaller raster and FFT near focus and at low magnification, a wider guard at large
+    #: defocus and high magnification. ``pan_margin`` is then unused.
+    adaptive_margin: bool = True
+    min_margin_px: int = 32
+    max_margin_px: int = 256
     #: Padded rasters kept for cropping (a jump back to a recent place is a crop too).
     pan_cache_size: int = 6
     #: A new padded raster takes the specimen it shares with a cached one (same sampling, on

@@ -208,11 +208,13 @@ class RasterContext:
         self.grains = grains
         self.time_index = int(time_index)
         self.lod_threshold_px = float(lod_threshold_px)
-        self.material = np.zeros(self.npix, np.uint8)
-        self.thick = np.zeros(self.npix, np.float32)
-        self.grain = np.full(self.npix, -1, np.int32)
-        self.area = np.full(self.npix, -1, np.int32)
-        self._mark = np.full(self.npix, -1, np.int32)
+        from .. import buffers  # recycled: their pages are mapped already (see de_twin.buffers)
+
+        self.material = buffers.zeros(self.npix, np.uint8)
+        self.thick = buffers.zeros(self.npix, np.float32)
+        self.grain = buffers.full(self.npix, -1, np.int32)
+        self.area = buffers.full(self.npix, -1, np.int32)
+        self._mark = buffers.full(self.npix, -1, np.int32)
         self.descan = np.zeros((2, self.npix), np.float32) if LAYER_DESCAN in self.layers else None
         if LAYER_STRAIN in self.layers:
             self.strain = np.zeros((3, self.npix), np.float32)

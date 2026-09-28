@@ -118,7 +118,9 @@ def upsample2x_scaled(a: np.ndarray, scale: float = 1.0) -> np.ndarray:
     a = np.asarray(a, np.float32)
     ny, nx = a.shape
     if _up2x_nb is not None:
-        out = np.empty((2 * ny, 2 * nx), np.float32)
+        from .. import buffers
+
+        out = buffers.empty((2 * ny, 2 * nx), np.float32)
         _up2x_nb(a, np.float32(0.75 * scale), np.float32(0.25 * scale), out)
         return out
     p = np.pad(a, 1, mode="edge")
@@ -238,14 +240,15 @@ def _noise_tile(seed: int, salt: int, tx: int, ty: int) -> np.ndarray:
     return tile
 
 
-def world_normal_noise(ix0: int, iy0: int, ny: int, nx: int, seed: int, salt: int = 0) -> np.ndarray:
+def world_normal_noise(ix0: int, iy0: int, ny: int, nx: int, seed: int, salt: int = 0,
+                       out: np.ndarray | None = None) -> np.ndarray:
     """Standard-normal float32 noise on world cells (iy0..iy0+ny, ix0..ix0+nx).
 
     Cells are grouped in 128x128 world tiles, each drawn from a PCG64 stream
     seeded by ``hash_seed(seed, TEXTURE_KIND, mix_cell(tx, ty), salt)``, so the
     value of a cell never depends on the view it is rendered in.
     """
-    out = np.empty((ny, nx), np.float32)
+    out = np.empty((ny, nx), np.float32) if out is None else out
     tx0, tx1 = ix0 // _TILE, (ix0 + nx - 1) // _TILE
     ty0, ty1 = iy0 // _TILE, (iy0 + ny - 1) // _TILE
 
