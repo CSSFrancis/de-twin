@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 import os
+import threading
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -212,6 +214,30 @@ def _add_shifted(out, a, sx, sy, w):
     out[ys_dst, xs_dst] += w * a[ys_src, xs_src]
 
 
+#: World noise tiles kept (64 kB each): a stage move or a re-render of the same place
+#: reads the tiles it has drawn before instead of drawing them again.
+NOISE_TILES_KEPT = 1024
+_NOISE_TILES: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
+_NOISE_LOCK = threading.Lock()
+
+
+def _noise_tile(seed: int, salt: int, tx: int, ty: int) -> np.ndarray:
+    key = (int(seed), int(salt), int(tx), int(ty))
+    with _NOISE_LOCK:
+        tile = _NOISE_TILES.get(key)
+        if tile is not None:
+            _NOISE_TILES.move_to_end(key)
+            return tile
+    rng = np.random.Generator(np.random.PCG64(hash_seed(seed, TEXTURE_KIND, mix_cell(tx, ty), salt)))
+    tile = rng.standard_normal((_TILE, _TILE), dtype=np.float32)
+    tile.flags.writeable = False
+    with _NOISE_LOCK:
+        _NOISE_TILES[key] = tile
+        while len(_NOISE_TILES) > NOISE_TILES_KEPT:
+            _NOISE_TILES.popitem(last=False)
+    return tile
+
+
 def world_normal_noise(ix0: int, iy0: int, ny: int, nx: int, seed: int, salt: int = 0) -> np.ndarray:
     """Standard-normal float32 noise on world cells (iy0..iy0+ny, ix0..ix0+nx).
 
@@ -229,9 +255,7 @@ def world_normal_noise(ix0: int, iy0: int, ny: int, nx: int, seed: int, salt: in
         for tx in range(tx0, tx1 + 1):
             xa = max(ix0, tx * _TILE)
             xb = min(ix0 + nx, (tx + 1) * _TILE)
-            rng = np.random.Generator(np.random.PCG64(
-                hash_seed(seed, TEXTURE_KIND, mix_cell(tx, ty), salt)))
-            tile = rng.standard_normal((_TILE, _TILE), dtype=np.float32)
+            tile = _noise_tile(seed, salt, tx, ty)
             out[ya - iy0:yb - iy0, xa - ix0:xb - ix0] = \
                 tile[ya - ty * _TILE:yb - ty * _TILE, xa - tx * _TILE:xb - tx * _TILE]
     if ty1 - ty0 < 2:
@@ -242,9 +266,30 @@ def world_normal_noise(ix0: int, iy0: int, ny: int, nx: int, seed: int, salt: in
     return out
 
 
+_DISKS: "OrderedDict[tuple, np.ndarray | None]" = OrderedDict()
+
+
 def disk_profile(shape: tuple[int, int], cx: float, cy: float, radius: float,
                  edge_sigma: float) -> np.ndarray | None:
-    """Soft top-hat (1 inside, 0 outside) or ``None`` when it covers the whole frame."""
+    """Soft top-hat (1 inside, 0 outside) or ``None`` when it covers the whole frame. The
+    last few are kept: the disc is fixed on the detector, so every view at one illumination
+    (a drag, a focus series) has the same one."""
+    key = (tuple(int(v) for v in shape), float(cx), float(cy), float(radius), float(edge_sigma))
+    with _NOISE_LOCK:
+        if key in _DISKS:
+            _DISKS.move_to_end(key)
+            return _DISKS[key]
+    prof = _disk_profile(shape, cx, cy, radius, edge_sigma)
+    if prof is not None:
+        prof.flags.writeable = False
+    with _NOISE_LOCK:
+        _DISKS[key] = prof
+        while len(_DISKS) > 4:
+            _DISKS.popitem(last=False)
+    return prof
+
+
+def _disk_profile(shape, cx, cy, radius, edge_sigma):
     h, w = shape
     far = math.hypot(max(cx + 0.5, w - cx - 0.5), max(cy + 0.5, h - cy - 0.5))
     if radius - 4.0 * edge_sigma >= far:

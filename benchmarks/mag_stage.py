@@ -106,6 +106,21 @@ def scenarios(tw, req):
     yield "jump 40,25 um", _frame(tw, req)
     col.move_stage(x=home.x_um, y=home.y_um)
     yield "jump back home", _frame(tw, req)
+    # a tilt series (alpha steps of 0.5 deg) and a return to a previous tilt
+    for a in (0.5, 1.0, 1.5):
+        col.move_stage(alpha=a)
+        yield f"tilt alpha {a:g} deg", _frame(tw, req)
+    col.move_stage(alpha=0.5)
+    yield "tilt back to 0.5 deg", _frame(tw, req)
+    col.move_stage(alpha=0.0)
+    _settle(tw, req)
+    # a defocus series and a return to a previous defocus
+    for df in (-0.5, -1.0, -1.5):
+        col.set_defocus_um(df)
+        yield f"defocus {df:g} um", _frame(tw, req)
+    col.set_defocus_um(-1.0)
+    yield "defocus back to -1 um", _frame(tw, req)
+    col.set_defocus_um(0.0)
 
 
 def main():

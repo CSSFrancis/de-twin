@@ -381,7 +381,7 @@ def render_legacy(fm, optics, grains, crystallinity, cfg) -> np.ndarray:
 class TransferCache:
     """Caches for the wave-optical model: exit-wave spectra and transfer functions."""
 
-    def __init__(self, size: int = 2):
+    def __init__(self, size: int = 4):
         self.spectra: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
         self.transfer: "OrderedDict[tuple, np.ndarray | None]" = OrderedDict()
         self.size = size

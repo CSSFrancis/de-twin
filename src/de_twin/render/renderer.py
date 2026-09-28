@@ -287,7 +287,7 @@ class Renderer:
             fm, token = self._panned_field_map(poptics, time_s)
             raster = render_tem_raster(fm, poptics, self.grains, self.crystallinity, self.config,
                                        self.seed, self._tem_cache, token, shift)
-            self._keep_pan("_pans", key, view.center_um, raster)
+            self._keep_pan("_pans", key, view.center_um, raster, poptics.view)
             img = self._crop_pan(key, view)
         else:
             self.frames_from_cache += 1
@@ -324,7 +324,7 @@ class Renderer:
             fm, token = self._panned_field_map(pad_optics, time_s, self._preview_fieldmaps)
             raster = render_tem_raster(fm, pad_optics, self.grains, self.crystallinity,
                                        self.config, self.seed, self._tem_cache, token, shift)
-            self._keep_pan("_pan_previews", pkey, pview.center_um, raster)
+            self._keep_pan("_pan_previews", pkey, pview.center_um, raster, pad_optics.view)
             img = self._crop_pan(pkey, pview, "_pan_previews")
         self.previews_rendered = getattr(self, "previews_rendered", 0) + 1
         out = finish_tem(img, poptics, self.config)
@@ -408,19 +408,24 @@ class Renderer:
         self._keep_field_map(store, (view, frozenset(TEM_LAYERS), gen, tkey), fm, token)
         return fm, token
 
-    def _keep_pan(self, slot: str, key, center_um, raster) -> None:
+    def _keep_pan(self, slot: str, key, center_um, raster, padded_view=None) -> None:
         pans = getattr(self, slot, None) or []
-        pans.insert(0, (key, center_um, raster))
+        pans.insert(0, (key, center_um, raster, padded_view))
         setattr(self, slot, pans[:max(1, self.config.pan_cache_size)])
 
     def _crop_pan(self, key, view, slot: str = "_pans"):
         pans = getattr(self, slot, None) or []
-        for i, (k, c0, raster) in enumerate(pans):
+        for i, (k, c0, raster, pview) in enumerate(pans):
             if k != key:
                 continue
             img = _crop(raster, c0, view)
             if img is not None:
                 pans.insert(0, pans.pop(i))
+                # the raster's field map is in use again: keep it (a focus or tilt change of
+                # this view re-renders from it without rasterising)
+                for store in (self._fieldmaps, self._preview_fieldmaps):
+                    for fk in [fk for fk in store if fk[0] == pview]:
+                        store.move_to_end(fk)
                 return img
         return None
 
