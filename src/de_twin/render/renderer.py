@@ -224,6 +224,9 @@ class Renderer:
         self.cache = DiffractionCache(self.config.diffraction_cache_mb)
         self._fieldmaps: "OrderedDict[tuple, tuple]" = OrderedDict()
         self._preview_fieldmaps: "OrderedDict[tuple, tuple]" = OrderedDict()
+        # the coherent STEM engine's fine views: their own store, so the transmission tiles of a
+        # sparse scan (one per point) do not push out the scan's own field map
+        self._fine_fieldmaps: "OrderedDict[tuple, tuple]" = OrderedDict()
         self._tokens = itertools.count(1)
         self._tem_cache = TransferCache()
         self._frame: Optional[tuple] = None
@@ -513,6 +516,7 @@ class Renderer:
         self._last_req = None
         self._fieldmaps.clear()
         self._preview_fieldmaps.clear()
+        self._fine_fieldmaps.clear()
         self._tem_cache = TransferCache()
         self._frame = None
         self.cache.clear()
@@ -628,7 +632,9 @@ class Renderer:
         from types import SimpleNamespace
 
         def fine(view):
-            return self.field_map(dataclasses.replace(optics, view=view), frozenset(), time_s)
+            with self._lock:
+                return self.field_map(dataclasses.replace(optics, view=view), frozenset(), time_s,
+                                      store=self._fine_fieldmaps)
         return SimpleNamespace(field_map=fine, grains=self.grains, crystallinity=self.crystallinity)
 
     def stem_model(self, optics) -> str:
