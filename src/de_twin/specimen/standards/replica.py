@@ -32,7 +32,9 @@ from ...hashing import SeedKind, hash_seed, normal_from_hash, splitmix64, unifor
 from ..fieldmap import grain_id_from_hash
 from ..geometry import NM_PER_UM, JitteredLattice
 from ..materials import MaterialId, absorption_lengths_nm
-from ..noise import FastLattice, cells, fbm
+from ..noise import LACUNARITY, FastLattice, cells, fbm
+from .. import raster_nb as _rnb
+from ..fieldmap import GRAINS_PER_MATERIAL
 from ..structures import _claim, _owner_pixels, _resolved
 from .common import StandardStructure
 
@@ -64,6 +66,34 @@ def island_film(seed: int, X_um, Y_um, deposit_nm, mean_deposit_nm: float, islan
         _, _, h = cells(seed ^ 0x1F, X_um[inside] / G, Y_um[inside] / G, 0.0)
         grain = grain_id_from_hash(metal, h)
     return inside, t, grain
+
+
+_LEVEL_LUT: list = []
+
+
+def _lattice_index(ctx, r: int, c: int) -> tuple[int, int]:
+    """(column, row) of raster pixel (r, c) on the view's world-fixed pixel lattice (the
+    renderer's `_lattice`: pixel units along the view's own axes from the world origin)."""
+    view = ctx.view
+    x, y = ctx.world(float(r), float(c))
+    x, y = float(x), float(y)
+    rot = float(getattr(view, "rotation_rad", 0.0))
+    if rot:
+        cr, sr = math.cos(rot), math.sin(rot)
+        x, y = cr * x + sr * y, -sr * x + cr * y
+    sx = -1.0 if getattr(view, "flip_x", False) else 1.0
+    sy = -1.0 if getattr(view, "flip_y", False) else 1.0
+    lc = sx * x * max(view.cos_beta, 0.1) / view.pixel_um
+    lr = sy * y * max(view.cos_alpha, 0.1) / view.pixel_um
+    return math.floor(lc + 1e-6), math.floor(lr + 1e-6)
+
+
+def _level_lut(cov, half, levels, table):
+    """`stamps._level_offset` on a fine coverage grid (built once: 8192 x 3 floats)."""
+    if not _LEVEL_LUT:
+        _LEVEL_LUT.append(_rnb.level_offset_lut(cov, half, levels, table, __import__(
+            "de_twin.specimen.stamps", fromlist=["_OFFSETS"])._OFFSETS))
+    return _LEVEL_LUT[0]
 
 
 def carbon_equivalent(metal: int, ht_kv: float = 200.0) -> float:
@@ -206,6 +236,14 @@ class LatexSpheres:
 
 
 # ------------------------------------------------------------------ the replica structure
+#: The replica texture's slope (which sets the angled metal deposit) from the noise's own
+#: derivative, one evaluation per pixel; False: finite differences over 2 nm, three (the
+#: NumPy fill's arithmetic).
+ANALYTIC_SLOPE = True
+#: In that mode the replica's aperiodic noise is evaluated on node grids this many nodes per
+#: wavelength of each field's finest octave and interpolated per pixel.
+NODES_PER_WAVELENGTH = 12
+
 #: Angular size of the evaporation source seen from the specimen (radians): the penumbra.
 SHADOW_PENUMBRA_RAD = math.radians(4.0)
 
@@ -321,6 +359,130 @@ class ShadowedReplicaStructure(StandardStructure):
         h0 = h(x, y)
         return h0, (h(x + e, y) - h0) / (e * NM_PER_UM), (h(x, y + e) - h0) / (e * NM_PER_UM)
 
+    def numba_fill(self) -> bool:
+        return _rnb.AVAILABLE and (self.crumple_nm > 0 or self.rough_nm > 0)
+
+    def _fill_fast(self, ctx, owner, seed, px, mean_c, flat, rough, islands, tile):
+        """`fill` through the numba kernel (:func:`..raster_nb.replica_block`): the same
+        per-pixel arithmetic, in parallel rows."""
+        from ..noise import fbm_params
+        from ..stamps import LABYRINTH, _OFFSETS, _coverage_table, period_px_cached, phase_tiles
+
+        b = owner.bounds
+        win = ctx.window(b.xmin, b.ymin, b.xmax, b.ymax)
+        if win is None:
+            return
+        r0, r1, c0, c1 = win
+        relief = self.relief
+        specs = [(seed ^ 0x51, relief.wavy_um if relief else 1.0, 2, 0.5),
+                 (seed ^ 0x52, relief.wavy_um if relief else 1.0, 2, 0.5),
+                 (seed ^ 0x61, relief.edge_corr if relief else 1.0, 2, 0.5),
+                 (seed ^ 0x62, relief.edge_corr if relief else 1.0, 2, 0.5),
+                 (seed ^ 0x93, self.crumple_um, 2, 0.5), (seed ^ 0x91, self.rough_um, 4, 0.6)]
+        FS = np.zeros((6, 4), np.uint64)
+        FC, FSN, FA = (np.zeros((6, 4)) for _ in range(3))
+        FN = np.zeros(6, np.int64)
+        for k, (sd, sc, octs, gain) in enumerate(specs):
+            a, c, sn, am = fbm_params(sd, sc, octs, gain)
+            FS[k, :octs], FC[k, :octs], FSN[k, :octs], FA[k, :octs], FN[k] = a, c, sn, am, octs
+        has_relief = tile is not None
+        spheres = self.spheres is not None
+        FL = np.array([has_relief, self.crumple_nm > 0, rough and self.rough_nm > 0, spheres, self.spheres_shadowed,
+                       self.metal_nm > 0, islands, bool(relief and relief.wavy > 0),
+                       bool(relief and relief.edge > 0), ANALYTIC_SLOPE], np.bool_)
+        R = np.array([relief.wavy if relief else 0.0, relief.edge if relief else 0.0,
+                      relief.P if relief else 1.0, WAVY_ACROSS])
+        stack = (np.stack([tile.h, tile.gx, tile.gy, tile.lit]) if has_relief
+                 else np.zeros((4, 1, 1), np.float32))
+        TX = np.array([self.crumple_nm, self.rough_nm, 0.002])
+        ux, uy = self.u
+        D = np.array([self.metal_nm, math.sin(self.elev), math.cos(self.elev), ux, uy, flat, self.shadow_leak,
+                      self.base, mean_c, carbon_equivalent(self.sphere_material)])
+        M = np.array([self.metal, self.sphere_material, int(MaterialId.AMORPHOUS_CARBON), GRAINS_PER_MATERIAL],
+                     np.int64)
+        tiles, cov = phase_tiles()
+        half = int(np.argmin(np.abs(cov - LABYRINTH)))
+        levels, table = _coverage_table()
+        feat = self.island_nm / NM_PER_UM
+        I = np.array([self.coverage, period_px_cached() / feat, 1.0 / (12.0 * feat), 6.0,
+                      self.grain_nm / NM_PER_UM, cov[1], cov[half]])
+        fseed = np.uint64(int(seed) & 0xFFFFFFFFFFFFFFFF)
+        cseed = np.uint64(((int(seed) ^ 0x1F) * 0xC2B2AE3D27D4EB4F) & 0xFFFFFFFFFFFFFFFF)
+        covs = np.ascontiguousarray(cov[1:half + 1], np.float64)
+        lvx = np.arange(1, half + 1, dtype=np.float64)
+        W = np.array([ctx.ox, ctx.oy, ctx.axc, ctx.ayc, ctx.axr, ctx.ayr])
+        O = np.array([owner.cx, owner.cy, math.cos(-owner.rot), math.sin(-owner.rot), owner.rx, owner.ry])
+        new_under = ctx.under_thick is None
+        uthick = np.zeros(ctx.npix, np.float32) if new_under else ctx.under_thick
+        umat = np.zeros(ctx.npix, np.uint8) if new_under else ctx.under_material
+        used = np.zeros(1, np.uint8)
+        bstep = max(1, ctx.BLOCK_PIXELS // max(1, c1 - c0))  # ctx.row_blocks
+        nblk = (r1 - r0 + bstep - 1) // bstep if spheres else 1
+        SPB = np.zeros((nblk, 11))
+        SNB = np.ones((nblk, 2), np.int64)
+        BSO = np.zeros((nblk, 2), np.int64)
+        cxs, cys, rs, starts, members = [], [], [], [], []
+        n_sph = n_mem = 0
+        if spheres:  # the spheres of each row block's pixels, as the NumPy fill builds them per block
+            ce, se = math.cos(self.elev), math.sin(self.elev)
+            step = max(px, 1.0 / NM_PER_UM)
+            for kb, (a, bb) in enumerate(ctx.row_blocks(r0, r1, c1 - c0)):
+                rows = np.arange(a, bb)[:, None]
+                cols = np.arange(c0, c1)[None, :]
+                X, Y = ctx.world(rows, cols)
+                dx, dy = X - owner.cx, Y - owner.cy
+                lx = dx * O[2] - dy * O[3]
+                ly = dx * O[3] + dy * O[2]
+                m = (np.abs(lx) <= owner.rx) & (np.abs(ly) <= owner.ry)
+                s0 = sum(len(x) for x in starts)
+                if not m.any():
+                    starts.append(np.zeros(2, np.int64) + n_mem)
+                    BSO[kb] = (s0, s0 + 2)
+                    continue
+                ss = self._sphere_set(seed, lx[m], ly[m])
+                rmax = float(ss.r.max()) if ss.r.size else 0.0
+                reach = 2.0 * rmax / max(math.tan(self.elev), 1e-3) + rmax
+                SPB[kb] = (ss.x0, ss.y0, 1.0 / ss.bin, step, step * NM_PER_UM, ux * ce, uy * ce, se, reach,
+                           0.5 * ss.bin, SHADOW_PENUMBRA_RAD)
+                SNB[kb] = (ss.nx, ss.ny)
+                cxs.append(ss.cx)
+                cys.append(ss.cy)
+                rs.append(ss.r)
+                starts.append(ss.start + n_mem)
+                members.append(ss.members + n_sph)
+                BSO[kb] = (s0, s0 + len(ss.start))
+                n_sph += ss.cx.size
+                n_mem += ss.members.size
+        cat = (lambda xs, dt: np.ascontiguousarray(np.concatenate(xs), dt) if xs else np.zeros(1, dt))
+        sarr = (cat(cxs, np.float64), cat(cys, np.float64), cat(rs, np.float64), cat(starts, np.int64),
+                cat(members, np.int64))
+        # node grids of the aperiodic noise (analytic mode): strides a fraction of each field's
+        # finest octave, in raster pixels (1: every pixel, as at low magnification)
+        finest = [((relief.wavy_um if relief else 1.0) / LACUNARITY, bool(FL[7])),
+                  ((relief.edge_corr if relief else 1.0) / LACUNARITY, bool(FL[8])),
+                  (self.crumple_um / LACUNARITY, bool(FL[1])),
+                  (self.rough_um / LACUNARITY ** 3, bool(FL[2]))]
+        ST = np.array([max(1, min(32, int(sc / (px * NODES_PER_WAVELENGTH)))) if (on and ANALYTIC_SLOPE) else 1
+                       for sc, on in finest], np.int64)
+        # the node lattice is world-fixed: raster pixel (r0, c0) is lattice pixel (gr, gc) of the
+        # view's pixel lattice, and nodes sit on its multiples of s, so the pieces of a raster
+        # (strips, the part a stage move brings in) interpolate the same nodes as the whole
+        gc, gr = _lattice_index(ctx, r0, c0)
+        OFF = np.array([[gr - (gr // s) * s, gc - (gc // s) * s] for s in ST], np.int64)
+        nodes = []
+        for q, (s, (_, on)) in enumerate(zip(ST, finest)):
+            shape = ((r1 - 1 - r0 + OFF[q, 0]) // s + 2, (c1 - 1 - c0 + OFF[q, 1]) // s + 2, 2 if q < 2 else 3) \
+                if (on and ANALYTIC_SLOPE and s > 1) else (1, 1, 3)  # stride 1: evaluated per pixel
+            nodes.append(np.zeros(shape))
+        if ANALYTIC_SLOPE:
+            _rnb.replica_nodes(r0, r1, c0, c1, W, O, FS, FC, FSN, FA, FN, R, TX,
+                               ST, OFF, *nodes)
+        _rnb.replica_block(ctx.thick, ctx.material, ctx.grain, uthick, umat, used, ctx.nx, r0, r1, c0, c1, W, O,
+                           FL, R, stack, FS, FC, FSN, FA, FN, TX, *sarr, SPB, SNB, BSO, bstep, D, M, I, tiles, fseed,
+                           cseed, covs, lvx, levels, table, _OFFSETS, ST, OFF, *nodes, *_level_lut(cov, half, levels, table))
+        if new_under and used[0]:
+            ctx.under_material, ctx.under_thick = umat, uthick
+
     def fill(self, ctx, owner):
         seed = int(hash_seed(owner.seed, SeedKind.STRUCTURE, 0)) & 0xFFFFFFFF
         px = ctx.pixel_um
@@ -336,6 +498,10 @@ class ShadowedReplicaStructure(StandardStructure):
         tile = self.tile()
         ux, uy = self.u
         sin_e, cos_e, tan_e = math.sin(self.elev), math.cos(self.elev), math.tan(self.elev)
+        if _rnb.AVAILABLE and (rough or self.crumple_nm > 0):
+            self._fill_fast(ctx, owner, seed, px, mean_c, flat, rough, islands, tile)
+            ctx.stats["fast_fills"] = ctx.stats.get("fast_fills", 0) + 1
+            return
         for B in _owner_pixels(ctx, owner):
             lx, ly = B.lx, B.ly
             # the relief (looked up) and the replica's own crumpled surface (noise)

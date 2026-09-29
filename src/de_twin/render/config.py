@@ -34,12 +34,33 @@ class RenderConfig:
     #: serves a stage move that stays inside the margin by cropping it: the image moves
     #: rigidly with the specimen, so a joystick nudge costs a crop, not a render. 0 off.
     pan_margin: float = 0.15
+    #: Pad by the objective's point spread instead (`renderer.transfer_spread_px`, x1.3,
+    #: rounded up to one of a few guard sizes, ``min_margin_px`` to ``max_margin_px``): a
+    #: smaller raster and FFT near focus and at low magnification, a wider guard at large
+    #: defocus and high magnification. ``pan_margin`` is then unused.
+    adaptive_margin: bool = True
+    min_margin_px: int = 64
+    max_margin_px: int = 256
+    #: Padded rasters kept for cropping (a jump back to a recent place is a crop too).
+    pan_cache_size: int = 6
+    #: A new padded raster takes the specimen it shares with a cached one (same sampling, on
+    #: the same world-fixed pixel lattice) from that one's field map when they overlap by at
+    #: least ``reuse_min_overlap`` of its area, and rasterises only the rest.
+    reuse_rasters: bool = True
+    reuse_min_overlap: float = 0.25
+    #: Threads a large raster is rasterised on, in row strips (1 = serial). Each strip's
+    #: numba kernels get the matching share of numba's threads.
+    raster_threads: int = 4
     #: Interactive use (dragging the stage, zooming): while the view keeps changing, a
     #: view the cache cannot crop is rendered at up to ``preview_side`` squared and upsampled
     #: (~35-70 ms rather than ~0.3-0.9 s); the first time the same view is asked for
     #: again — the next frame after you stop — it is rendered in full. Off by default,
     #: so a library caller always gets the full render.
     interactive: bool = False
+    #: Live view: after each new view, render the view that repeating the last change would
+    #: give (the next magnification rung, tilt, focus or stage step) in the background, so
+    #: stepping through a series is a crop. One view at a time; the latest wins.
+    prefetch: bool = False
     preview_side: int = 256
     #: How long (wall-clock seconds) the view must stay put before it counts as stopped
     #: and is rendered in full. Live view asks for several frames per drag step, so

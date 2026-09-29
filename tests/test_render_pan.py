@@ -9,7 +9,9 @@ from de_twin.twin import DigitalTwin
 
 
 def _pair(name="Dense Au on holey C"):
-    pan = DigitalTwin(name, camera="DESim", clock=ManualClock(), seed=3)
+    # the fixed pan margin (a 15 % guard on every side), not the adaptive guard band
+    pan = DigitalTwin(name, camera="DESim", clock=ManualClock(), seed=3,
+                      render_config=RenderConfig(adaptive_margin=False))
     ref = DigitalTwin(name, camera="DESim", clock=ManualClock(), seed=3,
                       render_config=RenderConfig(pan_margin=0.0))
     return pan, ref

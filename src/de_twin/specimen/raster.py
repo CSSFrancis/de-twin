@@ -27,8 +27,9 @@ from typing import Optional
 import numpy as np
 
 from ..hashing import SeedKind, hash_seed, uniform_from_hash
+from . import raster_nb as _nb
 from .fieldmap import LAYER_DESCAN, LAYER_STRAIN, FieldMap, GrainTable, ViewWindow
-from .geometry import AABB, DUST_THRESHOLD_PX, ROUGH_PEAK, rough_rmod
+from .geometry import AABB, DUST_THRESHOLD_PX, ROUGH_PEAK, ROUGH_PERIOD, rough_rmod
 
 
 class Shape(IntEnum):
@@ -184,9 +185,12 @@ class RasterContext:
     BLOCK_PIXELS = 1 << 17
 
     def __init__(self, view: ViewWindow, layers=frozenset(), grains: Optional[GrainTable] = None,
-                 time_index: int = 0, lod_threshold_px: float = 0.5):
+                 time_index: int = 0, lod_threshold_px: float = 0.5, span_px: Optional[int] = None):
         self.view = view
         self.ny, self.nx = int(view.shape[0]), int(view.shape[1])
+        #: The size (pixels) of the view this raster is part of: what the scene's populate /
+        #: aggregate choice is made on, so a piece of a view is drawn as the whole view is.
+        self.span_px = int(span_px) if span_px else max(self.ny, self.nx)
         self.npix = self.ny * self.nx
         x00, y00 = view.pixel_to_world(0.0, 0.0)
         xr, yr = view.pixel_to_world(1.0, 0.0)
@@ -204,11 +208,13 @@ class RasterContext:
         self.grains = grains
         self.time_index = int(time_index)
         self.lod_threshold_px = float(lod_threshold_px)
-        self.material = np.zeros(self.npix, np.uint8)
-        self.thick = np.zeros(self.npix, np.float32)
-        self.grain = np.full(self.npix, -1, np.int32)
-        self.area = np.full(self.npix, -1, np.int32)
-        self._mark = np.full(self.npix, -1, np.int32)
+        from .. import buffers  # recycled: their pages are mapped already (see de_twin.buffers)
+
+        self.material = buffers.zeros(self.npix, np.uint8)
+        self.thick = buffers.zeros(self.npix, np.float32)
+        self.grain = buffers.full(self.npix, -1, np.int32)
+        self.area = buffers.full(self.npix, -1, np.int32)
+        self._mark = buffers.full(self.npix, -1, np.int32)
         self.descan = np.zeros((2, self.npix), np.float32) if LAYER_DESCAN in self.layers else None
         if LAYER_STRAIN in self.layers:
             self.strain = np.zeros((3, self.npix), np.float32)
@@ -567,6 +573,13 @@ def paint_large(ctx: RasterContext, P: PrimitiveSet, i: int, curtain_depth: floa
     if win is None:
         return
     co = _affine_coeffs(ctx, P, i)
+    profile = int(P.profile[i])
+    if _nb.AVAILABLE and profile != Profile.CURTAIN:
+        _nb.paint_large(ctx.thick, ctx.material, ctx.grain, ctx.nx, win[0], win[1], np.array(co, np.float64),
+                        shape == Shape.RECT, float(P.inner_frac[i]) ** 2 if shape == Shape.RING else -1.0,
+                        profile, float(P.thickness[i]), np.uint8(P.material[i]), int(P.grain[i]),
+                        bool(P.layer[i] != Layer.SUPPORT_FILM))
+        return
     sel = np.array([i])
     step = max(1, max_px // max(1, win[3] - win[2]))
     for a in range(win[0], win[1], step):
@@ -605,8 +618,14 @@ def paint_drawn(ctx: RasterContext, P: PrimitiveSet, idx: np.ndarray, curtain_de
     for shape in np.unique(shapes):
         for profile in np.unique(profiles[shapes == shape]):
             grp = idx[(shapes == shape) & (profiles == profile)]
+            fast = _nb.AVAILABLE and int(profile) != Profile.CURTAIN
+            if not fast:
+                ctx.stats["numpy_prims"] = ctx.stats.get("numpy_prims", 0) + 1
             for sub, rows, cols, valid in iter_patches(ctx, P.xmin[grp], P.ymin[grp], P.xmax[grp], P.ymax[grp]):
                 sel = grp[sub]
+                if fast:
+                    _paint_patch_fast(ctx, P, sel, rows, cols, valid, int(shape), int(profile))
+                    continue
                 lx, ly = _local_frame(ctx, P, sel, rows, cols)
                 r2 = lx * lx + ly * ly
                 inside = _inside(P, sel, int(shape), lx, ly, r2) & valid
@@ -621,6 +640,33 @@ def paint_drawn(ctx: RasterContext, P: PrimitiveSet, idx: np.ndarray, curtain_de
                 overwrite = P.layer[sel] != Layer.SUPPORT_FILM
                 ctx.apply(flat, np.broadcast_to(t, m.shape)[m], P.material[sel][owner],
                           P.grain[sel][owner], overwrite=overwrite[owner])
+
+
+def _paint_patch_fast(ctx, P, sel, rows, cols, valid, shape: int, profile: int):
+    """One patch of `paint_drawn` through :func:`.raster_nb.paint_patch`."""
+    n = len(sel)
+    ang = -P.rot[sel]
+    c = np.cos(ang)
+    s = np.sin(ang)
+    rx = P.rx[sel]
+    ry = P.ry[sel]
+    irx = np.where(rx > 0, 1.0 / np.where(rx > 0, rx, 1.0), 0.0)
+    iry = np.where(ry > 0, 1.0 / np.where(ry > 0, ry, 1.0), 0.0)
+    dx0 = ctx.ox - P.cx[sel]
+    dy0 = ctx.oy - P.cy[sel]
+    co = np.stack([irx * (c * dx0 - s * dy0), irx * (c * ctx.axc - s * ctx.ayc), irx * (c * ctx.axr - s * ctx.ayr),
+                   iry * (s * dx0 + c * dy0), iry * (s * ctx.axc + c * ctx.ayc), iry * (s * ctx.axr + c * ctx.ayr)], 1)
+    vb = np.broadcast_to(valid, (n, rows.shape[1], cols.shape[2]))
+    hs = vb[:, :, 0].sum(1).astype(np.int64)
+    ws = vb[:, 0, :].sum(1).astype(np.int64)
+    r0s = np.ascontiguousarray(rows[:, 0, 0], np.int64)
+    c0s = np.ascontiguousarray(cols[:, 0, 0], np.int64)
+    fj = np.ascontiguousarray(P.facet_j[sel], np.float64).reshape(n, -1)
+    _nb.paint_patch(ctx, np.ascontiguousarray(co), r0s, c0s, hs, ws, shape, profile,
+                    P.thickness[sel].astype(np.float64), P.inner_frac[sel].astype(np.float64),
+                    P.facet_n[sel].astype(np.int64), fj, P.material[sel].astype(np.uint8),
+                    P.grain[sel].astype(np.int32), P.layer[sel] != Layer.SUPPORT_FILM, float(ROUGH_PERIOD),
+                    (1.0 - ROUGH_PEAK) ** 2, (1.0 + ROUGH_PEAK) ** 2)
 
 
 def paint_dust(ctx: RasterContext, P: PrimitiveSet, idx: np.ndarray):

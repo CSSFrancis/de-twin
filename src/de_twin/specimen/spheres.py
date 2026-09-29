@@ -36,6 +36,53 @@ def _bin_of(x, y, x0, y0, inv, nx, ny):
     return j * nx + i
 
 
+@_njit()
+def top_chord1(xk, yk, cx, cy, r, start, members, x0, y0, inv, nx, ny):
+    """(top, chord) of `_top_chord_nb` at one point (um)."""
+    b = _bin_of(xk, yk, x0, y0, inv, nx, ny)
+    t = 0.0
+    c = 0.0
+    if b >= 0:
+        for m in range(start[b], start[b + 1]):
+            s = members[m]
+            dx = xk - cx[s]
+            dy = yk - cy[s]
+            d2 = r[s] * r[s] - dx * dx - dy * dy
+            if d2 > 0.0:
+                half = math.sqrt(d2)
+                c += 2.0 * half
+                if r[s] + half > t:
+                    t = r[s] + half
+    return t, c
+
+
+@_njit()
+def occlusion1(xk, yk, zk, cx, cy, r, start, members, x0, y0, inv, nx, ny, dx, dy, dz, reach, step, pen):
+    """`_occlusion_nb` at one point."""
+    occ = 0.0
+    last = -2
+    s_ = 0.0
+    while s_ <= reach:
+        b = _bin_of(xk + dx / math.sqrt(dx * dx + dy * dy) * s_, yk + dy / math.sqrt(dx * dx + dy * dy) * s_,
+                    x0, y0, inv, nx, ny)
+        if b >= 0 and b != last:
+            for m in range(start[b], start[b + 1]):
+                s = members[m]
+                px = cx[s] - xk
+                py = cy[s] - yk
+                pz = r[s] - zk
+                t = px * dx + py * dy + pz * dz
+                if t > 0.5 * r[s]:
+                    D = math.sqrt(max(px * px + py * py + pz * pz - t * t, 0.0))
+                    w = max(t * pen, 1e-9)
+                    o = (r[s] - D) / w + 0.5
+                    if o > occ:
+                        occ = min(o, 1.0)
+        last = b
+        s_ += step
+    return occ
+
+
 @_njit(parallel=True)
 def _top_chord_nb(x, y, cx, cy, r, start, members, x0, y0, inv, nx, ny, top, chord):
     for k in _prange(x.size):

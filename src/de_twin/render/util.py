@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 import os
+import threading
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -35,10 +37,92 @@ def parallel_rows(fn, nrows: int, min_chunk: int = 64) -> None:
     list(pool().map(lambda i: fn(int(edges[i]), int(edges[i + 1])), range(n)))
 
 
+try:  # numba: the cubic resampling kernel (NumPy fallback below)
+    import numba as _nb
+
+    @_nb.njit(parallel=True, cache=True, nogil=True)
+    def _cubic_nb(src, wr, wc, out):  # pragma: no cover - compiled
+        ny, nx = out.shape
+        for i in _nb.prange(ny):
+            for j in range(nx):
+                acc = 0.0
+                for a in range(4):
+                    row = 0.0
+                    for b in range(4):
+                        row += wc[b] * src[i + a, j + b]
+                    acc += wr[a] * row
+                out[i, j] = acc if acc > 0.0 else 0.0
+except Exception:  # noqa: BLE001
+    _cubic_nb = None
+
+
+def cubic_resample(src: np.ndarray, wr: np.ndarray, wc: np.ndarray, shape) -> np.ndarray:
+    """``out[i, j] = max(0, sum_ab wr[a] wc[b] src[i + a, j + b])`` for a 4 x 4 tap kernel:
+    a separable sub-pixel shift of ``src`` (``shape`` + 3 on each axis) to ``shape``."""
+    ny, nx = shape
+    out = np.empty((ny, nx), np.float32)
+    if _cubic_nb is not None:
+        _cubic_nb(np.asarray(src, np.float32), wr.astype(np.float32), wc.astype(np.float32), out)
+        return out
+    tmp = wr[0] * src[0:ny]
+    for k in range(1, 4):
+        tmp += wr[k] * src[k:k + ny]
+    acc = wc[0] * tmp[:, 0:nx]
+    for k in range(1, 4):
+        acc += wc[k] * tmp[:, k:k + nx]
+    return np.maximum(acc, 0.0, out=out)
+
+
+def gaussian_filter_threaded(a: np.ndarray, sigma: float, **kw) -> np.ndarray:
+    """``scipy.ndimage.gaussian_filter`` of a 2-D array, the same numbers, with each axis's
+    1-D pass split into strips on the shared pool (ndimage releases the GIL)."""
+    from scipy import ndimage
+
+    tmp = np.empty_like(a)
+    out = np.empty_like(a)
+    parallel_rows(lambda c0, c1: ndimage.gaussian_filter1d(a[:, c0:c1], sigma, axis=0,
+                                                           output=tmp[:, c0:c1], **kw), a.shape[1], 32)
+    parallel_rows(lambda r0, r1: ndimage.gaussian_filter1d(tmp[r0:r1], sigma, axis=1,
+                                                           output=out[r0:r1], **kw), a.shape[0], 32)
+    return out
+
+
+if _cubic_nb is not None:
+    @_nb.njit(parallel=True, cache=True, nogil=True)
+    def _up2x_nb(a, c0, c1, out):  # pragma: no cover - compiled
+        """`upsample2x_scaled` in one pass, the same float32 arithmetic in the same order."""
+        ny, nx = a.shape
+        q0 = np.float32(0.75)
+        q1 = np.float32(0.25)
+        for i in _nb.prange(ny):
+            ip = i - 1 if i > 0 else 0
+            inx = i + 1 if i < ny - 1 else ny - 1
+            for half in range(2):
+                src2 = ip if half == 0 else inx
+                o = 2 * i + half
+                # the row pass at padded columns j - 1, j, j + 1 (edge clamped)
+                for j in range(nx):
+                    jm = j - 1 if j > 0 else 0
+                    jp = j + 1 if j < nx - 1 else nx - 1
+                    um = a[i, jm] * c0 + c1 * a[src2, jm]
+                    u = a[i, j] * c0 + c1 * a[src2, j]
+                    up = a[i, jp] * c0 + c1 * a[src2, jp]
+                    out[o, 2 * j] = u * q0 + q1 * um
+                    out[o, 2 * j + 1] = u * q0 + q1 * up
+else:
+    _up2x_nb = None
+
+
 def upsample2x_scaled(a: np.ndarray, scale: float = 1.0) -> np.ndarray:
     """Threaded pixel-centre bilinear 2x upsampling (edge clamped) times ``scale``."""
     a = np.asarray(a, np.float32)
     ny, nx = a.shape
+    if _up2x_nb is not None:
+        from .. import buffers
+
+        out = buffers.empty((2 * ny, 2 * nx), np.float32)
+        _up2x_nb(a, np.float32(0.75 * scale), np.float32(0.25 * scale), out)
+        return out
     p = np.pad(a, 1, mode="edge")
     out = np.empty((2 * ny, 2 * nx), np.float32)
     c0 = np.float32(0.75 * scale)
@@ -132,33 +216,83 @@ def _add_shifted(out, a, sx, sy, w):
     out[ys_dst, xs_dst] += w * a[ys_src, xs_src]
 
 
-def world_normal_noise(ix0: int, iy0: int, ny: int, nx: int, seed: int, salt: int = 0) -> np.ndarray:
+#: World noise tiles kept (64 kB each): a stage move or a re-render of the same place
+#: reads the tiles it has drawn before instead of drawing them again.
+NOISE_TILES_KEPT = 1024
+_NOISE_TILES: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
+_NOISE_LOCK = threading.Lock()
+
+
+def _noise_tile(seed: int, salt: int, tx: int, ty: int) -> np.ndarray:
+    key = (int(seed), int(salt), int(tx), int(ty))
+    with _NOISE_LOCK:
+        tile = _NOISE_TILES.get(key)
+        if tile is not None:
+            _NOISE_TILES.move_to_end(key)
+            return tile
+    rng = np.random.Generator(np.random.PCG64(hash_seed(seed, TEXTURE_KIND, mix_cell(tx, ty), salt)))
+    tile = rng.standard_normal((_TILE, _TILE), dtype=np.float32)
+    tile.flags.writeable = False
+    with _NOISE_LOCK:
+        _NOISE_TILES[key] = tile
+        while len(_NOISE_TILES) > NOISE_TILES_KEPT:
+            _NOISE_TILES.popitem(last=False)
+    return tile
+
+
+def world_normal_noise(ix0: int, iy0: int, ny: int, nx: int, seed: int, salt: int = 0,
+                       out: np.ndarray | None = None) -> np.ndarray:
     """Standard-normal float32 noise on world cells (iy0..iy0+ny, ix0..ix0+nx).
 
     Cells are grouped in 128x128 world tiles, each drawn from a PCG64 stream
     seeded by ``hash_seed(seed, TEXTURE_KIND, mix_cell(tx, ty), salt)``, so the
     value of a cell never depends on the view it is rendered in.
     """
-    out = np.empty((ny, nx), np.float32)
+    out = np.empty((ny, nx), np.float32) if out is None else out
     tx0, tx1 = ix0 // _TILE, (ix0 + nx - 1) // _TILE
     ty0, ty1 = iy0 // _TILE, (iy0 + ny - 1) // _TILE
-    for ty in range(ty0, ty1 + 1):
+
+    def row(ty):
         ya = max(iy0, ty * _TILE)
         yb = min(iy0 + ny, (ty + 1) * _TILE)
         for tx in range(tx0, tx1 + 1):
             xa = max(ix0, tx * _TILE)
             xb = min(ix0 + nx, (tx + 1) * _TILE)
-            rng = np.random.Generator(np.random.PCG64(
-                hash_seed(seed, TEXTURE_KIND, mix_cell(tx, ty), salt)))
-            tile = rng.standard_normal((_TILE, _TILE), dtype=np.float32)
+            tile = _noise_tile(seed, salt, tx, ty)
             out[ya - iy0:yb - iy0, xa - ix0:xb - ix0] = \
                 tile[ya - ty * _TILE:yb - ty * _TILE, xa - tx * _TILE:xb - tx * _TILE]
+    if ty1 - ty0 < 2:
+        for ty in range(ty0, ty1 + 1):
+            row(ty)
+    else:  # tile rows on the shared pool (the generators release the GIL)
+        list(pool().map(row, range(ty0, ty1 + 1)))
     return out
+
+
+_DISKS: "OrderedDict[tuple, np.ndarray | None]" = OrderedDict()
 
 
 def disk_profile(shape: tuple[int, int], cx: float, cy: float, radius: float,
                  edge_sigma: float) -> np.ndarray | None:
-    """Soft top-hat (1 inside, 0 outside) or ``None`` when it covers the whole frame."""
+    """Soft top-hat (1 inside, 0 outside) or ``None`` when it covers the whole frame. The
+    last few are kept: the disc is fixed on the detector, so every view at one illumination
+    (a drag, a focus series) has the same one."""
+    key = (tuple(int(v) for v in shape), float(cx), float(cy), float(radius), float(edge_sigma))
+    with _NOISE_LOCK:
+        if key in _DISKS:
+            _DISKS.move_to_end(key)
+            return _DISKS[key]
+    prof = _disk_profile(shape, cx, cy, radius, edge_sigma)
+    if prof is not None:
+        prof.flags.writeable = False
+    with _NOISE_LOCK:
+        _DISKS[key] = prof
+        while len(_DISKS) > 4:
+            _DISKS.popitem(last=False)
+    return prof
+
+
+def _disk_profile(shape, cx, cy, radius, edge_sigma):
     h, w = shape
     far = math.hypot(max(cx + 0.5, w - cx - 0.5), max(cy + 0.5, h - cy - 0.5))
     if radius - 4.0 * edge_sigma >= far:

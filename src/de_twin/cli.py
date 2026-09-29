@@ -9,6 +9,9 @@
     # and let DE-Server poll the twin's column as its TEM-Channel
     de-twin serve --shm --soap 5002 --camera DE16
 
+    # ... as a live view (Ground Crew): fast previews while the stage or mag changes
+    de-twin serve --shm --soap 5002 --camera DE16 --interactive
+
     # Follow a real / Dummy DE-TEM-Channel instead of simulating the column,
     # and a real DENS Impulse holder
     de-twin serve --shm --mirror-temchannel 192.168.0.10 --holder impulse
@@ -45,6 +48,11 @@ def _build_twin(args):
 
         column = Column(clock=clock, corrector=args.corrector, seed=args.seed,
                         corrector_options={"tuned": not args.corrector_cold})
+    render_config = None
+    if getattr(args, "interactive", False):
+        from .render import RenderConfig
+
+        render_config = RenderConfig(interactive=True, prefetch=True)
     return DigitalTwin(
         specimen=args.specimen,
         camera=args.camera,
@@ -52,6 +60,7 @@ def _build_twin(args):
         holder=args.holder,
         seed=args.seed,
         clock=clock,
+        render_config=render_config,
     )
 
 
@@ -178,6 +187,10 @@ def main(argv=None) -> int:
     p.add_argument("--threads", type=int, default=None, metavar="N",
                    help="shared memory: cores the detector physics may use (leave the rest for "
                         "DE-Server's processing)")
+    p.add_argument("--interactive", action="store_true",
+                   help="live view: while the stage or magnification keeps changing, show a fast "
+                        "low-resolution render and the full one once the view settles "
+                        "(RenderConfig.interactive)")
     p.set_defaults(func=cmd_serve)
 
     p = sub.add_parser("snap", help="render one frame to a file")

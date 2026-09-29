@@ -268,9 +268,60 @@ class DigitalTwin:
             if scan_point is None:
                 scan_point = self.scan_point(request, frame_index)
             img = self.renderer.render(optics, frame_index=frame_index, scan_point=scan_point, time_s=t)
+            if self.renderer.config.prefetch and optics.render_mode == RenderMode.TEM_IMAGING:
+                self._prefetch_next(request, state, t)
             if img.shape != shape:
                 img = _fit(img, shape)
             return img
+
+    # -------------------------------------------------------------- prefetch
+    _VIEW_FIELDS = ("magnification", "defocus_um")
+    _STAGE_FIELDS = ("x_um", "y_um", "alpha_deg", "beta_deg")
+
+    def _view_of(self, state: MicroscopeState) -> tuple:
+        return (tuple(getattr(state, f) for f in self._VIEW_FIELDS)
+                + tuple(getattr(state.stage, f) for f in self._STAGE_FIELDS))
+
+    def _prefetch_next(self, request: AcquisitionRequest, state: MicroscopeState, t: float) -> None:
+        """A new view: render, in the background, the one repeating the last change gives."""
+        cur = self._view_of(state)
+        last = getattr(self, "_pf_last", None)
+        if last is not None and last[0] == cur:
+            return
+        self._pf_last = (cur, state.copy())
+        if last is None:
+            return
+        prev = last[1]
+        nxt = state.copy()
+        changed = False
+        if state.magnification != prev.magnification:
+            ladder = list(self.column.mag_ladder() or ())
+            if state.magnification in ladder and prev.magnification in ladder:
+                i = 2 * ladder.index(state.magnification) - ladder.index(prev.magnification)
+                if 0 <= i < len(ladder):
+                    nxt.magnification = ladder[i]
+                    changed = True
+        for f in ("defocus_um",):
+            d = getattr(state, f) - getattr(prev, f)
+            if d:
+                setattr(nxt, f, getattr(state, f) + d)
+                changed = True
+        for f in self._STAGE_FIELDS:
+            d = getattr(state.stage, f) - getattr(prev.stage, f)
+            if d:
+                setattr(nxt.stage, f, getattr(state.stage, f) + d)
+                changed = True
+        if not changed:
+            return
+        optics = self.optics(request, nxt)
+        pending = getattr(self, "_pf_future", None)
+        if pending is not None:
+            pending.cancel()  # not started yet: the newer prediction replaces it
+        if getattr(self, "_pf_pool", None) is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._pf_pool = ThreadPoolExecutor(1, thread_name_prefix="de-twin-prefetch")
+        self._pf_future = self._pf_pool.submit(self.renderer.prefetch, optics, t)
 
     # ---------------------------------------------------------------- frames
     def frames(

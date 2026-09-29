@@ -30,6 +30,8 @@ import numpy as np
 from ..hashing import SeedKind, hash_seed, rng_for, uniform_from_hash
 from .geometry import (AABB, NM_PER_UM, polygon_mask_rows, rotated_rect_half_extent, value_noise,
                        value_noise_separable)
+from . import raster_nb as _rnb
+from .geometry import _separable_noise_tables
 from .materials import MaterialId
 from .options import SpecimenOptions
 from .raster import Layer, PrimitiveSet, Profile, Shape, iter_patches
@@ -579,6 +581,23 @@ class Holder:
             k = self._mesh_block_single_hole(ctx, r0, r1)
             if k is not None:
                 return (np.zeros(shape, np.uint8), np.zeros(shape, np.float32), np.full(shape, k, np.int32))
+            if _rnb.AVAILABLE and shape[1] == ctx.nx:
+                c, s = self._cos, self._sin
+                ox, oy = m.offset_um
+                LC = np.empty(6)
+                for q, (p1, p2, kk) in enumerate(((c, s, -ox), (-s, c, -oy))):
+                    LC[3 * q] = kk + p1 * ctx.ox + p2 * ctx.oy
+                    LC[3 * q + 1] = p1 * ctx.axc + p2 * ctx.ayc
+                    LC[3 * q + 2] = p1 * ctx.axr + p2 * ctx.ayr
+                mat = np.empty(shape, np.uint8)
+                thick = np.empty(shape, np.float32)
+                area = np.empty(shape, np.int32)
+                _rnb.mesh_bulk(r0, r1, ctx.nx, LC, np.array([ctx.ox, ctx.oy, ctx.axc, ctx.ayc, ctx.axr, ctx.ayr]),
+                               float(m.pitch_um), float(self._half), float(self._corner), float(self._disk2),
+                               float(self._usable2), np.uint8(m.bar_material), np.float32(m.bar_thickness_nm),
+                               float(self._cell_origin), float(self._cell_count),
+                               np.ascontiguousarray(self._cell_area, np.int32), mat, thick, area)
+                return mat, thick, area
             lx, ly = self._lattice(ctx, rows, cols)
             inv = 1.0 / m.pitch_um
             qx = np.floor(lx * inv + 0.5)
@@ -700,6 +719,66 @@ class Holder:
             removed[flat[m]] = True
         return removed
 
+    def _film_block_fast(self, ctx, rows, cols, r0, r1, removed, amin, amax) -> None:
+        """`_film_block` through :func:`..raster_nb.film_block` (the same arithmetic)."""
+        f = self.film
+        nx = ctx.nx
+        same = -1
+        if amin == amax and removed is None:
+            if not self.area_film_ok[amin]:
+                return
+            same = amin
+        holey = False
+        LC = np.zeros(6)
+        if f.type == "holey" and f.hole_pitch_um > 0:
+            state = self._holey_block_state(ctx, r0, r1)
+            if state == "perforated":
+                return
+            if state != "film":
+                holey = True
+                c, s = self._cos, self._sin
+                ox, oy = self.mesh.offset_um
+                for k, (p, q, kk) in enumerate(((c, s, -ox), (-s, c, -oy))):
+                    LC[3 * k] = kk + p * ctx.ox + q * ctx.oy
+                    LC[3 * k + 1] = p * ctx.axc + q * ctx.ayc
+                    LC[3 * k + 2] = p * ctx.axr + q * ctx.ayr
+        noise_mode = 0
+        lodg = 0.0
+        G = np.zeros((2, 2))
+        gix = giy = np.zeros(1, np.int64)
+        gtx = gty = np.zeros(1)
+        narr = np.zeros(1)
+        if f.granularity_nm > 0 and self._noise_scale > 0:
+            cpp = ctx.step_um * self._noise_scale
+            lod = 1.0 if cpp <= 0.5 else (0.0 if cpp >= 1.0 else 2.0 * (1.0 - cpp))
+            if lod > 0:
+                sc = self._noise_scale
+                lodg = lod * f.granularity_nm
+                sep = None
+                if ctx.axis_aligned:
+                    xs = (ctx.ox + ctx.axc * cols[0]) * sc
+                    ys = (ctx.oy + ctx.ayr * rows[:, 0]) * sc
+                    sep = _separable_noise_tables(self.seed, xs, ys)
+                if sep is not None:
+                    noise_mode = 1
+                    G, gix, gtx, giy, gty = sep
+                else:
+                    noise_mode = 2
+                    if ctx.axis_aligned:
+                        narr = value_noise_separable(self.seed, xs, ys).ravel()
+                    else:
+                        X, Y = ctx.world(rows, cols)
+                        shape = (rows.shape[0], cols.shape[1])
+                        narr = value_noise(self.seed, np.broadcast_to(X, shape) * sc,
+                                           np.broadcast_to(Y, shape) * sc).ravel()
+        W = np.array([ctx.ox, ctx.oy, ctx.axc, ctx.ayc, ctx.axr, ctx.ayr])
+        rem = np.ascontiguousarray(removed) if removed is not None else np.zeros(1, bool)
+        _rnb.film_block(ctx.thick, ctx.material, ctx.area, nx, r0, r1, same, self.area_film_ok, self.area_film_nm,
+                        rem, removed is not None, holey, LC, float(f.hole_pitch_um),
+                        (0.5 * f.hole_diameter_um) ** 2, f.type == "vitreous_ice", self.area_hx, self.area_hy,
+                        self.area_cx, self.area_cy, W, ICE_EDGE_GRADIENT, noise_mode, lodg,
+                        np.ascontiguousarray(G, np.float64), gix, gtx, giy, gty, narr, np.uint8(f.material))
+
     def _holey_block_state(self, ctx, r0, r1) -> str:
         """'film' if no perforation touches the block, 'perforated' if one covers it, else 'mixed'."""
         f = self.film
@@ -736,6 +815,9 @@ class Holder:
         R, W = rows.shape[0], cols.shape[1]
         amin, amax = int(a.min()), int(a.max())
         if amax < 0:
+            return
+        if _rnb.AVAILABLE:
+            self._film_block_fast(ctx, rows, cols, r0, r1, removed, amin, amax)
             return
         if amin == amax and removed is None:
             # the whole block is one placement area (the usual high-magnification case)

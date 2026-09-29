@@ -50,30 +50,67 @@ def _corner(seed, i, j):
     return float(z >> np.uint64(11)) * _INV53
 
 
+@_njit()
+def fbm1(xv, yv, seeds, cs, sn, amps):
+    """`fbm` at one point, from the octave parameters of :func:`fbm_params`."""
+    acc = 0.0
+    for o in range(seeds.size):
+        u = xv * cs[o] - yv * sn[o]
+        v = xv * sn[o] + yv * cs[o]
+        fu, fv = math.floor(u), math.floor(v)
+        tu, tv = u - fu, v - fv
+        tu = tu * tu * (3.0 - 2.0 * tu)
+        tv = tv * tv * (3.0 - 2.0 * tv)
+        i, j = np.int64(fu), np.int64(fv)
+        s = seeds[o]
+        a = _corner(s, i, j)
+        b = _corner(s, i + 1, j)
+        c = _corner(s, i, j + 1)
+        d = _corner(s, i + 1, j + 1)
+        ab = a + (b - a) * tu
+        cd = c + (d - c) * tu
+        acc += amps[o] * (2.0 * (ab + (cd - ab) * tv) - 1.0)
+    return acc
+
+
+@_njit()
+def fbm1_grad(xv, yv, seeds, cs, sn, amps):
+    """`fbm1` and its analytic gradient (d/dx, d/dy, per unit of x and y): the same octaves,
+    the smoothstep's derivative instead of finite differences (one evaluation, not three)."""
+    acc = 0.0
+    gx = 0.0
+    gy = 0.0
+    for o in range(seeds.size):
+        u = xv * cs[o] - yv * sn[o]
+        v = xv * sn[o] + yv * cs[o]
+        fu, fv = math.floor(u), math.floor(v)
+        tu, tv = u - fu, v - fv
+        su = tu * tu * (3.0 - 2.0 * tu)
+        sv = tv * tv * (3.0 - 2.0 * tv)
+        du = 6.0 * tu * (1.0 - tu)
+        dv = 6.0 * tv * (1.0 - tv)
+        i, j = np.int64(fu), np.int64(fv)
+        s = seeds[o]
+        a = _corner(s, i, j)
+        b = _corner(s, i + 1, j)
+        c = _corner(s, i, j + 1)
+        d = _corner(s, i + 1, j + 1)
+        ab = a + (b - a) * su
+        cd = c + (d - c) * su
+        acc += amps[o] * (2.0 * (ab + (cd - ab) * sv) - 1.0)
+        k = a - b - c + d
+        dVu = ((b - a) + k * sv) * du
+        dVv = ((c - a) + k * su) * dv
+        # u = x cs - y sn, v = x sn + y cs
+        gx += 2.0 * amps[o] * (dVu * cs[o] + dVv * sn[o])
+        gy += 2.0 * amps[o] * (-dVu * sn[o] + dVv * cs[o])
+    return acc, gx, gy
+
+
 @_njit(parallel=True)
 def _fbm_nb(x, y, out, seeds, cs, sn, amps):
-    n = x.size
-    no = seeds.size
-    for k in nb.prange(n):
-        xv, yv = x[k], y[k]
-        acc = 0.0
-        for o in range(no):
-            u = xv * cs[o] - yv * sn[o]
-            v = xv * sn[o] + yv * cs[o]
-            fu, fv = math.floor(u), math.floor(v)
-            tu, tv = u - fu, v - fv
-            tu = tu * tu * (3.0 - 2.0 * tu)
-            tv = tv * tv * (3.0 - 2.0 * tv)
-            i, j = np.int64(fu), np.int64(fv)
-            s = seeds[o]
-            a = _corner(s, i, j)
-            b = _corner(s, i + 1, j)
-            c = _corner(s, i, j + 1)
-            d = _corner(s, i + 1, j + 1)
-            ab = a + (b - a) * tu
-            cd = c + (d - c) * tu
-            acc += amps[o] * (2.0 * (ab + (cd - ab) * tv) - 1.0)
-        out[k] = acc
+    for k in _prange(x.size):
+        out[k] = fbm1(x[k], y[k], seeds, cs, sn, amps)
 
 
 def _corner_np(seed, i, j):
@@ -105,13 +142,8 @@ def _fbm_np(x, y, seeds, cs, sn, amps):
     return out
 
 
-def fbm(seed: int, x_um, y_um, scale_um: float, octaves: int = 3, gain: float = 0.5) -> np.ndarray:
-    """Band-limited noise in about [-1, 1]: *octaves* of smooth value noise from *scale_um*
-    down (each `LACUNARITY` finer and *gain* weaker)."""
-    x = np.ascontiguousarray(x_um, np.float64)
-    y = np.ascontiguousarray(y_um, np.float64)
-    shape = np.broadcast(x, y).shape
-    x, y = np.broadcast_to(x, shape).ravel(), np.broadcast_to(y, shape).ravel()
+def fbm_params(seed: int, scale_um: float, octaves: int = 3, gain: float = 0.5):
+    """(seeds, cos / scale, sin / scale, amplitudes) of `fbm`'s octaves (for :func:`fbm1`)."""
     octaves = max(int(octaves), 1)
     amps = gain ** np.arange(octaves, dtype=np.float64)
     amps /= amps.sum()
@@ -119,6 +151,17 @@ def fbm(seed: int, x_um, y_um, scale_um: float, octaves: int = 3, gain: float = 
     turn = OCTAVE_TURN[np.arange(octaves) % OCTAVE_TURN.size]
     cs, sn = np.cos(turn) / scales, np.sin(turn) / scales
     seeds = np.array([((int(seed) + 7919 * o) * _KJ) & 0xFFFFFFFFFFFFFFFF for o in range(octaves)], np.uint64)
+    return seeds, cs, sn, amps
+
+
+def fbm(seed: int, x_um, y_um, scale_um: float, octaves: int = 3, gain: float = 0.5) -> np.ndarray:
+    """Band-limited noise in about [-1, 1]: *octaves* of smooth value noise from *scale_um*
+    down (each `LACUNARITY` finer and *gain* weaker)."""
+    x = np.ascontiguousarray(x_um, np.float64)
+    y = np.ascontiguousarray(y_um, np.float64)
+    shape = np.broadcast(x, y).shape
+    x, y = np.broadcast_to(x, shape).ravel(), np.broadcast_to(y, shape).ravel()
+    seeds, cs, sn, amps = fbm_params(seed, scale_um, octaves, gain)
     if x.size == 0:
         return np.zeros(shape)
     if AVAILABLE:
@@ -142,40 +185,58 @@ def _site(seed, i, j, jitter):
     return i + 0.5 + jitter * (fx - 0.5), j + 0.5 + jitter * (fy - 0.5), z
 
 
+@_njit()
+def nearest_site_hash(xv, yv, seed, jitter):
+    """The hash of the nearest jittered site to (xv, yv) (cell units): `cells`' third output."""
+    ci, cj = np.int64(math.floor(xv)), np.int64(math.floor(yv))
+    best = 1e30
+    bh = np.uint64(0)
+    for di in range(-2, 3):
+        for dj in range(-2, 3):
+            sx, sy, h = _site(seed, ci + di, cj + dj, jitter)
+            d = (sx - xv) ** 2 + (sy - yv) ** 2
+            if d < best:
+                best, bh = d, h
+    return bh
+
+
+@_njit()
+def cell1(xv, yv, seed, merge, jitter):
+    """`cells` at one point: (distance to the nearest site, gap, the site's hash)."""
+    ci, cj = np.int64(math.floor(xv)), np.int64(math.floor(yv))
+    best, bx, by = 1e30, 0.0, 0.0
+    bh = np.uint64(0)
+    for di in range(-2, 3):
+        for dj in range(-2, 3):
+            sx, sy, h = _site(seed, ci + di, cj + dj, jitter)
+            d = (sx - xv) ** 2 + (sy - yv) ** 2
+            if d < best:
+                best, bx, by, bh = d, sx, sy, h
+    # distance to the nearest bisector with a neighbour the island has not merged with
+    gap = 1e30
+    for di in range(-2, 3):
+        for dj in range(-2, 3):
+            sx, sy, h = _site(seed, ci + di, cj + dj, jitter)
+            if h == bh:
+                continue
+            mx, my = sx - bx, sy - by
+            L = math.sqrt(mx * mx + my * my)
+            if L < 1e-9:
+                continue
+            pair = (bh ^ h) * np.uint64(0x9E3779B97F4A7C15)
+            u = float(pair >> np.uint64(40)) / 16777216.0
+            if u < merge:
+                continue  # the two islands have coalesced
+            t = ((xv - 0.5 * (sx + bx)) * mx + (yv - 0.5 * (sy + by)) * my) / L
+            if -t < gap:
+                gap = -t
+    return math.sqrt(best), gap, bh
+
+
 @_njit(parallel=True)
 def _cells_nb(x, y, seed, merge, jitter, d1o, gapo, ho):
     for k in _prange(x.size):
-        xv, yv = x[k], y[k]
-        ci, cj = np.int64(math.floor(xv)), np.int64(math.floor(yv))
-        best, bx, by = 1e30, 0.0, 0.0
-        bh = np.uint64(0)
-        for di in range(-2, 3):
-            for dj in range(-2, 3):
-                sx, sy, h = _site(seed, ci + di, cj + dj, jitter)
-                d = (sx - xv) ** 2 + (sy - yv) ** 2
-                if d < best:
-                    best, bx, by, bh = d, sx, sy, h
-        # distance to the nearest bisector with a neighbour the island has not merged with
-        gap = 1e30
-        for di in range(-2, 3):
-            for dj in range(-2, 3):
-                sx, sy, h = _site(seed, ci + di, cj + dj, jitter)
-                if h == bh:
-                    continue
-                mx, my = sx - bx, sy - by
-                L = math.sqrt(mx * mx + my * my)
-                if L < 1e-9:
-                    continue
-                pair = (bh ^ h) * np.uint64(0x9E3779B97F4A7C15)
-                u = float(pair >> np.uint64(40)) / 16777216.0
-                if u < merge[k]:
-                    continue  # the two islands have coalesced
-                t = ((xv - 0.5 * (sx + bx)) * mx + (yv - 0.5 * (sy + by)) * my) / L
-                if -t < gap:
-                    gap = -t
-        d1o[k] = math.sqrt(best)
-        gapo[k] = gap
-        ho[k] = bh
+        d1o[k], gapo[k], ho[k] = cell1(x[k], y[k], seed, merge[k], jitter)
 
 
 def cells(seed: int, x, y, merge) -> tuple:

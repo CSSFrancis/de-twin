@@ -153,9 +153,14 @@ def _level_offset(c: np.ndarray):
     lv = np.interp(np.clip(c, cov[1], cov[half]), cov[1:half + 1], np.arange(1, half + 1, dtype=np.float64))
     row = np.clip(np.rint((lv - 1.0) / (half - 1.0) * (_LEVELS - 1)).astype(np.int64), 0, _LEVELS - 1)
     off = np.empty_like(c)
-    for r in np.unique(row):
-        m = row == r
-        off[m] = np.interp(c[m], table[r], _OFFSETS)
+    # each row's pixels as one slice of a (radix) sort, not a mask over all of them per row
+    order = np.argsort(row.astype(np.uint8), kind="stable")
+    cuts = np.searchsorted(row[order], np.arange(_LEVELS + 1))
+    cs = c[order]
+    for r in range(_LEVELS):
+        a, b = cuts[r], cuts[r + 1]
+        if b > a:
+            off[order[a:b]] = np.interp(cs[a:b], table[r], _OFFSETS)
     return levels[row], off
 
 
@@ -206,46 +211,51 @@ def _lookup(tile, u, v):
     return a + (b - a) * tv
 
 
-@_njit(parallel=True)
-def _field_nb(x, y, level, out, tiles, seed, px_per_um, cells_per_um, sharp):
+@_njit()
+def field1(xk, yk, levk, tiles, seed, px_per_um, cells_per_um, sharp):
+    """`_field_nb` at one point."""
     nlev = tiles.shape[0]
     nvar = tiles.shape[1]
+    cx = xk * cells_per_um
+    cy = yk * cells_per_um
+    ci = math.floor(cx - 0.5)
+    cj = math.floor(cy - 0.5)
+    fx = cx - 0.5 - ci
+    fy = cy - 0.5 - cj
+    lv = min(max(levk, 0.0), nlev - 1.0)
+    l0 = int(math.floor(lv))
+    l1 = min(l0 + 1, nlev - 1)
+    tl = lv - l0
+    acc = 0.0
+    wsum = 0.0
+    for dj in range(2):
+        for di in range(2):
+            w = (fx if di else 1.0 - fx) * (fy if dj else 1.0 - fy)
+            w = w ** sharp
+            h = _hash_nb(seed, ci + di, cj + dj)
+            var = int(h % np.uint64(nvar))
+            d8 = int((h >> np.uint64(8)) % np.uint64(8))
+            ou = float((h >> np.uint64(16)) & np.uint64(0xFFFF)) / 65536.0 * 256.0
+            ov = float((h >> np.uint64(32)) & np.uint64(0xFFFF)) / 65536.0 * 256.0
+            u = xk * px_per_um
+            v = yk * px_per_um
+            if d8 & 1:  # mirror
+                u = -u
+            if d8 & 2:  # transpose
+                u, v = v, u
+            if d8 & 4:  # half turn
+                u, v = -u, -v
+            f0 = _lookup(tiles[l0, var], u + ou, v + ov)
+            f1 = _lookup(tiles[l1, var], u + ou, v + ov)
+            acc += w * (f0 + (f1 - f0) * tl)
+            wsum += w
+    return acc / wsum
+
+
+@_njit(parallel=True)
+def _field_nb(x, y, level, out, tiles, seed, px_per_um, cells_per_um, sharp):
     for k in _prange(x.size):
-        cx = x[k] * cells_per_um
-        cy = y[k] * cells_per_um
-        ci = math.floor(cx - 0.5)
-        cj = math.floor(cy - 0.5)
-        fx = cx - 0.5 - ci
-        fy = cy - 0.5 - cj
-        # the two composition families either side of this pixel's level
-        lv = min(max(level[k], 0.0), nlev - 1.0)
-        l0 = int(math.floor(lv))
-        l1 = min(l0 + 1, nlev - 1)
-        tl = lv - l0
-        acc = 0.0
-        wsum = 0.0
-        for dj in range(2):
-            for di in range(2):
-                w = (fx if di else 1.0 - fx) * (fy if dj else 1.0 - fy)
-                w = w ** sharp
-                h = _hash_nb(seed, ci + di, cj + dj)
-                var = int(h % np.uint64(nvar))
-                d8 = int((h >> np.uint64(8)) % np.uint64(8))
-                ou = float((h >> np.uint64(16)) & np.uint64(0xFFFF)) / 65536.0 * 256.0
-                ov = float((h >> np.uint64(32)) & np.uint64(0xFFFF)) / 65536.0 * 256.0
-                u = x[k] * px_per_um
-                v = y[k] * px_per_um
-                if d8 & 1:  # mirror
-                    u = -u
-                if d8 & 2:  # transpose
-                    u, v = v, u
-                if d8 & 4:  # half turn
-                    u, v = -u, -v
-                f0 = _lookup(tiles[l0, var], u + ou, v + ov)
-                f1 = _lookup(tiles[l1, var], u + ou, v + ov)
-                acc += w * (f0 + (f1 - f0) * tl)
-                wsum += w
-        out[k] = acc / wsum
+        out[k] = field1(x[k], y[k], level[k], tiles, seed, px_per_um, cells_per_um, sharp)
 
 
 def field(seed: int, x_um, y_um, feature_um: float, coverage=0.5, cell_features: float = 12.0,
@@ -280,6 +290,25 @@ def period_px_cached() -> float:
 
 
 # ------------------------------------------------------------------ periodic tiles
+@_njit()
+def periodic1(stack, c, fu, fv):
+    """Channel ``c`` of `sample_periodic` at one point (float32)."""
+    n = stack.shape[1]
+    u = fu * n - 0.5
+    v = fv * n - 0.5
+    a = math.floor(u)
+    b = math.floor(v)
+    tu = u - a
+    tv = v - b
+    i0 = int(a) % n
+    j0 = int(b) % n
+    i1 = (i0 + 1) % n
+    j1 = (j0 + 1) % n
+    top = stack[c, j0, i0] + (stack[c, j0, i1] - stack[c, j0, i0]) * tu
+    bot = stack[c, j1, i0] + (stack[c, j1, i1] - stack[c, j1, i0]) * tu
+    return np.float32(top + (bot - top) * tv)
+
+
 @_njit(parallel=True)
 def _periodic_nb(stack, fu, fv, out):
     k, n = stack.shape[0], stack.shape[1]
