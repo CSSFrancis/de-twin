@@ -577,15 +577,18 @@ class CoherentStem:
         key = (self._probe_key(optics), self._cfg_key())
         with self._lock:
             p = self._probes.get(key)
-            if p is None:
-                if not build:
-                    return None
-                p = build_probe(optics, self.cfg, self.sampling(optics))
-                self._probes[key] = p
-                while len(self._probes) > 2:
-                    self._probes.popitem(last=False)
-            else:
+            if p is not None:
                 self._probes.move_to_end(key)
+                return p
+        if not build:
+            return None
+        p = build_probe(optics, self.cfg, self.sampling(optics))  # outside the lock (prefetch thread)
+        with self._lock:
+            if key in self._probes:
+                return self._probes[key]
+            self._probes[key] = p
+            while len(self._probes) > 2:
+                self._probes.popitem(last=False)
             return p
 
     # ------------------------------------------------------------ tiles
@@ -628,16 +631,19 @@ class CoherentStem:
                optics.convergence_mrad, self.seed, self._cfg_key())
         with self._lock:
             tile = self._tiles.get(key)
-            if tile is None:
-                if not build:
-                    return None
-                tile = build_tile(fm, optics, ctx.grains, ctx.crystallinity, self.cfg, self.seed,
-                                  s.object_bandwidth)
-                self._tiles[key] = tile
-                while len(self._tiles) > 2:
-                    self._tiles.popitem(last=False)
-            else:
+            if tile is not None:
                 self._tiles.move_to_end(key)
+                return tile
+        if not build:
+            return None
+        tile = build_tile(fm, optics, ctx.grains, ctx.crystallinity, self.cfg, self.seed,
+                          s.object_bandwidth)  # outside the lock (prefetch thread)
+        with self._lock:
+            if key in self._tiles:
+                return self._tiles[key]
+            self._tiles[key] = tile
+            while len(self._tiles) > 2:
+                self._tiles.popitem(last=False)
             return tile
 
     def tile_for(self, ctx, optics, s: Sampling, points) -> Tile:
@@ -1066,6 +1072,34 @@ class CoherentStem:
                         self._inflight.pop(key, None)
             with self._lock:
                 self._inflight[key] = self._ahead.submit(job)
+
+    def prefetch(self, ctx, optics, fm_scan, fm_token) -> bool:
+        """Build the probe and transmission tile of ``optics`` and compute its first block (a
+        view the caller predicts), so the first pattern there is a cache hit. Runs on the
+        caller's (prefetch) thread; the render thread waits for the block if it gets there
+        first. Returns whether anything was computed."""
+        s = self.sampling(optics)
+        bsz = self._block_size(optics, s)
+        key = self._block_key(optics, fm_token, bsz, 0)
+        from concurrent.futures import Future
+
+        fut = Future()
+        fut.set_running_or_notify_cancel()  # running: the render thread waits, never cancels it
+        with self._lock:
+            if key in self._blocks or key in self._inflight:
+                return False
+            self._inflight[key] = fut
+        try:
+            blk = self.patterns(ctx, optics, self._block_points(optics, bsz, 0), fm_scan)
+            self._store(key, blk)
+            fut.set_result(blk)
+            return True
+        except BaseException as e:  # noqa: BLE001 - the waiting render thread computes it itself
+            fut.set_exception(e)
+            raise
+        finally:
+            with self._lock:
+                self._inflight.pop(key, None)
 
     def binned(self, ctx, fm_scan, fm_token, optics, scan_point, frame_index, specimen=None) -> np.ndarray:
         ix, iy = resolve_scan_point(optics, scan_point, frame_index, specimen, self.cfg)
