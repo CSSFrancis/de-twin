@@ -604,26 +604,50 @@ class CoherentStem:
 
     def _field_views(self, optics, s: Sampling, points) -> list:
         """[(indices into points, fine view)]: the whole scan field when it fits
-        ``coherent_field_max_px``; else the points' own field, split (in scan order) until
-        every part fits - a sparse scan is never one tile spanning all its points."""
+        ``coherent_field_max_px``; else the scan is cut into a fixed grid of scan tiles (whole
+        rows if they fit, else runs of one row) each of whose fields fits, and the points are
+        grouped by scan tile - the same tiles whichever block asks (live frames and the
+        datacube agree), and a sparse scan is never one tile spanning all its points."""
         limit = self.cfg.coherent_field_max_px
+        ny, nx = optics.view.shape
         allx, ally = self._scan_world(optics, self._full_scan_points(optics))
         full = field_view(allx, ally, s, optics.view)
-        idx = np.arange(len(np.asarray(points).reshape(-1, 2)))
+        pts = np.asarray(points, np.int64).reshape(-1, 2)
         if full.shape[0] * full.shape[1] <= limit:
-            return [(idx, full)]
-        xs, ys = self._scan_world(optics, points)
+            return [(np.arange(len(pts)), full)]
+        R, C = self._scan_tiling(optics, s, limit)
+        tid = (pts[:, 1] // R) * (-(-nx // C)) + pts[:, 0] // C
         out = []
-
-        def split(ix):
-            v = field_view(xs[ix], ys[ix], s, optics.view)
-            if v.shape[0] * v.shape[1] <= limit or len(ix) == 1:
-                out.append((ix, v))
-            else:
-                split(ix[:len(ix) // 2])
-                split(ix[len(ix) // 2:])
-        split(idx)
+        for t in dict.fromkeys(tid.tolist()):  # in order of first appearance
+            r, c = divmod(t, -(-nx // C))
+            iy, ix = np.mgrid[r * R:min(ny, (r + 1) * R), c * C:min(nx, (c + 1) * C)]
+            xs, ys = self._scan_world(optics, np.stack([ix.ravel(), iy.ravel()], 1))
+            out.append((np.flatnonzero(tid == t), field_view(xs, ys, s, optics.view)))
         return out
+
+    def _scan_tiling(self, optics, s: Sampling, limit: int) -> tuple[int, int]:
+        """(rows, columns) of scan points per scan tile: as many whole rows as fit
+        ``limit`` fine pixels, else one row cut into as many columns as fit."""
+        ny, nx = optics.view.shape
+
+        def px(rows, cols):
+            iy, ix = np.mgrid[0:rows, 0:cols]
+            xs, ys = self._scan_world(optics, np.stack([ix.ravel(), iy.ravel()], 1))
+            v = field_view(xs, ys, s, optics.view)
+            return v.shape[0] * v.shape[1]
+
+        def largest(fits, hi):  # the largest k in 1..hi with fits(k) (fits is monotone)
+            lo = 1
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if fits(mid):
+                    lo = mid
+                else:
+                    hi = mid - 1
+            return lo
+        if px(1, nx) <= limit:
+            return largest(lambda r: px(r, nx) <= limit, ny), nx
+        return 1, largest(lambda c: px(1, c) <= limit, nx)
 
     def _tile(self, ctx, optics, s: Sampling, view, build: bool = True) -> Optional[Tile]:
         fm, token = ctx.field_map(view)

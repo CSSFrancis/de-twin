@@ -301,10 +301,10 @@ class Renderer:
                                            threads=max(1, int(self.config.raster_threads)))
         return self.specimen.rasterize(view, layers)
 
-    def _keep_field_map(self, store, key, fm, token) -> None:
+    def _keep_field_map(self, store, key, fm, token, size: Optional[int] = None) -> None:
         store[key] = (fm, token, getattr(fm, "generation", 0))
         store.move_to_end(key)
-        while len(store) > max(1, self.config.fieldmap_cache_size):
+        while len(store) > max(1, self.config.fieldmap_cache_size if size is None else size):
             store.popitem(last=False)
 
     def _render_tem_panned(self, optics, time_s: float) -> np.ndarray:
@@ -659,7 +659,7 @@ class Renderer:
                 return hit[0], hit[1]
             self.rasters_built += 1
             token = (next(self._tokens), getattr(fm, "generation", 0))
-            self._keep_field_map(store, key, fm, token)
+            self._keep_field_map(store, key, fm, token, size=2)  # as many as the engine keeps tiles
             return fm, token
 
     def _prefetch_coherent(self, optics, time_s: float) -> bool:
