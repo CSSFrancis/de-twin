@@ -66,6 +66,13 @@ class BulkSurfaceConfig:
     scratch_depth: float = 0.7  # quality lost at a scratch's centre
     scratch_angle_deg: float = 30.0  # mean scratch direction from +x
     scratch_angle_spread_deg: float = 25.0
+    #: Grain-boundary zone: polishing / etching grooves, relief and the distorted lattice next
+    #: to a boundary lower the pattern quality within ~0.1-0.3 µm of it (what makes boundaries
+    #: continuous dark lines in real band-contrast maps at 0.1-0.5 µm steps; the EBSD footprint
+    #: alone, ~30 x 80 nm for Ni at 20 kV, only mixes points within it). Gaussian sigma, µm, and
+    #: the quality lost on the boundary.
+    boundary_zone_um: float = 0.2
+    boundary_zone_depth: float = 0.5
 
     def copy(self) -> "BulkSurfaceConfig":
         return copy.deepcopy(self)
@@ -172,7 +179,12 @@ class BulkSurface:
                 out["material" + suffix] = self._mats[out["phase" + suffix]]
                 out["grain_id" + suffix] = (out["hash" + suffix] >> np.uint64(33)).astype(np.int32)
         if blend:
-            out["quality"] = self.quality(x, y)
+            q = self.quality(x, y)
+            c = self.config
+            if not c.single_crystal and c.boundary_zone_um > 0 and c.boundary_zone_depth > 0:
+                d = np.asarray(out["boundary_um"], np.float64) / float(c.boundary_zone_um)
+                q = q * (1.0 - min(float(c.boundary_zone_depth), 0.95) * np.exp(-0.5 * d * d)).astype(np.float32)
+            out["quality"] = q
         return out
 
     def _voronoi(self, x, y, blend: bool) -> dict:

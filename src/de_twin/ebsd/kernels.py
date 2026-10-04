@@ -1,5 +1,13 @@
 """numba kernels for EBSD: the kinematic master-pattern sum and the per-pattern projection.
 
+Masters are stored (and exchanged) on the square-Lambert projection below, and rendered from a
+**cube map**: the gnomonic projection of the sphere onto the faces of a cube (face ``a, s``:
+``c_a = s``, ``u = c_b / c_a``, ``v = c_c / c_a`` with ``(b, c)`` the other two axes in
+order, ``Nf x Nf`` nodes over ``[-1, 1]^2``). Finding a direction's cube node takes one
+reciprocal where the Lambert point takes a square root, a division and an arctangent, which
+halves the lookup. A centrosymmetric master needs the three positive faces (a direction is
+flipped onto them), a non-centrosymmetric one all six.
+
 Square Lambert projection (Rosca-Lambert, as EMsoft stores master patterns) of the northern
 hemisphere ``z >= 0`` onto ``[-L, L]^2``, ``L = sqrt(pi / 2)``, sampled at ``N x N`` nodes
 (``linspace(-L, L, N)``, so the equator is the square's edge). Kinematic Kikuchi patterns are
@@ -16,6 +24,10 @@ import numpy as np
 
 SQRT_PI = math.sqrt(math.pi)
 LAMBERT_L = math.sqrt(math.pi / 2.0)
+
+#: The forward-scatter lobe is evaluated exactly every LOBE_STEP pixels along a row and
+#: interpolated linearly between (relative error ~1e-4 at 512^2: the lobe is ~20 deg wide).
+LOBE_STEP = 4
 
 #: Band profile: an excess line just inside each edge and a deficiency just outside, at
 #: ``EDGE_OFFSET`` band half-widths from it (dynamical-looking edges on a kinematic band).
@@ -102,11 +114,26 @@ def accumulate_bands(dirs, normals, half_width, amp, sigma, sigma_edge, reach, o
 
 
 # ---------------------------------------------------------------------- projection
-@_njit()
-def _lookup(master, scale, cx, cy, cz):
-    """Bilinear master code at crystal direction (cx, cy, cz) (unit; folded to z >= 0)."""
-    if cz < 0.0:
-        cx, cy, cz = -cx, -cy, -cz
+#: atan(x) = x P(x^2) on |x| <= 1, least-squares fit, max error 1.1e-8 rad (libm's scalar atan
+#: was half the lookup's time).
+_ATAN = (0.0028340989710117373, -0.016005224935549546, 0.04258803010402406, -0.07495492338117586,
+         0.10636782943784438, -0.14202580379049168, 0.19992485341385735, -0.33333066920402804,
+         0.9999999842746156)
+
+
+@_njit(inline="always")
+def _atan1(x):
+    t = x * x
+    p = _ATAN[0]
+    for c in _ATAN[1:]:
+        p = p * t + c
+    return x * p
+
+
+@_njit(inline="always")
+def _lookup(bank, plane, scale, cx, cy, cz):
+    """Bilinear code of ``bank[plane]`` at the square-Lambert point of unit direction
+    (cx, cy, cz), cz >= 0 (indexed in place: no per-pixel array views)."""
     q = math.sqrt(max(2.0 * (1.0 - cz), 0.0))
     if abs(cy) <= abs(cx):
         if cx == 0.0:
@@ -114,12 +141,12 @@ def _lookup(master, scale, cx, cy, cz):
         else:
             sg = 1.0 if cx > 0.0 else -1.0
             X = sg * q * (SQRT_PI * 0.5)
-            Y = sg * q * (2.0 / SQRT_PI) * math.atan(cy / cx)
+            Y = sg * q * (2.0 / SQRT_PI) * _atan1(cy / cx)
     else:
         sg = 1.0 if cy > 0.0 else -1.0
-        X = sg * q * (2.0 / SQRT_PI) * math.atan(cx / cy)
+        X = sg * q * (2.0 / SQRT_PI) * _atan1(cx / cy)
         Y = sg * q * (SQRT_PI * 0.5)
-    n = master.shape[0]
+    n = bank.shape[1]
     fx = (X + LAMBERT_L) * scale
     fy = (Y + LAMBERT_L) * scale
     ix = int(fx)
@@ -134,65 +161,187 @@ def _lookup(master, scale, cx, cy, cz):
         iy = n - 2
     tx = min(max(fx - ix, 0.0), 1.0)
     ty = min(max(fy - iy, 0.0), 1.0)
-    v00 = np.float32(master[iy, ix])
-    v01 = np.float32(master[iy, ix + 1])
-    v10 = np.float32(master[iy + 1, ix])
-    v11 = np.float32(master[iy + 1, ix + 1])
+    v00 = np.float32(bank[plane, iy, ix])
+    v01 = np.float32(bank[plane, iy, ix + 1])
+    v10 = np.float32(bank[plane, iy + 1, ix])
+    v11 = np.float32(bank[plane, iy + 1, ix + 1])
     return (v00 * (1.0 - tx) + v01 * tx) * (1.0 - ty) + (v10 * (1.0 - tx) + v11 * tx) * ty
 
 
+@_njit(inline="always")
+def _cube_lookup(bank, face0, full, cx, cy, cz):
+    """Bilinear cube-map code at direction (cx, cy, cz) (any length): faces ``face0 ..`` of
+    ``bank``; ``full``: six faces, else three and the direction is flipped onto them."""
+    ax, ay, az = abs(cx), abs(cy), abs(cz)
+    if ax >= ay and ax >= az:
+        a, m, u, v = 0, cx, cy, cz
+    elif ay >= az:
+        a, m, u, v = 1, cy, cx, cz
+    else:
+        a, m, u, v = 2, cz, cx, cy
+    f = face0 + a
+    if m < 0.0 and full:
+        f += 3
+    r = 1.0 / m  # u / m is the same for the direction and its flip
+    n = bank.shape[1]
+    s = (n - 1) * 0.5
+    fx = (u * r + 1.0) * s
+    fy = (v * r + 1.0) * s
+    ix = min(max(int(fx), 0), n - 2)
+    iy = min(max(int(fy), 0), n - 2)
+    tx = fx - ix
+    ty = fy - iy
+    v00 = np.float32(bank[f, iy, ix])
+    v01 = np.float32(bank[f, iy, ix + 1])
+    v10 = np.float32(bank[f, iy + 1, ix])
+    v11 = np.float32(bank[f, iy + 1, ix + 1])
+    return (v00 * (1.0 - tx) + v01 * tx) * (1.0 - ty) + (v10 * (1.0 - tx) + v11 * tx) * ty
+
+
+def cube_directions(n: int, faces: int = 3) -> np.ndarray:
+    """(faces, n, n, 3) unit directions at the cube-map nodes (row = v, column = u); faces
+    0-2 are +x, +y, +z, 3-5 (``faces=6``) -x, -y, -z."""
+    c = np.linspace(-1.0, 1.0, n)
+    U, V = np.meshgrid(c, c)
+    out = np.empty((faces, n, n, 3))
+    for f in range(faces):
+        a, sg = f % 3, (1.0 if f < 3 else -1.0)
+        b, cc = [k for k in range(3) if k != a]
+        out[f, ..., a] = sg
+        out[f, ..., b] = U * sg
+        out[f, ..., cc] = V * sg
+    return out / np.linalg.norm(out, axis=-1, keepdims=True)
+
+
+@_njit(inline="always")
+def _value(bank, face0, full, offs, scales, p, M, rx, ry, rz):
+    """Standardised master value of phase ``p`` along detector direction r (unit) for the
+    detector -> crystal matrix M (need not be orthogonal: the cube lookup is scale-free)."""
+    cx = M[0, 0] * rx + M[0, 1] * ry + M[0, 2] * rz
+    cy = M[1, 0] * rx + M[1, 1] * ry + M[1, 2] * rz
+    cz = M[2, 0] * rx + M[2, 1] * ry + M[2, 2] * rz
+    return offs[p] + scales[p] * _cube_lookup(bank, face0[p], full[p], cx, cy, cz)
+
+
+@_njit()
+def _detector_to_crystal(g, finv, has_f, s2dT, out):
+    """out = g^T @ finv @ s2dT (g crystal -> sample, finv the inverse deformation gradient)."""
+    a = np.empty((3, 3))
+    for i in range(3):
+        for j in range(3):
+            acc = 0.0
+            for k in range(3):
+                acc += (finv[i, k] if has_f else (1.0 if i == k else 0.0)) * s2dT[k, j]
+            a[i, j] = acc
+    for i in range(3):
+        for j in range(3):
+            acc = 0.0
+            for k in range(3):
+                acc += g[k, i] * a[k, j]
+            out[i, j] = acc
+
+
 @_njit(parallel=True)
-def project(master1, a1, b1, m1, master2, a2, b2, m2, w2, x0, y0, dd, ox, oy, bx, by, raw,
-            normal, fwd, i_cos, i_lobe, kappa, contrast, out):
-    """One EBSD pattern on a (binned) detector grid.
+def render(bank, face0, full, offs, scales, mats, o1, o2, ph1, ph2, mix, contrast, es, finv, has_f,
+           dx, dy, pc_lin, s2dT, ks, ox, oy, bx, by, ss, raw, normal, fwd, lobe, kappa, t_nb,
+           out, lam, p0, want_means):
+    """EBSD patterns of scan points ``ks`` on a binned detector grid, in one threaded pass.
 
-    Pixel (i, j) of ``out`` is the sensor area ``[ox + j bx, ox + (j + 1) bx) x [oy + i by, ...)``;
-    its direction from the source is ``(X, Y, dd) / |.|`` with ``X``, ``Y`` its centre minus the
-    pattern centre ``(x0, y0)``, all in sensor pixels. ``m1`` / ``m2``: detector -> crystal
-    matrices of the grain (and of the neighbour mixed in with weight ``w2``); ``master*`` the
-    uint8 master codes, value = ``a + b * code``.
+    Per point k: grain orientation ``mats[o1[k]]`` (crystal -> sample) of phase ``ph1[k]``, its
+    neighbour ``mats[o2[k]]`` / ``ph2[k]`` mixed in with weight ``mix[k]``, the inverse
+    deformation gradient ``finv[k]`` (sample frame; when ``has_f``), the beam offset
+    ``(dx[k], dy[k])`` (µm, sample frame) that moves the pattern centre linearly
+    (``pc_lin``: x0, dx0/ddx, dx0/ddy, y0, ..., dd, ... in sensor pixels), band modulation
+    ``contrast[k]`` and backscattered electrons per second ``es[k]``.
 
-    ``raw``: ``out`` is the blended master value (no background, no solid angle).
-    Otherwise ``out`` is electrons per sensor pixel per second::
+    Pixel (i, j) of point m is the sensor area ``[ox + j bx, ox + (j + 1) bx) x [oy + i by, ...)``
+    sampled at ``ss x ss`` points (supersampled binning). Its value (``raw``: the blended master
+    value only) is electrons per sensor pixel per second::
 
-        (i_cos (r.n)/pi + i_lobe vMF(r; fwd, kappa)) * dOmega * (1 + contrast * m)
+        es ((1 - lobe) (r.n)/pi + lobe vMF(r; fwd, kappa)) dOmega (1 + contrast m)
 
-    with ``dOmega = cos^3(gamma) / dd^2`` the solid angle of one sensor pixel, zero where the
-    direction is below the sample surface (a soft shadow edge).
+    with ``dOmega = cos^3 / dd^2`` per sensor pixel, shadowed below the sample surface. With
+    ``want_means`` it also writes the detector's Poisson means ``lam = out * t_nb`` and
+    ``p0 = exp(-lam)`` (``detector.fast.prepare``'s contract) and returns each row's dose.
     """
-    h, w = out.shape
-    s1 = (master1.shape[0] - 1) / (2.0 * LAMBERT_L)
-    s2 = (master2.shape[0] - 1) / (2.0 * LAMBERT_L)
-    w1 = 1.0 - w2
-    nx_, ny_, nz_ = normal[0], normal[1], normal[2]
-    fx_, fy_, fz_ = fwd[0], fwd[1], fwd[2]
+    m_pts = ks.shape[0]
+    h, w = out.shape[1], out.shape[2]
+    rows = np.zeros(m_pts * h)
     vmf = kappa / (2.0 * math.pi * (1.0 - math.exp(-2.0 * kappa))) if kappa > 0 else 1.0 / (4.0 * math.pi)
-    inv_dd2 = 1.0 / (dd * dd)
-    for i in nb.prange(h):
-        Y = oy + (i + 0.5) * by - y0
+    cut = 30.0
+    inv_ss = 1.0 / ss
+    for row in nb.prange(m_pts * h):
+        mi = row // h
+        i = row - mi * h
+        k = ks[mi]
+        M1 = np.empty((3, 3))
+        M2 = np.empty((3, 3))
+        g1 = o1[k]
+        g2 = o2[k]
+        w2 = mix[k] if (g2 >= 0 and g1 >= 0) else 0.0
+        if g1 >= 0:
+            _detector_to_crystal(mats[g1], finv[k if has_f else 0], has_f, s2dT, M1)
+        if w2 > 0.0:
+            _detector_to_crystal(mats[g2], finv[k if has_f else 0], has_f, s2dT, M2)
+        x0 = pc_lin[0] + pc_lin[1] * dx[k] + pc_lin[2] * dy[k]
+        y0 = pc_lin[3] + pc_lin[4] * dx[k] + pc_lin[5] * dy[k]
+        dd = pc_lin[6] + pc_lin[7] * dx[k] + pc_lin[8] * dy[k]
+        inv_dd2 = 1.0 / (dd * dd)
+        c = contrast[k] if g1 >= 0 else 0.0
+        e = es[k]
+        p1 = ph1[k]
+        p2 = ph2[k]
+        acc_row = 0.0
+        anchors = ss == 1 and kappa > 0.0 and not raw
+        if anchors:  # the lobe is smooth: exact every LOBE_STEP pixels, linear between
+            na = (w - 1) // LOBE_STEP + 2
+            lob = np.empty(na)
+            Ya = oy + (i + 0.5) * by - y0
+            for a in range(na):
+                ja = min(a * LOBE_STEP, w - 1)
+                Xa = ox + (ja + 0.5) * bx - x0
+                ia = 1.0 / math.sqrt(Xa * Xa + Ya * Ya + dd * dd)
+                rfa = (Xa * fwd[0] + Ya * fwd[1] + dd * fwd[2]) * ia
+                lob[a] = math.exp(kappa * (rfa - 1.0))
         for j in range(w):
-            X = ox + (j + 0.5) * bx - x0
-            inv = 1.0 / math.sqrt(X * X + Y * Y + dd * dd)
-            rx, ry, rz = X * inv, Y * inv, dd * inv
-            c0 = m1[0, 0] * rx + m1[0, 1] * ry + m1[0, 2] * rz
-            c1 = m1[1, 0] * rx + m1[1, 1] * ry + m1[1, 2] * rz
-            c2 = m1[2, 0] * rx + m1[2, 1] * ry + m1[2, 2] * rz
-            val = w1 * (a1 + b1 * _lookup(master1, s1, c0, c1, c2))
-            if w2 > 0.0:
-                c0 = m2[0, 0] * rx + m2[0, 1] * ry + m2[0, 2] * rz
-                c1 = m2[1, 0] * rx + m2[1, 1] * ry + m2[1, 2] * rz
-                c2 = m2[2, 0] * rx + m2[2, 1] * ry + m2[2, 2] * rz
-                val += w2 * (a2 + b2 * _lookup(master2, s2, c0, c1, c2))
-            if raw:
-                out[i, j] = val
-                continue
-            rn = rx * nx_ + ry * ny_ + rz * nz_
-            if rn <= 0.0:
-                out[i, j] = 0.0
-                continue
-            shadow = min(rn / 0.03, 1.0)
-            rf = rx * fx_ + ry * fy_ + rz * fz_
-            bg = i_cos * rn / math.pi + i_lobe * vmf * math.exp(kappa * (rf - 1.0))
-            domega = rz * rz * rz * inv_dd2
-            v = shadow * bg * domega * (1.0 + contrast * val)
-            out[i, j] = v if v > 0.0 else 0.0
+            tot = 0.0
+            for sa in range(ss):
+                Y = oy + (i + (sa + 0.5) * inv_ss) * by - y0
+                for sb in range(ss):
+                    X = ox + (j + (sb + 0.5) * inv_ss) * bx - x0
+                    inv = 1.0 / math.sqrt(X * X + Y * Y + dd * dd)
+                    rx, ry, rz = X * inv, Y * inv, dd * inv
+                    val = 0.0
+                    if g1 >= 0:
+                        val = (1.0 - w2) * _value(bank, face0, full, offs, scales, p1, M1, rx, ry, rz)
+                        if w2 > 0.0:
+                            val += w2 * _value(bank, face0, full, offs, scales, p2, M2, rx, ry, rz)
+                    if raw:
+                        tot += val
+                        continue
+                    rn = rx * normal[0] + ry * normal[1] + rz * normal[2]
+                    if rn <= 0.0:
+                        continue
+                    shadow = min(rn / 0.03, 1.0)
+                    if anchors:
+                        a = j // LOBE_STEP
+                        j0 = a * LOBE_STEP
+                        j1 = min(j0 + LOBE_STEP, w - 1)
+                        t = (j - j0) / (j1 - j0) if j1 > j0 else 0.0
+                        ex = lob[a] + (lob[a + 1] - lob[a]) * t
+                    else:
+                        rf = rx * fwd[0] + ry * fwd[1] + rz * fwd[2]
+                        ex = math.exp(kappa * (rf - 1.0))
+                    bg = (1.0 - lobe) * rn / math.pi + lobe * vmf * ex
+                    v = e * shadow * bg * rz * rz * rz * inv_dd2 * (1.0 + c * val)
+                    if v > 0.0:
+                        tot += v
+            v = tot * inv_ss * inv_ss
+            out[mi, i, j] = v
+            if want_means:
+                lv = v * t_nb
+                lam[mi, i, j] = lv
+                p0[mi, i, j] = math.exp(np.float32(-lv)) if lv < cut else 0.0
+                acc_row += lv
+        rows[row] = acc_row
+    return rows

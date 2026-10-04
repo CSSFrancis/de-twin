@@ -35,6 +35,7 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 
@@ -63,28 +64,47 @@ class MasterPattern:
     n_bands: int
     build_s: float
     resolution_deg: float
+    #: Southern hemisphere (same coding), read at Lambert(x, y, |z|) for z < 0 as EMsoft stores
+    #: it; None for a centrosymmetric pattern (the north read at -direction).
+    south: Optional[np.ndarray] = None
+    source: str = "kinematic"  # or the file / "array" a user master came from
+    #: The cube map the renderer reads ((3 | 6, Nf, Nf) uint8, same coding; see kernels).
+    cube: Optional[np.ndarray] = None
 
-    def values(self) -> np.ndarray:
+    def values(self, hemisphere: str = "north") -> np.ndarray:
         """The standardised master pattern as float32 (N, N)."""
-        return np.float32(self.offset) + np.float32(self.scale) * self.data.astype(np.float32)
+        d = self.data if hemisphere == "north" else (self.south if self.south is not None
+                                                      else self.data[::-1, ::-1])
+        return np.float32(self.offset) + np.float32(self.scale) * d.astype(np.float32)
 
     @property
     def nbytes(self) -> int:
-        return int(self.data.nbytes)
+        return int(sum(a.nbytes for a in (self.data, self.south, self.cube) if a is not None))
 
     def value(self, directions) -> np.ndarray:
         """Bilinear master values at crystal directions (..., 3) (numpy, for checks)."""
-        X, Y = kernels.lambert_xy(np.asarray(directions, np.float64)
-                                  / np.linalg.norm(directions, axis=-1, keepdims=True))
+        v = np.asarray(directions, np.float64)
+        v = v / np.linalg.norm(v, axis=-1, keepdims=True)
+        south = v[..., 2] < 0
+        if self.south is not None:  # EMsoft: the southern array at Lambert(x, y, |z|)
+            v = np.where(south[..., None], v * np.array([1.0, 1.0, -1.0]), v)
+        X, Y = kernels.lambert_xy(v)  # folds z < 0 to -v (the centrosymmetric case)
         n = self.data.shape[0]
         s = (n - 1) / (2.0 * kernels.LAMBERT_L)
         fx, fy = (X + kernels.LAMBERT_L) * s, (Y + kernels.LAMBERT_L) * s
         ix = np.clip(np.floor(fx).astype(int), 0, n - 2)
         iy = np.clip(np.floor(fy).astype(int), 0, n - 2)
         tx, ty = np.clip(fx - ix, 0, 1), np.clip(fy - iy, 0, 1)
-        d = self.values()
-        return ((d[iy, ix] * (1 - tx) + d[iy, ix + 1] * tx) * (1 - ty)
-                + (d[iy + 1, ix] * (1 - tx) + d[iy + 1, ix + 1] * tx) * ty)
+        out = np.empty(v.shape[:-1], np.float32)
+        for hemi, sel in (("north", ~south), ("south", south)) if self.south is not None else (("north", None),):
+            d = self.values(hemi)
+            val = ((d[iy, ix] * (1 - tx) + d[iy, ix + 1] * tx) * (1 - ty)
+                   + (d[iy + 1, ix] * (1 - tx) + d[iy + 1, ix + 1] * tx) * ty)
+            if sel is None:
+                out = val.astype(np.float32)
+            else:
+                out[sel] = val[sel]
+        return out
 
 
 def bands(material: int, kv: float, max_g_inv_nm: float = MAX_G_INV_NM,
@@ -109,6 +129,44 @@ def bands(material: int, kv: float, max_g_inv_nm: float = MAX_G_INV_NM,
     glen = np.linalg.norm(g, axis=1)
     lam = electron_wavelength_nm(float(kv))
     return hkl, g / glen[:, None], 0.5 * lam * glen, f2 / f2.max()
+
+
+def cube_side(resolution_deg: float) -> int:
+    """Nodes per side of a cube-map face whose (largest, face-centre) pixel is ``resolution_deg``."""
+    return int(math.ceil(2.0 / math.radians(max(resolution_deg, 0.01)))) | 1
+
+
+def quantise(*arrays):
+    """(offset, scale, uint8 codes of each array) over their joint range."""
+    lo = min(float(a.min()) for a in arrays)
+    hi = max(float(a.max()) for a in arrays)
+    scale = (hi - lo) / 255.0 if hi > lo else 1.0
+    return lo, scale, [np.clip(np.rint((a - lo) / scale), 0, 255).astype(np.uint8) for a in arrays]
+
+
+def lambert_sample(north, south, dirs) -> np.ndarray:
+    """Bilinear values of float Lambert hemispheres (``south`` None: centrosymmetric) at unit
+    directions (..., 3), EMsoft's convention (south read at Lambert(x, y, |z|))."""
+    v = np.asarray(dirs, np.float64)
+    neg = v[..., 2] < 0
+    if south is not None:
+        v = np.where(neg[..., None], v * np.array([1.0, 1.0, -1.0]), v)
+    X, Y = kernels.lambert_xy(v)
+    n = north.shape[0]
+    s = (n - 1) / (2.0 * kernels.LAMBERT_L)
+    fx, fy = (X + kernels.LAMBERT_L) * s, (Y + kernels.LAMBERT_L) * s
+    ix = np.clip(np.floor(fx).astype(int), 0, n - 2)
+    iy = np.clip(np.floor(fy).astype(int), 0, n - 2)
+    tx, ty = np.clip(fx - ix, 0, 1), np.clip(fy - iy, 0, 1)
+
+    def bil(d):
+        return ((d[iy, ix] * (1 - tx) + d[iy, ix + 1] * tx) * (1 - ty)
+                + (d[iy + 1, ix] * (1 - tx) + d[iy + 1, ix + 1] * tx) * ty)
+
+    out = bil(north)
+    if south is not None:
+        out = np.where(neg, bil(south), out)
+    return out
 
 
 def lambert_side(resolution_deg: float) -> int:
@@ -136,20 +194,27 @@ def build_master(material: int, kv: float, *, energy_spread_frac: float = 0.08,
     sigma_edge = np.maximum(sigma, kernels.EDGE_MIN_SIGMA)
     reach = 1.0 + kernels.EDGE_OFFSET + 5.0 * np.maximum(sigma, sigma_edge)
     n = lambert_side(resolution_deg)
-    dirs = kernels.lambert_directions(n).reshape(-1, 3)
-    acc = np.empty(len(dirs), np.float64)
-    kernels.accumulate_bands(dirs, np.ascontiguousarray(normals, np.float64), sin_tb.astype(np.float64),
-                             amp.astype(np.float64), sigma.astype(np.float64), sigma_edge.astype(np.float64),
-                             reach.astype(np.float64), acc)
-    acc -= acc.mean()  # equal-area grid: plain moments are moments over the hemisphere
-    sd = acc.std()
-    acc /= sd if sd > 0 else 1.0
-    acc = np.where(acc > 0, COMPRESS * np.log1p(np.maximum(acc, 0.0) / COMPRESS), acc)
-    lo, hi = float(acc.min()), float(acc.max())
-    scale = (hi - lo) / 255.0 if hi > lo else 1.0
-    data = np.clip(np.rint((acc - lo) / scale), 0, 255).astype(np.uint8).reshape(n, n)
-    return MasterPattern(int(material), float(kv), data, lo, scale, int(len(hkl)), time.perf_counter() - t0,
-                         float(resolution_deg))
+    nf = cube_side(resolution_deg)
+    args = (np.ascontiguousarray(normals, np.float64), sin_tb.astype(np.float64), amp.astype(np.float64),
+            sigma.astype(np.float64), sigma_edge.astype(np.float64), reach.astype(np.float64))
+
+    def evaluate(dirs):
+        out = np.empty(len(dirs), np.float64)
+        kernels.accumulate_bands(np.ascontiguousarray(dirs), *args, out)
+        return out
+
+    lam = evaluate(kernels.lambert_directions(n).reshape(-1, 3))
+    cub = evaluate(kernels.cube_directions(nf, 3).reshape(-1, 3))
+    mu, sd = lam.mean(), lam.std()  # equal-area grid: plain moments are moments over the sphere
+    sd = sd if sd > 0 else 1.0
+
+    def finish(a):
+        a = (a - mu) / sd
+        return np.where(a > 0, COMPRESS * np.log1p(np.maximum(a, 0.0) / COMPRESS), a)
+
+    lo, scale, (data, cube) = quantise(finish(lam), finish(cub))
+    return MasterPattern(int(material), float(kv), data.reshape(n, n), lo, scale, int(len(hkl)),
+                         time.perf_counter() - t0, float(resolution_deg), cube=cube.reshape(3, nf, nf))
 
 
 class MasterCache:

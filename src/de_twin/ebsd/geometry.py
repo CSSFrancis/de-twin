@@ -88,7 +88,7 @@ class EbsdGeometry:
                                    "camera holds ~1 electron per pixel per frame at 20 kV).")
     step_um: float = _opt(0.5, 1e-4, 1e4, "Scan step on the (tilt-corrected) sample surface when "
                           "the request gives none.")
-    band_contrast: float = _opt(0.15, 0.0, 1.0, "Kikuchi band modulation relative to the background "
+    band_contrast: float = _opt(0.06, 0.0, 1.0, "Kikuchi band modulation relative to the background "
                                 "for a perfect surface.")
     energy_spread_frac: float = _opt(0.08, 0.0, 0.5, "FWHM of the backscattered energies that form "
                                      "the bands, over the beam energy (blurs the band edges).")
@@ -99,6 +99,8 @@ class EbsdGeometry:
     boundary_blend: bool = _opt(True, doc="Mix the neighbouring grain's pattern within the "
                                 "interaction volume near grain boundaries.")
     interaction_scale: float = _opt(1.0, 0.0, 10.0, "Scales the interaction-volume footprint.")
+    supersample: float = _opt(1, 1, 4, "Samples per binned pixel along each axis (binning integrates "
+                              "the band edges; 1 = the pixel centre).")
 
     # ------------------------------------------------------------------ persistence
     def to_dict(self) -> dict:

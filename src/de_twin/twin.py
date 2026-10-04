@@ -246,27 +246,41 @@ class DigitalTwin:
         time_s: Optional[float] = None,
     ) -> Optional[np.ndarray]:
         """Noiseless electrons/pixel/second on the ROI, or None if no beam."""
+        img, _ = self._flux(request, frame_index, scan_point, state=state, optics=optics, time_s=time_s)
+        return img
+
+    def _flux(self, request, frame_index=0, scan_point=None, *, state=None, optics=None, time_s=None,
+              frame_time_s: Optional[float] = None):
+        """``(flux, means)``: ``means`` (the detector's Poisson means, see ``Detector.expose``) when
+        the renderer made them on the way (an EBSD frame with ``frame_time_s``), else None. That
+        flux is a reused buffer, valid until the next frame."""
         with self.lock:
             t = self.clock.now() if time_s is None else time_s
             state = state or self.column.state()
             if not self.beam_on_detector(request, state):
-                return None
+                return None, None
             optics = optics or self.optics(request, state)
             roi = self.detector.roi(request)
             shape = (roi.h, roi.w)
             if self.flood_for_gain and request.exposure_mode in (ExposureMode.GAIN, ExposureMode.VACUUM):
-                return self._flood(optics, shape)
+                return self._flood(optics, shape), None
             self.specimen.update(t, self.holder_state(t))
             if scan_point is None:
                 scan_point = self.scan_point(request, frame_index)
+            if (optics.render_mode == RenderMode.EBSD and frame_time_s is not None and not optics.beam_blanked
+                    and not self.detector.super_resolution(request)):
+                bx, by = (max(1, int(v)) for v in (request.hw_binning or (1, 1)))
+                nb = bx * by if (bx, by) != (1, 1) else 1
+                return self.renderer.render_ebsd_frame(optics, frame_index, scan_point, t,
+                                                       float(frame_time_s) * nb)
             img = self.renderer.render(optics, frame_index=frame_index, scan_point=scan_point, time_s=t)
             if self.renderer.config.prefetch and optics.render_mode == RenderMode.TEM_IMAGING:
                 self._prefetch_next(request, state, t)
             if optics.render_mode == RenderMode.EBSD and img.shape == self.detector._grid_shape(request):
-                return img  # rendered on the binned grid already (per sensor pixel: expose takes it)
+                return img, None  # rendered on the binned grid already (per sensor pixel: expose takes it)
             if img.shape != shape:
                 img = _fit(img, shape)
-            return img
+            return img, None
 
     # -------------------------------------------------------------- prefetch
     _VIEW_FIELDS = ("magnification", "defocus_um")
@@ -350,7 +364,8 @@ class DigitalTwin:
                     optics = self.optics(request, state)
             with self.lock:
                 holder_state = self.holder_state(t)
-                flux = self.flux(request, i, state=state, optics=optics, time_s=t)
+                flux, means = self._flux(request, i, state=state, optics=optics, time_s=t,
+                                         frame_time_s=frame_time)
                 blanked = flux is None
                 # Noise is seeded by a twin-wide frame counter, not the index within this
                 # request: repeated acquisitions (live view) must not repeat their noise.
@@ -361,7 +376,7 @@ class DigitalTwin:
                 else:
                     serial, seed = i, int(request.seed)
                 raw, info = self.detector.expose(flux, frame_time, request, serial,
-                                                 ht_kv=state.ht_kv, seed=seed)
+                                                 ht_kv=state.ht_kv, seed=seed, means=means)
             meta = FrameMeta(
                 frame_index=i,
                 time_s=t,

@@ -42,15 +42,20 @@ def _raw(tw, req, ix=0, iy=0, matrix=None, material=None, master=None):
     return r.pattern(optics, m, pc, material_id=mid, raw=True), pc, optics
 
 
-def _zone_centre(img, c, r, half=12):
-    """Where a zone axis (a star of crossing bands) is in ``img`` near (col c, row r): the
-    centroid of the brightest part of a window. (Not the argmax: excess lines along band
-    edges cross just off the axis.)"""
+def _zone_centre(img, c, r, half=16):
+    """Where a zone axis is in ``img`` near (col c, row r): the unweighted centroid of the
+    bright region (above the midpoint of window median and maximum) that contains the window's
+    brightest pixel. Crossing top-hat bands make a flat-topped region with brighter excess
+    lines at its edges, so neither the argmax nor an intensity-weighted centroid is reliable;
+    the region is symmetric about the axis."""
+    from scipy import ndimage
+
     r0, c0 = int(round(r)) - half, int(round(c)) - half
     win = img[r0:r0 + 2 * half + 1, c0:c0 + 2 * half + 1].astype(np.float64)
-    w = np.clip(win - np.percentile(win, 90), 0, None) ** 2
-    rr, cc = np.mgrid[0:win.shape[0], 0:win.shape[1]]
-    return c0 + float((w * cc).sum() / w.sum()), r0 + float((w * rr).sum() / w.sum())
+    lab, _ = ndimage.label(win > 0.5 * (np.median(win) + win.max()))
+    k = lab[np.unravel_index(np.argmax(win), win.shape)]
+    rr, cc = np.nonzero(lab == k)
+    return c0 + float(cc.mean()), r0 + float(rr.mean())
 
 
 # ---------------------------------------------------------------------- mode and optics
@@ -265,7 +270,7 @@ def test_boundaries_mix_patterns_and_lower_band_contrast():
     r = tw.renderer.ebsd
     tab = r.tables(tw.specimen, optics)
     w = float(tab.mix[0, i])
-    p = r._render_point(optics, tab, i, 0, raw=True).copy()
+    p = r.raw_pattern(tw.specimen, optics, i, 0)
     a = r.pattern(optics, tab.matrices[tab.orient[0, i]], gt["pattern_centre"][0, i],
                   material_id=MaterialId.NICKEL, raw=True)
     b = r.pattern(optics, tab.matrices[tab.orient2[0, i]], gt["pattern_centre"][0, i],
@@ -278,7 +283,7 @@ def test_master_pattern_is_compact_and_cached():
     MASTERS.clear()
     g = EbsdGeometry()
     mp = master_for(MaterialId.NICKEL, KV, g)
-    assert mp.data.dtype == np.uint8 and mp.nbytes < 1.5e6
+    assert mp.data.dtype == np.uint8 and mp.cube.dtype == np.uint8 and mp.nbytes < 3e6
     assert master_for(MaterialId.NICKEL, KV, g) is mp and MASTERS.builds >= 1
     v = mp.values()
     assert abs(float(v.mean())) < 0.1
@@ -380,7 +385,7 @@ def test_pattern_centre_conventions():
 # ---------------------------------------------------------------------- indexing
 @pytest.mark.timeout(300)
 def test_dictionary_indexing_recovers_orientations():
-    """Noisy frames of a Ni polycrystal (~10 e- per binned pixel, integrating Celeritas)
+    """Noisy frames of a Ni polycrystal (~45 e- per binned pixel, integrating Celeritas)
     indexed with a 4-degree dictionary and a refinement: within 1.5 deg of the truth (in practice
     ~0.05 deg median; ~0.1 deg at 3 e-, and it breaks down near 1 e- per binned pixel)."""
     from orix.quaternion.symmetry import Oh
@@ -391,7 +396,7 @@ def test_dictionary_indexing_recovers_orientations():
 
     tw = _twin("EBSD Ni polycrystal", probe_current_na=0.1)
     nx, ny = 6, 5
-    req = _scan(tw, nx, ny, step=3.0, binning=8, dwell=1e-3, seed=7)
+    req = _scan(tw, nx, ny, step=3.0, binning=8, dwell=5e-3, seed=7)
     optics = tw.optics(req)
     gt = tw.ground_truth(req, as_arrays=True)
     dark = tw.detector.expected_dark(req.frame_time_s, req)
@@ -422,7 +427,7 @@ def test_dictionary_indexing_recovers_orientations():
     errs = []
     for k in range(nx * ny):
         iy, ix = divmod(k, nx)
-        if gt["mix"][iy, ix] > 0.2:
+        if gt["quality"][iy, ix] < 0.7:  # on a boundary (mixed or in its zone)
             continue
         m, c = refine(exp_fine[k], sim(optics, pcs[k]), D[idx[k]])
         G = crystal_to_lab(gt["quaternion"][iy, ix])[0]

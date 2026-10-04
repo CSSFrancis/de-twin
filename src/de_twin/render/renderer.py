@@ -231,6 +231,8 @@ class Renderer:
         self._stem = StemRenderer(self.cache, self.config, self.seed)
         self._coherent = CoherentStem(self.cache, self.config, self.seed)
         self._ebsd = None  # EbsdRenderer, made on first EBSD render
+        #: material id -> user master patterns (``DigitalTwin.set_master_pattern``); the twin's dict
+        self.ebsd_user_masters: dict = {}
         self._grains_fallback: Optional[GrainTable] = None
         self._lock = threading.RLock()  # render() and a prefetching thread share the caches
         self._prefetch_tem = TransferCache(size=1)
@@ -633,8 +635,14 @@ class Renderer:
         if self._ebsd is None:
             from ..ebsd import EbsdRenderer
 
-            self._ebsd = EbsdRenderer(self.seed)
+            self._ebsd = EbsdRenderer(self.seed, self.ebsd_user_masters)
         return self._ebsd
+
+    def render_ebsd_frame(self, optics, frame_index: int, scan_point, time_s: float, t_nb: float):
+        """``(flux, means)`` of an EBSD camera frame (see ``EbsdRenderer.render_frame``)."""
+        with self._lock:
+            ix, iy = resolve_scan_point(optics, scan_point, frame_index, self.specimen, self.config)
+            return self.ebsd.render_frame(self.specimen, optics, ix, iy, t_nb, *self._ebsd_source(optics, time_s))
 
     def _ebsd_source(self, optics, time_s: float) -> tuple:
         """(field map, grain table) for an EBSD scan of a specimen that has no ``sample``
