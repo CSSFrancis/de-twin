@@ -97,6 +97,10 @@ class CameraModel:
     cluster_area_px: float = 2.5  # coincidence area of one event
     false_event_rate: float = 2e-6  # per pixel per sensor cycle
     reference_ht_kv: float = 300.0
+    #: Below this beam energy an electron stops inside the sensitive layer and deposits all of
+    #: its energy, so the ADU per electron falls in proportion to the energy (the HT table's
+    #: log-log trend only holds while electrons pass through). SEM energies (EBSD, 5-30 kV).
+    full_stop_kv: float = 40.0
     aliases: tuple[str, ...] = field(default=(), compare=False)
 
     # ------------------------------------------------------------- derived
@@ -131,7 +135,10 @@ class CameraModel:
             return 1.0
         kv = np.array([p[0] for p in self.adu_table])
         adu = np.array([p[1] for p in self.adu_table])
-        ht = float(np.clip(ht_kv, 20.0, 1000.0))
+        ht = float(np.clip(ht_kv, 1.0, 1000.0))
+        stop = float(self.full_stop_kv)
+        if 0.0 < stop and ht < stop and ht < kv[0]:  # fully absorbed: deposit ~ energy
+            return self.adu_per_electron_at(stop) * ht / stop
         if kv[0] <= ht <= kv[-1]:
             return float(np.exp(np.interp(np.log(ht), np.log(kv), np.log(adu))))
         return _loglog_extrapolate(kv, adu, ht)
