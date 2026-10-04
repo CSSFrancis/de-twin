@@ -78,29 +78,47 @@ class EbsdGeometry:
     enabled: bool = _opt(True, doc="EBSD mode on (every acquisition renders EBSD patterns).")
     sample_tilt_deg: float = _opt(70.0, 0.0, 89.0, "Sample tilt about x_s towards the detector.")
     detector_tilt_deg: float = _opt(0.0, -30.0, 30.0, "Screen normal tilted down towards the sample.")
-    working_distance_mm: float = _opt(15.0, 1.0, 50.0, "Working distance (sample height below the pole "
-                                      "piece).")
+    working_distance_mm: float = _opt(
+        15.0, 1.0, 50.0, "Working distance (sample height below the pole piece)."
+    )
     calibration_wd_mm: float = _opt(15.0, 1.0, 50.0, "Working distance the pattern centre was calibrated at.")
     pcx: float = _opt(0.5, -1.0, 2.0, "Pattern centre x / sensor width, from the left (Bruker).")
     pcy: float = _opt(0.3, -1.0, 2.0, "Pattern centre y / sensor height, from the top (Bruker).")
     pcz: float = _opt(0.6, 0.05, 5.0, "Source-screen distance / sensor height (Bruker).")
-    probe_current_na: float = _opt(0.1, 0.0, 1000.0, "SEM probe current, nA (an integrating DE "
-                                   "camera holds ~1 electron per pixel per frame at 20 kV).")
-    step_um: float = _opt(0.5, 1e-4, 1e4, "Scan step on the (tilt-corrected) sample surface when "
-                          "the request gives none.")
-    band_contrast: float = _opt(0.06, 0.0, 1.0, "Kikuchi band modulation relative to the background "
-                                "for a perfect surface.")
-    energy_spread_frac: float = _opt(0.08, 0.0, 0.5, "FWHM of the backscattered energies that form "
-                                     "the bands, over the beam energy (blurs the band edges).")
-    angular_blur_deg: float = _opt(0.1, 0.0, 2.0, "Angular blur of the screen (scintillator / "
-                                   "charge spread), sigma.")
+    probe_current_na: float = _opt(
+        0.1,
+        0.0,
+        1000.0,
+        "SEM probe current, nA (an integrating DE camera holds ~1 electron per pixel per frame at 20 kV).",
+    )
+    step_um: float = _opt(
+        0.5, 1e-4, 1e4, "Scan step on the (tilt-corrected) sample surface when the request gives none."
+    )
+    band_contrast: float = _opt(
+        0.06, 0.0, 1.0, "Kikuchi band modulation relative to the background for a perfect surface."
+    )
+    energy_spread_frac: float = _opt(
+        0.08,
+        0.0,
+        0.5,
+        "FWHM of the backscattered energies that form "
+        "the bands, over the beam energy (blurs the band edges).",
+    )
+    angular_blur_deg: float = _opt(
+        0.1, 0.0, 2.0, "Angular blur of the screen (scintillator / charge spread), sigma."
+    )
     master_resolution_deg: float = _opt(0.15, 0.03, 1.0, "Pixel of the cached Lambert master pattern.")
     background: bool = _opt(True, doc="Angle-dependent backscatter background (off: isotropic, bands only).")
-    boundary_blend: bool = _opt(True, doc="Mix the neighbouring grain's pattern within the "
-                                "interaction volume near grain boundaries.")
+    boundary_blend: bool = _opt(
+        True, doc="Mix the neighbouring grain's pattern within the interaction volume near grain boundaries."
+    )
     interaction_scale: float = _opt(1.0, 0.0, 10.0, "Scales the interaction-volume footprint.")
-    supersample: float = _opt(1, 1, 4, "Samples per binned pixel along each axis (binning integrates "
-                              "the band edges; 1 = the pixel centre).")
+    supersample: float = _opt(
+        1,
+        1,
+        4,
+        "Samples per binned pixel along each axis (binning integrates the band edges; 1 = the pixel centre).",
+    )
 
     # ------------------------------------------------------------------ persistence
     def to_dict(self) -> dict:
@@ -160,8 +178,9 @@ class EbsdGeometry:
         f = b - 2.0 * float(b @ n) * n
         return f / np.linalg.norm(f)
 
-    def pattern_centre(self, dx_um=0.0, dy_um=0.0, sensor_shape=(1024, 1024),
-                       pixel_um: float = 15.0) -> np.ndarray:
+    def pattern_centre(
+        self, dx_um=0.0, dy_um=0.0, sensor_shape=(1024, 1024), pixel_um: float = 15.0
+    ) -> np.ndarray:
         """Bruker ``(pcx, pcy, pcz)`` with the beam ``(dx_um, dy_um)`` from the scan centre on the
         sample (sample frame), at this geometry's working distance. Arrays broadcast; the
         result has a trailing axis of 3."""
@@ -244,8 +263,9 @@ def kanaya_okayama_range_um(z: float, density_g_cm3: float, kv: float) -> float:
 EBSD_FOOTPRINT_FRACTION = 0.02
 
 
-def footprint_um(z: float, density_g_cm3: float, kv: float, tilt_deg: float,
-                 scale: float = 1.0) -> tuple[float, float]:
+def footprint_um(
+    z: float, density_g_cm3: float, kv: float, tilt_deg: float, scale: float = 1.0
+) -> tuple[float, float]:
     """(rx, ry) µm: semi-axes of the area the Kikuchi signal comes from, along x_s (the tilt
     axis) and y_s (stretched by 1 / cos tilt on the tilted surface)."""
     rx = EBSD_FOOTPRINT_FRACTION * kanaya_okayama_range_um(z, density_g_cm3, kv) * float(scale)

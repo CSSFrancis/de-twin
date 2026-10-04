@@ -6,6 +6,7 @@
 * :mod:`.master`: kinematic Kikuchi master patterns per phase and energy, cached.
 * :mod:`.kernels`: numba kernels (master sum, gnomonic projection).
 * :mod:`.render`: :class:`EbsdRenderer`, the per-scan-point patterns and ground truth.
+* :mod:`.io`: user master patterns (EMsoft / kikuchipy HDF5, NumPy) and the EMsoft writer.
 
 Put a twin in EBSD mode with ``DigitalTwin.configure_ebsd`` (or ``OpticsConfig.ebsd``) and a
 bulk specimen (:data:`de_twin.specimen.bulk.BULK_PRESETS`); patterns then come out of
@@ -13,8 +14,21 @@ bulk specimen (:data:`de_twin.specimen.bulk.BULK_PRESETS`); patterns then come o
 """
 
 from .geometry import PC_CONVENTION, EbsdGeometry, convert_pc, detector_position, pc_pixels
+from .io import load_master_pattern, write_emsoft
 from .master import MASTERS, MasterPattern, build_master, master_for
 from .render import EbsdRenderer
 
-__all__ = ["EbsdGeometry", "EbsdRenderer", "MASTERS", "MasterPattern", "PC_CONVENTION", "build_master",
-           "convert_pc", "detector_position", "master_for", "pc_pixels"]
+__all__ = [
+    "EbsdGeometry",
+    "EbsdRenderer",
+    "MASTERS",
+    "MasterPattern",
+    "PC_CONVENTION",
+    "build_master",
+    "convert_pc",
+    "detector_position",
+    "load_master_pattern",
+    "master_for",
+    "pc_pixels",
+    "write_emsoft",
+]

@@ -107,8 +107,9 @@ def accumulate_bands(dirs, normals, half_width, amp, sigma, sigma_edge, reach, o
             se = sigma_edge[k]
             a = t - 1.0 + EDGE_OFFSET
             b = t - 1.0 - EDGE_OFFSET
-            edge = EDGE_EXCESS * math.exp(-0.5 * a * a / (se * se)) \
-                - EDGE_DEFICIENCY * math.exp(-0.5 * b * b / (se * se))
+            edge = EDGE_EXCESS * math.exp(-0.5 * a * a / (se * se)) - EDGE_DEFICIENCY * math.exp(
+                -0.5 * b * b / (se * se)
+            )
             acc += amp[k] * (band + edge)
         out[p] = acc
 
@@ -116,9 +117,17 @@ def accumulate_bands(dirs, normals, half_width, amp, sigma, sigma_edge, reach, o
 # ---------------------------------------------------------------------- projection
 #: atan(x) = x P(x^2) on |x| <= 1, least-squares fit, max error 1.1e-8 rad (libm's scalar atan
 #: was half the lookup's time).
-_ATAN = (0.0028340989710117373, -0.016005224935549546, 0.04258803010402406, -0.07495492338117586,
-         0.10636782943784438, -0.14202580379049168, 0.19992485341385735, -0.33333066920402804,
-         0.9999999842746156)
+_ATAN = (
+    0.0028340989710117373,
+    -0.016005224935549546,
+    0.04258803010402406,
+    -0.07495492338117586,
+    0.10636782943784438,
+    -0.14202580379049168,
+    0.19992485341385735,
+    -0.33333066920402804,
+    0.9999999842746156,
+)
 
 
 @_njit(inline="always")
@@ -242,9 +251,43 @@ def _detector_to_crystal(g, finv, has_f, s2dT, out):
 
 
 @_njit(parallel=True)
-def render(bank, face0, full, offs, scales, mats, o1, o2, ph1, ph2, mix, contrast, es, finv, has_f,
-           dx, dy, pc_lin, s2dT, ks, ox, oy, bx, by, ss, raw, normal, fwd, lobe, kappa, t_nb,
-           out, lam, p0, want_means):
+def render(
+    bank,
+    face0,
+    full,
+    offs,
+    scales,
+    mats,
+    o1,
+    o2,
+    ph1,
+    ph2,
+    mix,
+    contrast,
+    es,
+    finv,
+    has_f,
+    dx,
+    dy,
+    pc_lin,
+    s2dT,
+    ks,
+    ox,
+    oy,
+    bx,
+    by,
+    ss,
+    raw,
+    normal,
+    fwd,
+    lobe,
+    kappa,
+    t_nb,
+    out,
+    lam,
+    p0,
+    want_means,
+):
     """EBSD patterns of scan points ``ks`` on a binned detector grid, in one threaded pass.
 
     Per point k: grain orientation ``mats[o1[k]]`` (crystal -> sample) of phase ``ph1[k]``, its

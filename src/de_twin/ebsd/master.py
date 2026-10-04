@@ -73,8 +73,11 @@ class MasterPattern:
 
     def values(self, hemisphere: str = "north") -> np.ndarray:
         """The standardised master pattern as float32 (N, N)."""
-        d = self.data if hemisphere == "north" else (self.south if self.south is not None
-                                                      else self.data[::-1, ::-1])
+        d = (
+            self.data
+            if hemisphere == "north"
+            else (self.south if self.south is not None else self.data[::-1, ::-1])
+        )
         return np.float32(self.offset) + np.float32(self.scale) * d.astype(np.float32)
 
     @property
@@ -96,10 +99,13 @@ class MasterPattern:
         iy = np.clip(np.floor(fy).astype(int), 0, n - 2)
         tx, ty = np.clip(fx - ix, 0, 1), np.clip(fy - iy, 0, 1)
         out = np.empty(v.shape[:-1], np.float32)
-        for hemi, sel in (("north", ~south), ("south", south)) if self.south is not None else (("north", None),):
+        for hemi, sel in (
+            (("north", ~south), ("south", south)) if self.south is not None else (("north", None),)
+        ):
             d = self.values(hemi)
-            val = ((d[iy, ix] * (1 - tx) + d[iy, ix + 1] * tx) * (1 - ty)
-                   + (d[iy + 1, ix] * (1 - tx) + d[iy + 1, ix + 1] * tx) * ty)
+            val = (d[iy, ix] * (1 - tx) + d[iy, ix + 1] * tx) * (1 - ty) + (
+                d[iy + 1, ix] * (1 - tx) + d[iy + 1, ix + 1] * tx
+            ) * ty
             if sel is None:
                 out = val.astype(np.float32)
             else:
@@ -107,8 +113,13 @@ class MasterPattern:
         return out
 
 
-def bands(material: int, kv: float, max_g_inv_nm: float = MAX_G_INV_NM,
-          min_f2_fraction: float = MIN_F2_FRACTION, max_bands: int = MAX_BANDS):
+def bands(
+    material: int,
+    kv: float,
+    max_g_inv_nm: float = MAX_G_INV_NM,
+    min_f2_fraction: float = MIN_F2_FRACTION,
+    max_bands: int = MAX_BANDS,
+):
     """(hkl (K, 3) int, unit plane normals (K, 3), sin(theta_B) (K,), weight |F|^2 / max (K,))
     of the Kikuchi bands of ``material`` at ``kv``, one per +-g pair, strongest first."""
     from ..crystal import library_for
@@ -160,8 +171,9 @@ def lambert_sample(north, south, dirs) -> np.ndarray:
     tx, ty = np.clip(fx - ix, 0, 1), np.clip(fy - iy, 0, 1)
 
     def bil(d):
-        return ((d[iy, ix] * (1 - tx) + d[iy, ix + 1] * tx) * (1 - ty)
-                + (d[iy + 1, ix] * (1 - tx) + d[iy + 1, ix + 1] * tx) * ty)
+        return (d[iy, ix] * (1 - tx) + d[iy, ix + 1] * tx) * (1 - ty) + (
+            d[iy + 1, ix] * (1 - tx) + d[iy + 1, ix + 1] * tx
+        ) * ty
 
     out = bil(north)
     if south is not None:
@@ -175,9 +187,16 @@ def lambert_side(resolution_deg: float) -> int:
     return n | 1
 
 
-def build_master(material: int, kv: float, *, energy_spread_frac: float = 0.08,
-                 angular_blur_deg: float = 0.1, resolution_deg: float = 0.15,
-                 max_bands: int = MAX_BANDS, hkl_subset=None) -> MasterPattern:
+def build_master(
+    material: int,
+    kv: float,
+    *,
+    energy_spread_frac: float = 0.08,
+    angular_blur_deg: float = 0.1,
+    resolution_deg: float = 0.15,
+    max_bands: int = MAX_BANDS,
+    hkl_subset=None,
+) -> MasterPattern:
     """Build the master pattern (see the module docstring). ``hkl_subset``: only these planes
     (and their higher orders' weights as given; for tests)."""
     t0 = time.perf_counter()
@@ -190,13 +209,19 @@ def build_master(material: int, kv: float, *, energy_spread_frac: float = 0.08,
     theta = np.arcsin(np.clip(sin_tb, 0, 1))
     sig_e = float(energy_spread_frac) / 2.355 / 2.0  # edge shift dt = dE / (2E)
     sig_a = math.radians(float(angular_blur_deg)) / np.maximum(theta, 1e-9)
-    sigma = np.maximum(np.sqrt(sig_e ** 2 + sig_a ** 2), 0.02)
+    sigma = np.maximum(np.sqrt(sig_e**2 + sig_a**2), 0.02)
     sigma_edge = np.maximum(sigma, kernels.EDGE_MIN_SIGMA)
     reach = 1.0 + kernels.EDGE_OFFSET + 5.0 * np.maximum(sigma, sigma_edge)
     n = lambert_side(resolution_deg)
     nf = cube_side(resolution_deg)
-    args = (np.ascontiguousarray(normals, np.float64), sin_tb.astype(np.float64), amp.astype(np.float64),
-            sigma.astype(np.float64), sigma_edge.astype(np.float64), reach.astype(np.float64))
+    args = (
+        np.ascontiguousarray(normals, np.float64),
+        sin_tb.astype(np.float64),
+        amp.astype(np.float64),
+        sigma.astype(np.float64),
+        sigma_edge.astype(np.float64),
+        reach.astype(np.float64),
+    )
 
     def evaluate(dirs):
         out = np.empty(len(dirs), np.float64)
@@ -213,8 +238,17 @@ def build_master(material: int, kv: float, *, energy_spread_frac: float = 0.08,
         return np.where(a > 0, COMPRESS * np.log1p(np.maximum(a, 0.0) / COMPRESS), a)
 
     lo, scale, (data, cube) = quantise(finish(lam), finish(cub))
-    return MasterPattern(int(material), float(kv), data.reshape(n, n), lo, scale, int(len(hkl)),
-                         time.perf_counter() - t0, float(resolution_deg), cube=cube.reshape(3, nf, nf))
+    return MasterPattern(
+        int(material),
+        float(kv),
+        data.reshape(n, n),
+        lo,
+        scale,
+        int(len(hkl)),
+        time.perf_counter() - t0,
+        float(resolution_deg),
+        cube=cube.reshape(3, nf, nf),
+    )
 
 
 class MasterCache:
@@ -226,17 +260,33 @@ class MasterCache:
         self._lock = threading.Lock()
         self.builds = 0
 
-    def get(self, material: int, kv: float, energy_spread_frac: float, angular_blur_deg: float,
-            resolution_deg: float) -> MasterPattern:
-        key = (int(material), round(float(kv), 2), round(float(energy_spread_frac), 4),
-               round(float(angular_blur_deg), 4), round(float(resolution_deg), 4))
+    def get(
+        self,
+        material: int,
+        kv: float,
+        energy_spread_frac: float,
+        angular_blur_deg: float,
+        resolution_deg: float,
+    ) -> MasterPattern:
+        key = (
+            int(material),
+            round(float(kv), 2),
+            round(float(energy_spread_frac), 4),
+            round(float(angular_blur_deg), 4),
+            round(float(resolution_deg), 4),
+        )
         with self._lock:
             hit = self._d.get(key)
             if hit is not None:
                 self._d.move_to_end(key)
                 return hit
-            mp = build_master(material, kv, energy_spread_frac=energy_spread_frac,
-                              angular_blur_deg=angular_blur_deg, resolution_deg=resolution_deg)
+            mp = build_master(
+                material,
+                kv,
+                energy_spread_frac=energy_spread_frac,
+                angular_blur_deg=angular_blur_deg,
+                resolution_deg=resolution_deg,
+            )
             self.builds += 1
             self._d[key] = mp
             while len(self._d) > 1 and self.nbytes > self.budget:

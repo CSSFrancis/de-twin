@@ -19,8 +19,8 @@ tilt-corrected sample surface):
    camera frame it also writes the detector's Poisson means (``means``), so the detector
    starts its frame from them without another pass.
 
-Steps 1-3 are done once per scan (:class:`EbsdTables`, :class:`EbsdPlan`: ~60 bytes per scan
-point, +108 for a strained specimen) and kept; master patterns are process-wide
+Steps 1-3 are done once per scan (:class:`EbsdTables`, :class:`EbsdPlan`: ~100 bytes per scan
+point, +72 for a strained specimen) and kept; master patterns are process-wide
 (:mod:`de_twin.ebsd.master`) unless the twin was given its own (``user_masters``).
 
 A specimen without :meth:`sample` (a TEM specimen) is read from its field map: phase and
@@ -42,7 +42,8 @@ from .geometry import EbsdGeometry, background_parameters, backscatter_yield, bo
 from .master import MasterPattern, master_for
 
 ELECTRON_C = 1.602176634e-19
-_NO_F = np.zeros((1, 3, 3))
+_NO_F = np.zeros((1, 3, 3), np.float32)
+F32 = np.float32
 
 
 @dataclass
@@ -81,12 +82,12 @@ class EbsdPlan:
     ph2: np.ndarray
     o1: np.ndarray  # (n,) int32 orientation index
     o2: np.ndarray
-    mix: np.ndarray  # (n,) float64
-    contrast: np.ndarray  # (n,) float64 band modulation (band_contrast * quality)
-    es: np.ndarray  # (n,) float64 backscattered electrons per second
-    finv: np.ndarray  # (n, 3, 3) float64 inverse deformation gradient, or (1, 3, 3)
+    mix: np.ndarray  # (n,) float32
+    contrast: np.ndarray  # (n,) float32 band modulation (band_contrast * quality)
+    es: np.ndarray  # (n,) float32 backscattered electrons per second
+    finv: np.ndarray  # (n, 3, 3) float32 inverse deformation gradient, or (1, 3, 3)
     has_f: bool
-    dx: np.ndarray  # (n,) float64 beam offset from the scan centre, µm
+    dx: np.ndarray  # (n,) float32 beam offset from the scan centre, µm
     dy: np.ndarray
     matrices: np.ndarray
     pc_lin: np.ndarray  # (9,) pattern centre (sensor px) linear in the beam offset
@@ -158,15 +159,22 @@ class EbsdRenderer:
         planes, face0, full = [], [], []
         for m in masters:
             if m.cube.shape[1] != n:
-                raise ValueError("master patterns of one scan must share a resolution (set "
-                                 "EbsdGeometry.master_resolution_deg to the user master's)")
+                raise ValueError(
+                    "master patterns of one scan must share a resolution (set "
+                    "EbsdGeometry.master_resolution_deg to the user master's)"
+                )
             face0.append(len(planes))
             full.append(m.cube.shape[0] == 6)
             planes.extend(m.cube)
         bank = np.stack(planes) if planes else np.zeros((3, 3, 3), np.uint8)
-        return (bank, np.array(face0 or [0], np.int32), np.array(full or [False], np.bool_),
-                np.array([m.offset for m in masters] or [0.0]), np.array([m.scale for m in masters] or [0.0]),
-                masters)
+        return (
+            bank,
+            np.array(face0 or [0], np.int32),
+            np.array(full or [False], np.bool_),
+            np.array([m.offset for m in masters] or [0.0]),
+            np.array([m.scale for m in masters] or [0.0]),
+            masters,
+        )
 
     # ------------------------------------------------------------------ tables
     def tables(self, specimen, optics, field_map=None, grains=None) -> EbsdTables:
@@ -203,18 +211,28 @@ class EbsdRenderer:
                 for mid in np.unique(m1):
                     sel = m1 == mid
                     mm = material(int(mid))
-                    rx, ry = footprint_um(mm.z_eff, mm.density_g_cm3, optics.ht_kv, g.sample_tilt_deg,
-                                          g.interaction_scale)
+                    rx, ry = footprint_um(
+                        mm.z_eff, mm.density_g_cm3, optics.ht_kv, g.sample_tilt_deg, g.interaction_scale
+                    )
                     mix[sel] = boundary_mix(s["boundary_um"][sel], s["normal"][sel], rx, ry)
             mix[o1 == o2] = 0.0
             F = s.get("F")
             gnd = s.get("gnd")
-            return EbsdTables(x, y, s["material"].reshape(ny, nx), s["material2"].reshape(ny, nx),
-                              s["grain_id"].reshape(ny, nx), s["grain_id2"].reshape(ny, nx),
-                              o1.reshape(ny, nx), o2.reshape(ny, nx), mats, mix.reshape(ny, nx),
-                              s["quality"].reshape(ny, nx),
-                              None if F is None else np.asarray(F, np.float32).reshape(ny, nx, 3, 3),
-                              None if gnd is None else np.asarray(gnd, np.float32).reshape(ny, nx))
+            return EbsdTables(
+                x,
+                y,
+                s["material"].reshape(ny, nx),
+                s["material2"].reshape(ny, nx),
+                s["grain_id"].reshape(ny, nx),
+                s["grain_id2"].reshape(ny, nx),
+                o1.reshape(ny, nx),
+                o2.reshape(ny, nx),
+                mats,
+                mix.reshape(ny, nx),
+                s["quality"].reshape(ny, nx),
+                None if F is None else np.asarray(F, np.float32).reshape(ny, nx, 3, 3),
+                None if gnd is None else np.asarray(gnd, np.float32).reshape(ny, nx),
+            )
         # a TEM specimen: the field map's phase and grain-table orientation
         fm = field_map
         gid = fm.grain_id.astype(np.int64)
@@ -228,15 +246,32 @@ class EbsdRenderer:
         orient = np.full(gid.shape, -1, np.int32)
         orient[ok] = inv
         gid32 = np.where(ok, gid, -1).astype(np.int32)
-        return EbsdTables(x, y, mat.astype(np.uint8), mat.astype(np.uint8), gid32, gid32.copy(), orient,
-                          orient.copy(), mats, np.zeros((ny, nx), np.float32), np.ones((ny, nx), np.float32))
+        return EbsdTables(
+            x,
+            y,
+            mat.astype(np.uint8),
+            mat.astype(np.uint8),
+            gid32,
+            gid32.copy(),
+            orient,
+            orient.copy(),
+            mats,
+            np.zeros((ny, nx), np.float32),
+            np.ones((ny, nx), np.float32),
+        )
 
     # ------------------------------------------------------------------ plans
     def plan(self, specimen, optics, field_map=None, grains=None) -> EbsdPlan:
         g = ebsd_geometry(optics)
-        key = (_key(optics), g, round(optics.ht_kv, 4), optics.extras["sensor_shape"],
-               optics.extras["sensor_pixel_um"], float(optics.pattern_e_per_s),
-               tuple((k, tuple(id(m) for m in v)) for k, v in sorted(self.user_masters.items())))
+        key = (
+            _key(optics),
+            g,
+            round(optics.ht_kv, 4),
+            optics.extras["sensor_shape"],
+            optics.extras["sensor_pixel_um"],
+            float(optics.pattern_e_per_s),
+            tuple((k, tuple(id(m) for m in v)) for k, v in sorted(self.user_masters.items())),
+        )
         with self._lock:
             p = self._plans.get(key)
             if p is not None:
@@ -263,19 +298,38 @@ class EbsdRenderer:
         ph2 = np.where(o2 >= 0, lut[m2], -1).astype(np.int32)
         eta = np.array([backscatter_yield(mm.z_eff, g.sample_tilt_deg) for mm in MATERIALS])
         eta[0] = 0.0  # vacuum
-        es = float(optics.pattern_e_per_s) * eta[m1]
-        contrast = (float(g.band_contrast) * tab.quality.ravel()).astype(np.float64)
+        es = (float(optics.pattern_e_per_s) * eta[m1]).astype(F32)
+        contrast = (float(g.band_contrast) * tab.quality.ravel()).astype(F32)
         cx, cy = optics.view.center_um
         has_f = tab.F is not None
-        finv = (np.linalg.inv(tab.F.reshape(-1, 3, 3).astype(np.float64)) if has_f else _NO_F)
+        finv = np.linalg.inv(tab.F.reshape(-1, 3, 3).astype(np.float64)).astype(F32) if has_f else _NO_F
         lobe, kappa = self._background(optics, g)
-        return EbsdPlan(bank, face0, full, offs, scales, ph1, ph2, o1.astype(np.int32), o2.astype(np.int32),
-                        tab.mix.ravel().astype(np.float64), contrast, es, np.ascontiguousarray(finv), has_f,
-                        (tab.x_um - cx).ravel(), (tab.y_um - cy).ravel(),
-                        np.ascontiguousarray(tab.matrices if len(tab.matrices) else np.zeros((1, 3, 3))),
-                        pc_linear(g, optics.extras["sensor_shape"], optics.extras["sensor_pixel_um"]),
-                        np.ascontiguousarray(g.sample_to_detector().T), g.surface_normal_d(),
-                        g.forward_direction_d(), lobe, kappa, masters)
+        return EbsdPlan(
+            bank,
+            face0,
+            full,
+            offs,
+            scales,
+            ph1,
+            ph2,
+            o1.astype(np.int32),
+            o2.astype(np.int32),
+            tab.mix.ravel().astype(F32),
+            contrast,
+            es,
+            np.ascontiguousarray(finv),
+            has_f,
+            (tab.x_um - cx).ravel().astype(F32),
+            (tab.y_um - cy).ravel().astype(F32),
+            np.ascontiguousarray(tab.matrices if len(tab.matrices) else np.zeros((1, 3, 3))),
+            pc_linear(g, optics.extras["sensor_shape"], optics.extras["sensor_pixel_um"]),
+            np.ascontiguousarray(g.sample_to_detector().T),
+            g.surface_normal_d(),
+            g.forward_direction_d(),
+            lobe,
+            kappa,
+            masters,
+        )
 
     @staticmethod
     def _background(optics, g: EbsdGeometry) -> tuple[float, float]:
@@ -287,14 +341,19 @@ class EbsdRenderer:
     def pattern_centre(self, optics, tab: EbsdTables, ix: int, iy: int) -> np.ndarray:
         g = ebsd_geometry(optics)
         cx, cy = optics.view.center_um
-        return g.pattern_centre(tab.x_um[iy, ix] - cx, tab.y_um[iy, ix] - cy, optics.extras["sensor_shape"],
-                                optics.extras["sensor_pixel_um"])
+        return g.pattern_centre(
+            tab.x_um[iy, ix] - cx,
+            tab.y_um[iy, ix] - cy,
+            optics.extras["sensor_shape"],
+            optics.extras["sensor_pixel_um"],
+        )
 
     def pattern_centres(self, optics, tab: EbsdTables) -> np.ndarray:
         g = ebsd_geometry(optics)
         cx, cy = optics.view.center_um
-        return g.pattern_centre(tab.x_um - cx, tab.y_um - cy, optics.extras["sensor_shape"],
-                                optics.extras["sensor_pixel_um"])
+        return g.pattern_centre(
+            tab.x_um - cx, tab.y_um - cy, optics.extras["sensor_shape"], optics.extras["sensor_pixel_um"]
+        )
 
     @staticmethod
     def grid(optics) -> tuple[int, int, int, int, int, int]:
@@ -309,13 +368,45 @@ class EbsdRenderer:
         h, w, ox, oy, bx, by = self.grid(optics)
         want = lam is not None
         dummy = self._buffer("dummy", (1, 1, 1))
-        rows = kernels.render(plan.bank, plan.face0, plan.full, plan.offs, plan.scales, plan.matrices, plan.o1,
-                              plan.o2, plan.ph1, plan.ph2, plan.mix, plan.contrast, plan.es, plan.finv, plan.has_f,
-                              plan.dx, plan.dy, plan.pc_lin, plan.s2dT, np.asarray(ks, np.int64), float(ox),
-                              float(oy), float(bx), float(by), int(max(1, g.supersample)), bool(raw), plan.normal,
-                              plan.fwd, float(plan.lobe), float(plan.kappa), float(t_nb), out,
-                              lam if want else dummy, p0 if want else dummy, want)
+        rows = kernels.render(
+            plan.bank,
+            plan.face0,
+            plan.full,
+            plan.offs,
+            plan.scales,
+            plan.matrices,
+            plan.o1,
+            plan.o2,
+            plan.ph1,
+            plan.ph2,
+            plan.mix,
+            plan.contrast,
+            plan.es,
+            plan.finv,
+            plan.has_f,
+            plan.dx,
+            plan.dy,
+            plan.pc_lin,
+            plan.s2dT,
+            np.asarray(ks, np.int64),
+            float(ox),
+            float(oy),
+            float(bx),
+            float(by),
+            int(max(1, g.supersample)),
+            bool(raw),
+            plan.normal,
+            plan.fwd,
+            float(plan.lobe),
+            float(plan.kappa),
+            float(t_nb),
+            out,
+            lam if want else dummy,
+            p0 if want else dummy,
+            want,
+        )
         self.patterns_rendered += len(ks)
+        self.last_rows = rows  # per-row dose of the last call (row totals for a sparse detector path)
         return float(rows.sum())
 
     def _buffer(self, name, shape):
@@ -325,8 +416,21 @@ class EbsdRenderer:
         return b
 
     # ------------------------------------------------------------------ one pattern
-    def pattern(self, optics, matrix, pc, *, material_id: int, matrix2=None, material2: Optional[int] = None,
-                mix: float = 0.0, quality: float = 1.0, raw: bool = False, F=None, out=None) -> np.ndarray:
+    def pattern(
+        self,
+        optics,
+        matrix,
+        pc,
+        *,
+        material_id: int,
+        matrix2=None,
+        material2: Optional[int] = None,
+        mix: float = 0.0,
+        quality: float = 1.0,
+        raw: bool = False,
+        F=None,
+        out=None,
+    ) -> np.ndarray:
         """One pattern on the optics' binned detector grid for a grain with crystal->sample
         ``matrix`` at Bruker pattern centre ``pc`` (and deformation gradient ``F``, sample
         frame). ``raw``: the projected (standardised) master values only. Otherwise electrons
@@ -338,23 +442,42 @@ class EbsdRenderer:
         if two and int(material2) not in ids:
             ids.append(int(material2))
         bank, face0, full, offs, scales, masters = self._bank(ids, optics.ht_kv, g)
-        mats = (np.stack([np.asarray(matrix, np.float64)] + ([np.asarray(matrix2, np.float64)] if two else []))
-                if ids else np.zeros((1, 3, 3)))
+        mats = (
+            np.stack([np.asarray(matrix, np.float64)] + ([np.asarray(matrix2, np.float64)] if two else []))
+            if ids
+            else np.zeros((1, 3, 3))
+        )
         lobe, kappa = self._background(optics, g)
         mid = int(material_id) if material_id else 0
-        es = float(optics.pattern_e_per_s) * (backscatter_yield(material(mid).z_eff, g.sample_tilt_deg)
-                                              if mid else 0.0)
-        plan = EbsdPlan(bank, face0, full, offs, scales,
-                        np.array([0 if ids else -1], np.int32),
-                        np.array([ids.index(int(material2)) if two else -1], np.int32),
-                        np.array([0 if ids else -1], np.int32), np.array([1 if two else -1], np.int32),
-                        np.array([float(mix) if two else 0.0]),
-                        np.array([float(g.band_contrast) * float(quality)]), np.array([es]),
-                        np.linalg.inv(np.asarray(F, np.float64))[None] if F is not None else _NO_F,
-                        F is not None, np.zeros(1), np.zeros(1), mats,
-                        pc_linear(g, optics.extras["sensor_shape"], optics.extras["sensor_pixel_um"], pc),
-                        np.ascontiguousarray(g.sample_to_detector().T), g.surface_normal_d(),
-                        g.forward_direction_d(), lobe, kappa, masters)
+        es = float(optics.pattern_e_per_s) * (
+            backscatter_yield(material(mid).z_eff, g.sample_tilt_deg) if mid else 0.0
+        )
+        plan = EbsdPlan(
+            bank,
+            face0,
+            full,
+            offs,
+            scales,
+            np.array([0 if ids else -1], np.int32),
+            np.array([ids.index(int(material2)) if two else -1], np.int32),
+            np.array([0 if ids else -1], np.int32),
+            np.array([1 if two else -1], np.int32),
+            np.array([float(mix) if two else 0.0], F32),
+            np.array([float(g.band_contrast) * float(quality)], F32),
+            np.array([es], F32),
+            np.linalg.inv(np.asarray(F, np.float64))[None].astype(F32) if F is not None else _NO_F,
+            F is not None,
+            np.zeros(1, F32),
+            np.zeros(1, F32),
+            mats,
+            pc_linear(g, optics.extras["sensor_shape"], optics.extras["sensor_pixel_um"], pc),
+            np.ascontiguousarray(g.sample_to_detector().T),
+            g.surface_normal_d(),
+            g.forward_direction_d(),
+            lobe,
+            kappa,
+            masters,
+        )
         buf = np.empty((1, h, w), np.float32) if out is None else out.reshape(1, h, w)
         self._run(plan, optics, [0], buf, raw=raw)
         return buf[0]
@@ -371,7 +494,7 @@ class EbsdRenderer:
 
     def render_frame(self, specimen, optics, ix: int, iy: int, t_nb: float, field_map=None, grains=None):
         """The pattern at (ix, iy) for a camera frame, into reused buffers: ``(flux, means)``
-        with ``means = (lam, p0, dose, t_nb)`` the detector's Poisson means for an exposure of
+        with ``means = (lam, p0, dose, t_nb, row_totals)`` the detector's Poisson means for an exposure of
         ``t_nb`` (frame time x sensor pixels per grid pixel): what ``Detector.expose(...,
         means=)`` starts from. The buffers are overwritten by the next call."""
         plan = self.plan(specimen, optics, field_map, grains)
@@ -380,7 +503,9 @@ class EbsdRenderer:
         lam = self._buffer("lam", (1, h, w))
         p0 = self._buffer("p0", (1, h, w))
         dose = self._run(plan, optics, [iy * optics.view.shape[1] + ix], out, lam=lam, p0=p0, t_nb=t_nb)
-        return out[0], (lam[0], p0[0], dose, float(t_nb))
+        # row_totals: each row's mean electrons, what a sparse (electron-by-electron) detector path
+        # builds its per-row alias tables from, made in the same pass
+        return out[0], (lam[0], p0[0], dose, float(t_nb), self.last_rows)
 
     def raw_pattern(self, specimen, optics, ix: int, iy: int) -> np.ndarray:
         """The projected master values at scan point (ix, iy) (no background, noiseless)."""
@@ -391,8 +516,18 @@ class EbsdRenderer:
         return out[0]
 
     # ------------------------------------------------------------------ stacks
-    def patterns(self, specimen, optics, field_map=None, grains=None, *, out=None, dtype=np.float32,
-                 per_binned_pixel: bool = True, block: int = 64) -> np.ndarray:
+    def patterns(
+        self,
+        specimen,
+        optics,
+        field_map=None,
+        grains=None,
+        *,
+        out=None,
+        dtype=np.float32,
+        per_binned_pixel: bool = True,
+        block: int = 64,
+    ) -> np.ndarray:
         """Every scan point's pattern: (ny, nx, h, w). ``per_binned_pixel``: electrons per binned
         pixel per second (the 4D-STEM datacube's unit); else per sensor pixel. ``out`` may be a
         preallocated (e.g. memory-mapped) array of that shape. Rendered ``block`` points per
@@ -408,10 +543,10 @@ class EbsdRenderer:
         buf = np.empty((min(block, n), h, w), np.float32)
         for b0 in range(0, n, block):
             ks = np.arange(b0, min(b0 + block, n))
-            self._run(plan, optics, ks, buf[:len(ks)])
+            self._run(plan, optics, ks, buf[: len(ks)])
             if k != 1:
-                buf[:len(ks)] *= k
-            flat[b0:b0 + len(ks)] = buf[:len(ks)]
+                buf[: len(ks)] *= k
+            flat[b0 : b0 + len(ks)] = buf[: len(ks)]
         return out
 
     # ------------------------------------------------------------------ ground truth
@@ -445,10 +580,12 @@ class EbsdRenderer:
             u, s, vt = np.linalg.svd(F)
             R = u @ vt
             U = np.einsum("nji,nj,njk->nik", vt, s, vt)
-            extra = {"deformation_gradient": F.reshape(ny, nx, 3, 3),
-                     "strain": (U - np.eye(3)).reshape(ny, nx, 3, 3),
-                     "rotation": _R.from_matrix(R).as_rotvec().reshape(ny, nx, 3),
-                     "gnd": tab.gnd.copy() if tab.gnd is not None else np.zeros((ny, nx), np.float32)}
+            extra = {
+                "deformation_gradient": F.reshape(ny, nx, 3, 3),
+                "strain": (U - np.eye(3)).reshape(ny, nx, 3, 3),
+                "rotation": _R.from_matrix(R).as_rotvec().reshape(ny, nx, 3),
+                "gnd": tab.gnd.copy() if tab.gnd is not None else np.zeros((ny, nx), np.float32),
+            }
             if ok.any():
                 okf = ok.ravel()
                 local = np.einsum("nij,njk->nik", R[okf], tab.matrices[tab.orient.ravel()[okf]])

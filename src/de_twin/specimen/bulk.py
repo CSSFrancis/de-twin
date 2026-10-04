@@ -73,6 +73,9 @@ class BulkSurfaceConfig:
     #: the quality lost on the boundary.
     boundary_zone_um: float = 0.2
     boundary_zone_depth: float = 0.5
+    #: Indents (:class:`~de_twin.specimen.indent.Indent`): residual strain, lattice rotation,
+    #: plastic zone and cracks around each (the EBSD renderer distorts the patterns with them).
+    indents: tuple = ()
 
     def copy(self) -> "BulkSurfaceConfig":
         return copy.deepcopy(self)
@@ -98,12 +101,18 @@ class BulkSurface:
                 raise ValueError(f"phase material {p.material} is not crystalline")
         self._cum = np.cumsum(fr / fr.sum())
         self._mats = np.array([int(p.material) for p in c.phases], np.uint8)
-        self._lattice = JitteredLattice(max(float(c.grain_size_um), 1e-3),
-                                        hash_seed(c.seed, SeedKind.STRUCTURE, 0),
-                                        0, jitter_frac=min(max(float(c.grain_jitter), 0.0), 0.49))
+        self._lattice = JitteredLattice(
+            max(float(c.grain_size_um), 1e-3),
+            hash_seed(c.seed, SeedKind.STRUCTURE, 0),
+            0,
+            jitter_frac=min(max(float(c.grain_jitter), 0.0), 0.49),
+        )
         self._orient: "OrderedDict[int, np.ndarray]" = OrderedDict()
         self._lock = threading.Lock()
         self._scratches = self._make_scratches()
+        from .indent import IndentField
+
+        self._indents = [IndentField(i) for i in self.config.indents]
         self._time_s = 0.0
 
     # ------------------------------------------------------------------ specimen duck type
@@ -170,8 +179,12 @@ class BulkSurface:
             h1 = np.full(n, np.uint64(hash_seed(c.seed, SeedKind.GRAIN, 0)))
             out = {"hash": h1, "phase": np.zeros(n, np.int64)}
             if blend:
-                out.update(hash2=h1.copy(), phase2=out["phase"].copy(), boundary_um=np.full(n, np.inf),
-                           normal=np.zeros((n, 2)))
+                out.update(
+                    hash2=h1.copy(),
+                    phase2=out["phase"].copy(),
+                    boundary_um=np.full(n, np.inf),
+                    normal=np.zeros((n, 2)),
+                )
         else:
             out = self._voronoi(x, y, blend)
         for suffix in ("", "2") if blend else ("",):
@@ -183,7 +196,17 @@ class BulkSurface:
             c = self.config
             if not c.single_crystal and c.boundary_zone_um > 0 and c.boundary_zone_depth > 0:
                 d = np.asarray(out["boundary_um"], np.float64) / float(c.boundary_zone_um)
-                q = q * (1.0 - min(float(c.boundary_zone_depth), 0.95) * np.exp(-0.5 * d * d)).astype(np.float32)
+                q = q * (1.0 - min(float(c.boundary_zone_depth), 0.95) * np.exp(-0.5 * d * d)).astype(
+                    np.float32
+                )
+            if self._indents:
+                F = np.tile(np.eye(3), (x.size, 1, 1))
+                gnd = np.zeros(x.size)
+                for f in self._indents:
+                    F += f.deformation_gradient(x, y) - np.eye(3)  # superposed (small) displacement gradients
+                    gnd += f.gnd(x, y)
+                    q = q * f.quality(x, y).astype(np.float32)
+                out["F"], out["gnd"] = F, gnd
             out["quality"] = q
         return out
 
@@ -218,8 +241,12 @@ class BulkSurface:
             sep = s2 - s1
             dist = np.linalg.norm(sep, axis=1)
             nrm = sep / np.maximum(dist, 1e-12)[:, None]
-            out.update(hash2=h2, phase2=self._phase_of(h2), normal=nrm,
-                       boundary_um=np.maximum((d2 - d1) / (2.0 * np.maximum(dist, 1e-12)), 0.0))
+            out.update(
+                hash2=h2,
+                phase2=self._phase_of(h2),
+                normal=nrm,
+                boundary_um=np.maximum((d2 - d1) / (2.0 * np.maximum(dist, 1e-12)), 0.0),
+            )
         return out
 
     def orientations(self, hashes, phases) -> np.ndarray:
@@ -281,23 +308,63 @@ GAMMA_FIBRE = Texture("fibre", (1, 1, 1), 10.0)
 
 _BULK = {
     "EBSD Ni polycrystal": BulkSurfaceConfig(
-        name="EBSD Ni polycrystal", phases=(_p(MaterialId.NICKEL),), grain_size_um=8.0, surface_damage=0.05),
+        name="EBSD Ni polycrystal", phases=(_p(MaterialId.NICKEL),), grain_size_um=8.0, surface_damage=0.05
+    ),
     "EBSD Al cube texture": BulkSurfaceConfig(
-        name="EBSD Al cube texture", seed=7, phases=(_p(MaterialId.ALUMINUM, 1.0, CUBE),), grain_size_um=20.0,
-        surface_damage=0.1, scratch_density_per_mm=3.0),
+        name="EBSD Al cube texture",
+        seed=7,
+        phases=(_p(MaterialId.ALUMINUM, 1.0, CUBE),),
+        grain_size_um=20.0,
+        surface_damage=0.1,
+        scratch_density_per_mm=3.0,
+    ),
     "EBSD ferrite gamma fibre": BulkSurfaceConfig(
-        name="EBSD ferrite gamma fibre", seed=11, phases=(_p(MaterialId.IRON, 1.0, GAMMA_FIBRE),),
+        name="EBSD ferrite gamma fibre",
+        seed=11,
+        phases=(_p(MaterialId.IRON, 1.0, GAMMA_FIBRE),),
         grain_size_um=10.0,
-        surface_damage=0.1),
+        surface_damage=0.1,
+    ),
     "EBSD duplex steel": BulkSurfaceConfig(
-        name="EBSD duplex steel", seed=23, phases=(_p(MaterialId.IRON, 0.55), _p(MaterialId.AUSTENITE, 0.45)),
-        grain_size_um=6.0, surface_damage=0.15, scratch_density_per_mm=2.0, scratch_width_um=0.6),
+        name="EBSD duplex steel",
+        seed=23,
+        phases=(_p(MaterialId.IRON, 0.55), _p(MaterialId.AUSTENITE, 0.45)),
+        grain_size_um=6.0,
+        surface_damage=0.15,
+        scratch_density_per_mm=2.0,
+        scratch_width_um=0.6,
+    ),
     "EBSD Si (001) wafer": BulkSurfaceConfig(
-        name="EBSD Si (001) wafer", seed=0,
-        phases=(_p(MaterialId.SILICON, 1.0, Texture("oriented", (0, 0, 1), 0.0,
-                                                                                  (1, 1, 0), 0.0)),),
-        single_crystal=True, surface_damage=0.0),
+        name="EBSD Si (001) wafer",
+        seed=0,
+        phases=(_p(MaterialId.SILICON, 1.0, Texture("oriented", (0, 0, 1), 0.0, (1, 1, 0), 0.0)),),
+        single_crystal=True,
+        surface_damage=0.0,
+    ),
 }
+_INDENT_SI = dict(
+    phases=(_p(MaterialId.SILICON, 1.0, Texture("oriented", (0, 0, 1), 0.0, (1, 1, 0), 0.0)),),
+    single_crystal=True,
+    surface_damage=0.0,
+    seed=0,
+)
+
+
+def _indent(kind, **kw):
+    from .indent import Indent
+
+    return Indent(kind=kind, **kw)
+
+
+_BULK["EBSD Si (001) Vickers indent"] = BulkSurfaceConfig(
+    name="EBSD Si (001) Vickers indent", indents=(_indent("vickers", size_um=5.0),), **_INDENT_SI
+)
+_BULK["EBSD Si (001) Berkovich indent"] = BulkSurfaceConfig(
+    name="EBSD Si (001) Berkovich indent",
+    indents=(_indent("berkovich", size_um=6.0, rotation_deg=-90.0),),
+    **_INDENT_SI,
+)
+
 #: Bulk EBSD specimens by name (``DigitalTwin(specimen=<name>)`` builds a :class:`BulkSurface`).
 BULK_PRESETS: dict[str, BulkSurfaceConfig] = _BULK
 

@@ -26,8 +26,13 @@ def _twin(specimen="EBSD Si (001) wafer", camera="Celeritas", **geom):
 
 
 def _scan(tw, nx=1, ny=1, step=1.0, binning=4, dwell=1e-3, **kw):
-    return tw.request(hw_binning=(binning, binning), frame_time_s=dwell, total_frames=nx * ny,
-                      scan=ScanRequest(enabled=True, size=(nx, ny), step_um=step, dwell_s=dwell), **kw)
+    return tw.request(
+        hw_binning=(binning, binning),
+        frame_time_s=dwell,
+        total_frames=nx * ny,
+        scan=ScanRequest(enabled=True, size=(nx, ny), step_um=step, dwell_s=dwell),
+        **kw,
+    )
 
 
 def _raw(tw, req, ix=0, iy=0, matrix=None, material=None, master=None):
@@ -51,7 +56,7 @@ def _zone_centre(img, c, r, half=16):
     from scipy import ndimage
 
     r0, c0 = int(round(r)) - half, int(round(c)) - half
-    win = img[r0:r0 + 2 * half + 1, c0:c0 + 2 * half + 1].astype(np.float64)
+    win = img[r0 : r0 + 2 * half + 1, c0 : c0 + 2 * half + 1].astype(np.float64)
     lab, _ = ndimage.label(win > 0.5 * (np.median(win) + win.max()))
     k = lab[np.unravel_index(np.argmax(win), win.shape)]
     rr, cc = np.nonzero(lab == k)
@@ -97,8 +102,10 @@ def test_known_zone_axes_at_predicted_positions():
     H, W = optics.extras["sensor_shape"]
     x0, y0, dd = pc_pixels(pc, (H, W))
     g = tw.ebsd
-    cases = {(0, 0, -1): (x0, y0 - dd * math.tan(math.radians(20.0))),
-             (0, -1, -1): (x0, y0 + dd * math.tan(math.radians(25.0)))}
+    cases = {
+        (0, 0, -1): (x0, y0 - dd * math.tan(math.radians(20.0))),
+        (0, -1, -1): (x0, y0 + dd * math.tan(math.radians(25.0))),
+    }
     for uvw, (ex, ey) in cases.items():
         pos = detector_position(g, np.eye(3), uvw, pc, (H, W))
         assert pos == pytest.approx((ex, ey), abs=1e-6)
@@ -124,16 +131,23 @@ def test_band_width_and_position():
     """A single (200) band of Ni, identity orientation: the plane normal [100] is x_d, so the band
     is the vertical strip |x - x_pc| < DD tan(theta_B) along the pattern-centre row. A (111)
     band of a rotated grain covers exactly |r . n| < sin(theta_B)."""
-    tw = _twin("EBSD Ni polycrystal", master_resolution_deg=0.05, energy_spread_frac=0.02,
-               angular_blur_deg=0.02)
+    tw = _twin(
+        "EBSD Ni polycrystal", master_resolution_deg=0.05, energy_spread_frac=0.02, angular_blur_deg=0.02
+    )
     g = tw.ebsd
     req = _scan(tw, binning=1, hw_roi=Roi(312, 280, 400, 64))
     optics = tw.optics(req)
     r = tw.renderer.ebsd
     lam = optics.wavelength_nm
     for hkl in [(2, 0, 0)]:
-        mp = build_master(MaterialId.NICKEL, KV, energy_spread_frac=0.02, angular_blur_deg=0.02,
-                          resolution_deg=0.05, hkl_subset=[hkl])
+        mp = build_master(
+            MaterialId.NICKEL,
+            KV,
+            energy_spread_frac=0.02,
+            angular_blur_deg=0.02,
+            resolution_deg=0.05,
+            hkl_subset=[hkl],
+        )
         MASTERS._d[(int(MaterialId.NICKEL), round(KV, 2), 0.02, 0.02, 0.05)] = mp
         pc = g.pattern_centre()
         img = r.pattern(optics, np.eye(3), pc, material_id=MaterialId.NICKEL, raw=True)
@@ -156,8 +170,14 @@ def test_band_width_and_position():
         assert 0.5 * (above.max() + above.min()) == pytest.approx(x0, abs=1.0)
     MASTERS.clear()
     # (111) of a general orientation
-    mp = build_master(MaterialId.NICKEL, KV, energy_spread_frac=0.02, angular_blur_deg=0.02,
-                      resolution_deg=0.05, hkl_subset=[(1, 1, 1)])
+    mp = build_master(
+        MaterialId.NICKEL,
+        KV,
+        energy_spread_frac=0.02,
+        angular_blur_deg=0.02,
+        resolution_deg=0.05,
+        hkl_subset=[(1, 1, 1)],
+    )
     MASTERS._d[(int(MaterialId.NICKEL), round(KV, 2), 0.02, 0.02, 0.05)] = mp
     req = _scan(tw, binning=2)
     optics = tw.optics(req)
@@ -172,7 +192,7 @@ def test_band_width_and_position():
     img = r.pattern(optics, G, pc, material_id=MaterialId.NICKEL, raw=True)
     H, W = optics.extras["sensor_shape"]
     x0, y0, dd = pc_pixels(pc, (H, W))
-    ys, xs = np.mgrid[0:img.shape[0], 0:img.shape[1]]
+    ys, xs = np.mgrid[0 : img.shape[0], 0 : img.shape[1]]
     X, Y = (xs + 0.5) * 2 - x0, (ys + 0.5) * 2 - y0
     rd = np.stack([X, Y, np.full_like(X, dd)], -1)
     rd /= np.linalg.norm(rd, axis=-1, keepdims=True)
@@ -196,8 +216,9 @@ def test_pattern_centre_follows_the_beam():
     pc = g.pattern_centre(30.0, 0.0, (H, W), p)
     assert pc == pytest.approx((g.pcx + 30 / (W * p), g.pcy, g.pcz))
     pc = g.pattern_centre(0.0, 30.0, (H, W), p)
-    assert pc == pytest.approx((g.pcx, g.pcy - math.sin(d) * 30 / (H * p),
-                                g.pcz + math.cos(d) * 30 / (H * p)))
+    assert pc == pytest.approx(
+        (g.pcx, g.pcy - math.sin(d) * 30 / (H * p), g.pcz + math.cos(d) * 30 / (H * p))
+    )
     # a larger working distance: the sample (source) lower, so the pattern centre moves down
     g2 = g.replace(working_distance_mm=g.calibration_wd_mm + 0.5)
     pc = g2.pattern_centre(0, 0, (H, W), p)
@@ -246,8 +267,13 @@ def test_ground_truth_round_trips():
         if gt["mix"][iy, ix] > 0:
             continue
         G = crystal_to_lab(gt["quaternion"][iy, ix])[0]
-        p = r.pattern(optics, G, gt["pattern_centre"][iy, ix], material_id=int(gt["material_id"][iy, ix]),
-                      quality=float(gt["quality"][iy, ix]))
+        p = r.pattern(
+            optics,
+            G,
+            gt["pattern_centre"][iy, ix],
+            material_id=int(gt["material_id"][iy, ix]),
+            quality=float(gt["quality"][iy, ix]),
+        )
         assert np.allclose(p, tw.flux(req, iy * 12 + ix), rtol=1e-5)
     cm = tw.ground_truth(req)
     assert cm.scan_unit == "um" and set(cm.prop) >= {"grain_id", "band_contrast", "pcx", "pcy", "pcz"}
@@ -271,10 +297,20 @@ def test_boundaries_mix_patterns_and_lower_band_contrast():
     tab = r.tables(tw.specimen, optics)
     w = float(tab.mix[0, i])
     p = r.raw_pattern(tw.specimen, optics, i, 0)
-    a = r.pattern(optics, tab.matrices[tab.orient[0, i]], gt["pattern_centre"][0, i],
-                  material_id=MaterialId.NICKEL, raw=True)
-    b = r.pattern(optics, tab.matrices[tab.orient2[0, i]], gt["pattern_centre"][0, i],
-                  material_id=MaterialId.NICKEL, raw=True)
+    a = r.pattern(
+        optics,
+        tab.matrices[tab.orient[0, i]],
+        gt["pattern_centre"][0, i],
+        material_id=MaterialId.NICKEL,
+        raw=True,
+    )
+    b = r.pattern(
+        optics,
+        tab.matrices[tab.orient2[0, i]],
+        gt["pattern_centre"][0, i],
+        material_id=MaterialId.NICKEL,
+        raw=True,
+    )
     assert np.allclose(p, (1 - w) * a + w * b, atol=1e-4)
 
 
@@ -326,8 +362,7 @@ def test_bulk_specimens():
     o = fe.sample(*rng.uniform(-300, 300, (2, 400)))
     Gs = fe.orientations(o["hash"], o["phase"])
     family = np.array([[1, 1, 1], [1, 1, -1], [1, -1, 1], [-1, 1, 1]])
-    best = np.max(np.abs(np.einsum("nij,kj->nik", Gs, family
-                                   / math.sqrt(3))[:, 2, :]), axis=1)
+    best = np.max(np.abs(np.einsum("nij,kj->nik", Gs, family / math.sqrt(3))[:, 2, :]), axis=1)
     assert np.median(np.degrees(np.arccos(np.clip(best, -1, 1)))) < 15
     # scratches lower the quality along lines
     al = BulkSurface(BULK_PRESETS["EBSD Al cube texture"])
@@ -387,7 +422,7 @@ def test_pattern_centre_conventions():
 def test_dictionary_indexing_recovers_orientations():
     """Noisy frames of a Ni polycrystal (~45 e- per binned pixel, integrating Celeritas)
     indexed with a 4-degree dictionary and a refinement: within 1.5 deg of the truth (in practice
-    ~0.05 deg median; ~0.1 deg at 3 e-, and it breaks down near 1 e- per binned pixel)."""
+    ~0.06 deg median at ~45 e-, ~0.15 deg at ~10 e-; the band contrast is calibrated to raw patterns)."""
     from orix.quaternion.symmetry import Oh
     from orix.sampling import get_sample_fundamental
     from reconstruction.ebsd_index import dictionary_index, flatten, misorientation_deg, normalise, refine
@@ -419,6 +454,7 @@ def test_dictionary_indexing_recovers_orientations():
                 h, w = p.shape
                 p = p.reshape(h // factor, factor, w // factor, factor).mean(axis=(1, 3))
             return normalise(p)
+
         return f
 
     rots = get_sample_fundamental(4.0, point_group=Oh)

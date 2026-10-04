@@ -126,3 +126,6 @@ EBSD
    ebsd.MasterPattern
    ebsd.build_master
    ebsd.convert_pc
+   ebsd.load_master_pattern
+   ebsd.write_emsoft
+   specimen.indent.Indent

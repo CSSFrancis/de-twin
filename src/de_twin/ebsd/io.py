@@ -64,8 +64,9 @@ def _reduce_energy(get_slice, energies, weights, energy_kv):
         x = float(np.clip(energy_kv, es[0], es[-1]))
         k = int(np.clip(np.searchsorted(es, x) - 1, 0, ne - 2))
         t = (x - es[k]) / (es[k + 1] - es[k]) if es[k + 1] > es[k] else 0.0
-        return ((1 - t) * np.asarray(get_slice(int(order[k])), np.float64)
-                + t * np.asarray(get_slice(int(order[k + 1])), np.float64))
+        return (1 - t) * np.asarray(get_slice(int(order[k])), np.float64) + t * np.asarray(
+            get_slice(int(order[k + 1])), np.float64
+        )
     if weights is not None and np.sum(weights) > 0:
         w = np.asarray(weights, np.float64) / np.sum(weights)
         acc = None
@@ -115,13 +116,22 @@ def read_emsoft(path, energy_kv=None) -> dict:
 
             out[key] = _reduce_energy(get, en, w, energy_kv)
         cd = f.get("CrystalData")
-        out["space_group"] = int(np.asarray(cd["SpaceGroupNumber"][()]).ravel()[0]) if cd is not None \
-            and "SpaceGroupNumber" in cd else None
-        out["lattice"] = tuple(float(v) for v in np.asarray(cd["LatticeParameters"][()]).ravel()) \
-            if cd is not None and "LatticeParameters" in cd else None
+        out["space_group"] = (
+            int(np.asarray(cd["SpaceGroupNumber"][()]).ravel()[0])
+            if cd is not None and "SpaceGroupNumber" in cd
+            else None
+        )
+        out["lattice"] = (
+            tuple(float(v) for v in np.asarray(cd["LatticeParameters"][()]).ravel())
+            if cd is not None and "LatticeParameters" in cd
+            else None
+        )
         out["energies"] = energies
-        out["kv"] = float(energy_kv) if energy_kv is not None else (float(energies.max()) if energies is not None
-                                                                     else None)
+        out["kv"] = (
+            float(energy_kv)
+            if energy_kv is not None
+            else (float(energies.max()) if energies is not None else None)
+        )
     return out
 
 
@@ -161,6 +171,7 @@ def read_kikuchipy(path, energy_kv=None) -> dict:
         out = {"projection": found.get("projection", "lambert").lower()}
         hemi_name = found.get("hemisphere", "both" if hemis == 2 else "upper").lower()
         for h in range(hemis):
+
             def get(i, h=h):
                 idx = [slice(None)] * d.ndim
                 if hemi_ax is not None:
@@ -175,8 +186,11 @@ def read_kikuchipy(path, energy_kv=None) -> dict:
         out.setdefault("north", None)
         out.setdefault("south", None)
         out["energies"] = energies
-        out["kv"] = float(energy_kv) if energy_kv is not None else (float(np.max(energies)) if energies is not None
-                                                                     else None)
+        out["kv"] = (
+            float(energy_kv)
+            if energy_kv is not None
+            else (float(np.max(energies)) if energies is not None else None)
+        )
         out["space_group"], out["lattice"] = None, None
     return out
 
@@ -191,17 +205,22 @@ def read_master_file(path, energy_kv=None) -> dict:
         return read_emsoft(path, energy_kv)
     if kikuchipy:
         return read_kikuchipy(path, energy_kv)
-    raise ValueError(f"{path}: neither an EMsoft master pattern (EMData/EBSDmaster) nor a kikuchipy/HyperSpy "
-                     "file (Experiments/...)")
+    raise ValueError(
+        f"{path}: neither an EMsoft master pattern (EMData/EBSDmaster) nor a kikuchipy/HyperSpy "
+        "file (Experiments/...)"
+    )
 
 
-def from_array(array, *, projection="lambert", hemisphere=None, energies=None, energy_kv=None,
-               weights=None) -> dict:
+def from_array(
+    array, *, projection="lambert", hemisphere=None, energies=None, energy_kv=None, weights=None
+) -> dict:
     """A NumPy master: (n, n) one hemisphere; (2, n, n) north and south; (nE, n, n) with
     ``energies``; (2, nE, n, n). ``hemisphere``: "north"/"upper", "south"/"lower" or "both"."""
     a = np.asarray(array, np.float64)
-    hemi = (hemisphere or ("both" if (a.ndim == 4 or (a.ndim == 3 and energies is None and a.shape[0] == 2))
-                           else "north")).lower()
+    hemi = (
+        hemisphere
+        or ("both" if (a.ndim == 4 or (a.ndim == 3 and energies is None and a.shape[0] == 2)) else "north")
+    ).lower()
     if a.ndim == 2:
         a = a[None, None]
     elif a.ndim == 3:
@@ -217,10 +236,17 @@ def from_array(array, *, projection="lambert", hemisphere=None, energies=None, e
         north, south = None, reduced[0]
     else:
         north, south = reduced[0], (reduced[1] if len(reduced) > 1 else None)
-    return {"north": north, "south": south, "projection": str(projection).lower(), "energies": energies,
-            "kv": float(energy_kv) if energy_kv is not None else (float(np.max(energies)) if energies is not None
-                                                                   else None),
-            "space_group": None, "lattice": None}
+    return {
+        "north": north,
+        "south": south,
+        "projection": str(projection).lower(),
+        "energies": energies,
+        "kv": float(energy_kv)
+        if energy_kv is not None
+        else (float(np.max(energies)) if energies is not None else None),
+        "space_group": None,
+        "lattice": None,
+    }
 
 
 # ---------------------------------------------------------------------- resampling
@@ -229,7 +255,9 @@ def _stereo_to_lambert(st, n, south: bool) -> np.ndarray:
     z = np.abs(dirs[..., 2])
     X, Y = dirs[..., 0] / (1.0 + z), dirs[..., 1] / (1.0 + z)
     m = st.shape[0]
-    return ndimage.map_coordinates(st, [(Y + 1) * (m - 1) / 2, (X + 1) * (m - 1) / 2], order=1, mode="nearest")
+    return ndimage.map_coordinates(
+        st, [(Y + 1) * (m - 1) / 2, (X + 1) * (m - 1) / 2], order=1, mode="nearest"
+    )
 
 
 def _resample_lambert(a, n) -> np.ndarray:
@@ -264,9 +292,17 @@ def symmetry_error(north, south, point_group, n_dirs: int = 4000, seed: int = 0)
     return float(np.sqrt(np.mean(np.square(diffs))) / sd)
 
 
-def master_from_hemispheres(raw: dict, material: int, kv: float, resolution_deg: float, *,
-                            centrosymmetric: Optional[bool] = None, point_group=None, source: str = "array",
-                            validate: bool = True) -> MasterPattern:
+def master_from_hemispheres(
+    raw: dict,
+    material: int,
+    kv: float,
+    resolution_deg: float,
+    *,
+    centrosymmetric: Optional[bool] = None,
+    point_group=None,
+    source: str = "array",
+    validate: bool = True,
+) -> MasterPattern:
     """A cached-format :class:`MasterPattern` from float hemispheres (see the module docstring)."""
     north, south = raw.get("north"), raw.get("south")
     if north is None and south is None:
@@ -296,7 +332,9 @@ def master_from_hemispheres(raw: dict, material: int, kv: float, resolution_deg:
     elif centrosymmetric is False:
         raise ValueError("a non-centrosymmetric master needs its southern hemisphere")
     elif point_group is not None and not getattr(point_group, "contains_inversion", True):
-        warnings.warn("one hemisphere of a non-centrosymmetric phase: assuming Friedel symmetry", stacklevel=3)
+        warnings.warn(
+            "one hemisphere of a non-centrosymmetric phase: assuming Friedel symmetry", stacklevel=3
+        )
     both = [north] if south is None else [north, south]
     mu = float(np.mean(both))
     sd = float(np.std(both)) or 1.0
@@ -304,31 +342,54 @@ def master_from_hemispheres(raw: dict, material: int, kv: float, resolution_deg:
     south = None if south is None else (south - mu) / sd
     err = symmetry_error(north, south, point_group) if validate else float("nan")
     if validate and err > SYMMETRY_REFUSE:
-        raise ValueError(f"master pattern is not invariant under the phase's point group (symmetry error "
-                         f"{err:.2f}): wrong phase, or a transposed / mirrored projection?")
+        raise ValueError(
+            f"master pattern is not invariant under the phase's point group (symmetry error "
+            f"{err:.2f}): wrong phase, or a transposed / mirrored projection?"
+        )
     if validate and err > SYMMETRY_WARN:
         warnings.warn(f"master pattern symmetry error {err:.2f}", stacklevel=3)
     nf = cube_side(resolution_deg)
     faces = 3 if south is None else 6
-    cube = lambert_sample(north, south, kernels.cube_directions(nf, faces).reshape(-1, 3)).reshape(faces, nf, nf)
+    cube = lambert_sample(north, south, kernels.cube_directions(nf, faces).reshape(-1, 3)).reshape(
+        faces, nf, nf
+    )
     arrays = [north, cube] + ([south] if south is not None else [])
     lo, scale, codes = quantise(*arrays)
-    mp = MasterPattern(int(material), float(kv), codes[0], lo, scale, 0, 0.0, float(resolution_deg),
-                       south=codes[2] if south is not None else None, source=source, cube=codes[1])
+    mp = MasterPattern(
+        int(material),
+        float(kv),
+        codes[0],
+        lo,
+        scale,
+        0,
+        0.0,
+        float(resolution_deg),
+        south=codes[2] if south is not None else None,
+        source=source,
+        cube=codes[1],
+    )
     mp.symmetry_error = err
     return mp
 
 
 # ---------------------------------------------------------------------- writer
-def write_emsoft(path, north, south=None, energies=(20.0,), *, space_group: int = 225, lattice=(0.4, 0.4, 0.4,
-                 90.0, 90.0, 90.0), weights=None) -> None:
+def write_emsoft(
+    path,
+    north,
+    south=None,
+    energies=(20.0,),
+    *,
+    space_group: int = 225,
+    lattice=(0.4, 0.4, 0.4, 90.0, 90.0, 90.0),
+    weights=None,
+) -> None:
     """Write master hemispheres (n, n) or (nE, n, n) in EMsoft's EMEBSDmaster layout (mLPNH /
     mLPSH as (1, nE, n, n) float32, EkeVs, CrystalData; ``weights``: an energy histogram as
     ``EMData/MCOpenCL/accum_e``). ``south`` None: the inversion of the north."""
     h5py = _h5py()
     nh = np.asarray(north, np.float32)
     nh = nh[None] if nh.ndim == 2 else nh
-    sh = (nh[:, ::-1, ::-1] if south is None else np.asarray(south, np.float32))
+    sh = nh[:, ::-1, ::-1] if south is None else np.asarray(south, np.float32)
     sh = sh[None] if sh.ndim == 2 else sh
     with h5py.File(path, "w") as f:
         g = f.create_group("EMData/EBSDmaster")
@@ -345,10 +406,21 @@ def write_emsoft(path, north, south=None, energies=(20.0,), *, space_group: int 
 
 
 # ---------------------------------------------------------------------- one call
-def load_master_pattern(source, material: int, *, resolution_deg: float = 0.15, energy_kv=None,
-                        kv: Optional[float] = None, projection=None, hemisphere=None, energies=None,
-                        weights=None, centrosymmetric: Optional[bool] = None, validate: bool = True,
-                        point_group=None) -> MasterPattern:
+def load_master_pattern(
+    source,
+    material: int,
+    *,
+    resolution_deg: float = 0.15,
+    energy_kv=None,
+    kv: Optional[float] = None,
+    projection=None,
+    hemisphere=None,
+    energies=None,
+    weights=None,
+    centrosymmetric: Optional[bool] = None,
+    validate: bool = True,
+    point_group=None,
+) -> MasterPattern:
     """A user :class:`MasterPattern` for ``material`` from a file path (EMsoft / kikuchipy HDF5)
     or a NumPy array (with ``projection``, ``hemisphere``, ``energies``). ``kv``: the beam energy
     it is for (default: the selected energy, else the file's highest)."""
@@ -359,8 +431,14 @@ def load_master_pattern(source, material: int, *, resolution_deg: float = 0.15, 
         raw = read_master_file(str(source), energy_kv)
         src = str(source)
     else:
-        raw = from_array(source, projection=projection or "lambert", hemisphere=hemisphere, energies=energies,
-                         energy_kv=energy_kv, weights=weights)
+        raw = from_array(
+            source,
+            projection=projection or "lambert",
+            hemisphere=hemisphere,
+            energies=energies,
+            energy_kv=energy_kv,
+            weights=weights,
+        )
         src = "array"
     if projection is not None and isinstance(source, (str, Path)):
         raw["projection"] = projection
@@ -371,20 +449,42 @@ def load_master_pattern(source, material: int, *, resolution_deg: float = 0.15, 
     if phase is None:
         raise ValueError(f"material {material} is not crystalline")
     crystal = material_by_id(int(material)).crystal
-    if raw.get("space_group") and crystal is not None and crystal.space_group and \
-            int(raw["space_group"]) != int(crystal.space_group):
-        raise ValueError(f"the file's space group {raw['space_group']} is not material {material}'s "
-                         f"({crystal.space_group})")
+    if (
+        raw.get("space_group")
+        and crystal is not None
+        and crystal.space_group
+        and int(raw["space_group"]) != int(crystal.space_group)
+    ):
+        raise ValueError(
+            f"the file's space group {raw['space_group']} is not material {material}'s "
+            f"({crystal.space_group})"
+        )
     if raw.get("lattice") and crystal is not None and crystal.lattice:
         a_file, a_mat = float(raw["lattice"][0]), float(crystal.lattice[0])
         if a_file > 0 and abs(a_file - a_mat) / a_mat > 0.03:
-            warnings.warn(f"the file's lattice a = {a_file:g} nm differs from the material's {a_mat:g} nm",
-                          stacklevel=2)
+            warnings.warn(
+                f"the file's lattice a = {a_file:g} nm differs from the material's {a_mat:g} nm", stacklevel=2
+            )
     pg = point_group if point_group is not None else phase.point_group
-    return master_from_hemispheres(raw, int(material), float(beam), resolution_deg,
-                                   centrosymmetric=centrosymmetric, point_group=pg, source=src, validate=validate)
+    return master_from_hemispheres(
+        raw,
+        int(material),
+        float(beam),
+        resolution_deg,
+        centrosymmetric=centrosymmetric,
+        point_group=pg,
+        source=src,
+        validate=validate,
+    )
 
 
-__all__ = ["load_master_pattern", "master_from_hemispheres", "read_emsoft", "read_kikuchipy", "read_master_file",
-           "from_array", "symmetry_error", "write_emsoft"]
-
+__all__ = [
+    "load_master_pattern",
+    "master_from_hemispheres",
+    "read_emsoft",
+    "read_kikuchipy",
+    "read_master_file",
+    "from_array",
+    "symmetry_error",
+    "write_emsoft",
+]

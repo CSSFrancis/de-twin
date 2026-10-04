@@ -3,7 +3,6 @@ kinematic master, hemispheres, energy selection and validation."""
 
 from __future__ import annotations
 
-
 import numpy as np
 import pytest
 
@@ -21,8 +20,12 @@ NI_LATTICE = (0.3524, 0.3524, 0.3524, 90.0, 90.0, 90.0)
 def _twin():
     tw = DigitalTwin("EBSD Ni polycrystal", camera="Celeritas")
     tw.configure_ebsd(beam_kv=KV)
-    req = tw.request(hw_binning=(4, 4), frame_time_s=1e-3, total_frames=1,
-                     scan=ScanRequest(enabled=True, size=(3, 2), step_um=4.0, dwell_s=1e-3))
+    req = tw.request(
+        hw_binning=(4, 4),
+        frame_time_s=1e-3,
+        total_frames=1,
+        scan=ScanRequest(enabled=True, size=(3, 2), step_um=4.0, dwell_s=1e-3),
+    )
     return tw, req
 
 
@@ -101,7 +104,7 @@ def test_southern_hemisphere_is_read_where_emsoft_puts_it():
     c = rd @ (g.sample_to_detector() @ G)  # crystal directions: G^T S2D^T r
     want = mp.value(c)
     r0, c0 = int(pc[1] * H / 4), int(pc[0] * W / 4)  # the pattern centre on the 4x-binned grid
-    centre = img[r0 - 4:r0 + 4, c0 - 4:c0 + 4]
+    centre = img[r0 - 4 : r0 + 4, c0 - 4 : c0 + 4]
     assert centre.mean() > img.mean() + 2.0  # the spot is there
     assert np.abs(img - want).max() < 0.1 * (want.max() - want.min())
     # and the centrosymmetric fold would not have it
@@ -137,8 +140,12 @@ def test_kikuchipy_layout(tmp_path):
     path = tmp_path / "ni_mp.hspy"
     with h5py.File(path, "w") as f:
         e = f.create_group("Experiments/ni_mp")
-        e["data"] = np.stack([north, north[::-1, ::-1]])[:, None].astype(np.float32)  # (hemisphere, energy, y, x)
-        for i, (name, off) in enumerate((("hemisphere", 0.0), ("energy", KV), ("height", 0.0), ("width", 0.0))):
+        e["data"] = np.stack([north, north[::-1, ::-1]])[:, None].astype(
+            np.float32
+        )  # (hemisphere, energy, y, x)
+        for i, (name, off) in enumerate(
+            (("hemisphere", 0.0), ("energy", KV), ("height", 0.0), ("width", 0.0))
+        ):
             ax = e.create_group(f"axis-{i}")
             ax.attrs["name"], ax.attrs["offset"], ax.attrs["scale"] = name, off, 1.0
         md = e.create_group("metadata/Simulation/EBSD_master_pattern")
@@ -155,7 +162,7 @@ def test_stereographic_array():
     m = 801
     c = np.linspace(-1, 1, m)
     X, Y = np.meshgrid(c, c)
-    r2 = X ** 2 + Y ** 2
+    r2 = X**2 + Y**2
     d = np.stack([2 * X, 2 * Y, 1 - r2], -1) / (1 + r2)[..., None]  # inverse stereographic, z >= 0
     st = lambert_sample(north, None, d)
     tw.set_master_pattern("Nickel", st, projection="stereographic", kv=KV)
@@ -200,5 +207,3 @@ def test_deapi_master_pattern_file(tmp_path):
     assert status.startswith("Nickel") and "20 kV" in status
     assert bad.startswith("error")
     assert tw.master_patterns()[0]["source"] == str(path)
-
-

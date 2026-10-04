@@ -43,14 +43,18 @@ class IndexResult:
     dictionary_ncc: np.ndarray  # (N,) best dictionary correlation
 
 
-def dictionary_index(experimental: np.ndarray, simulate: Callable[[np.ndarray], np.ndarray],
-                     matrices: np.ndarray, chunk: int = 1024) -> tuple[np.ndarray, np.ndarray]:
+def dictionary_index(
+    experimental: np.ndarray,
+    simulate: Callable[[np.ndarray], np.ndarray],
+    matrices: np.ndarray,
+    chunk: int = 1024,
+) -> tuple[np.ndarray, np.ndarray]:
     """Best dictionary entry per experimental pattern: ``experimental`` (N, P) normalised
     vectors, ``simulate(matrix)`` a normalised (P,) vector. Returns (index (N,), ncc (N,))."""
     best = np.full(len(experimental), -np.inf, np.float32)
     idx = np.zeros(len(experimental), np.int64)
     for c0 in range(0, len(matrices), chunk):
-        D = np.stack([simulate(m) for m in matrices[c0:c0 + chunk]])  # (C, P)
+        D = np.stack([simulate(m) for m in matrices[c0 : c0 + chunk]])  # (C, P)
         S = experimental @ D.T  # (N, C)
         j = S.argmax(axis=1)
         v = S[np.arange(len(S)), j]
@@ -60,22 +64,35 @@ def dictionary_index(experimental: np.ndarray, simulate: Callable[[np.ndarray], 
     return idx, best
 
 
-def refine(experimental: np.ndarray, simulate: Callable[[np.ndarray], np.ndarray], start: np.ndarray,
-           step_deg: float = 2.0) -> tuple[np.ndarray, float]:
+def refine(
+    experimental: np.ndarray,
+    simulate: Callable[[np.ndarray], np.ndarray],
+    start: np.ndarray,
+    step_deg: float = 2.0,
+) -> tuple[np.ndarray, float]:
     """Nelder-Mead on a rotation vector applied (in the sample frame) to ``start``."""
+
     def cost(r):
         return -float(experimental @ simulate(_R.from_rotvec(r).as_matrix() @ start))
 
     s = np.radians(step_deg)
     simplex = np.vstack([np.zeros(3), np.eye(3) * s])
-    res = optimize.minimize(cost, np.zeros(3), method="Nelder-Mead",
-                            options={"initial_simplex": simplex, "xatol": 1e-4, "fatol": 1e-6,
-                                     "maxiter": 400})
+    res = optimize.minimize(
+        cost,
+        np.zeros(3),
+        method="Nelder-Mead",
+        options={"initial_simplex": simplex, "xatol": 1e-4, "fatol": 1e-6, "maxiter": 400},
+    )
     return _R.from_rotvec(res.x).as_matrix() @ start, -float(res.fun)
 
 
-def index(experimental: np.ndarray, simulate_coarse, simulate_fine, matrices: np.ndarray,
-          experimental_fine: np.ndarray) -> IndexResult:
+def index(
+    experimental: np.ndarray,
+    simulate_coarse,
+    simulate_fine,
+    matrices: np.ndarray,
+    experimental_fine: np.ndarray,
+) -> IndexResult:
     """Dictionary-index (coarse patterns) then refine (fine patterns) every pattern."""
     j, dncc = dictionary_index(experimental, simulate_coarse, matrices)
     out, ncc = [], []

@@ -272,10 +272,11 @@ class Detector:
         ``dose_e_per_px`` (mean electrons per sensor pixel), ``saturated``,
         ``saturated_pixels``, ``blanked`` and the resolved geometry.
         ``seed`` replaces the detector's own for this frame's noise (a pinned acquisition).
-        ``means``: ``(lam, p0, dose, t_nb)``, the exposure's Poisson means already made by the
-        renderer (``lam = flux * t_nb`` per grid pixel, ``p0 = exp(-lam)``, their sum, and the
-        ``t_nb`` they were made for), as ``detector.fast.prepare`` would make them; used by the
-        fused integrating path when they match this frame (else ignored).
+        ``means``: ``(lam, p0, dose, t_nb[, row_totals])``, the exposure's Poisson means already
+        made by the renderer (``lam = flux * t_nb`` per grid pixel, ``p0 = exp(-lam)``, their sum,
+        the ``t_nb`` they were made for and optionally each row's sum), as ``detector.fast.prepare``
+        would make them; used by the fused integrating path when they match this frame (else
+        ignored). The row totals are what an electron-by-electron (sparse) path needs.
         """
         self._build_maps()
         m = self.model
