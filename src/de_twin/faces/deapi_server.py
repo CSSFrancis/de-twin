@@ -530,6 +530,30 @@ class TwinFakeServer(FakeServer):  # type: ignore[misc,valid-type]
         def set_kv(value):
             twin.configure_ebsd(current(), beam_kv=float(value))
 
+        # user master pattern: a file on the twin's machine (deapi properties are strings: no upload)
+        self._ebsd_master_phase = "Nickel"
+        self._ebsd_master_status = "kinematic"
+
+        def set_master_file(value):
+            path = str(value).strip()
+            try:
+                if path:
+                    mp = twin.set_master_pattern(self._ebsd_master_phase, path)
+                    self._ebsd_master_status = (f"{self._ebsd_master_phase}: {path} at {mp.kv:g} kV, "
+                                                f"{mp.nbytes / 1e6:.1f} MB")
+                else:
+                    twin.clear_master_patterns(self._ebsd_master_phase)
+                    self._ebsd_master_status = "kinematic"
+            except Exception as exc:  # noqa: BLE001 - reported through the status property
+                self._ebsd_master_status = f"error: {exc}"
+                log.warning("EBSD master pattern %s: %s", path, exc)
+
+        self._put(DynamicProperty("Simulator EBSD Master Pattern Phase", lambda: self._ebsd_master_phase,
+                                  lambda v: setattr(self, "_ebsd_master_phase", str(v)), category="Simulator"))
+        self._put(DynamicProperty("Simulator EBSD Master Pattern File", lambda: "", set_master_file,
+                                  category="Simulator"))
+        self._put(DynamicProperty("Simulator EBSD Master Pattern Status", lambda: self._ebsd_master_status,
+                                  category="Simulator"))
         self._put(DynamicProperty("Simulator EBSD Beam Energy (kV)", lambda: twin.column.state().ht_kv,
                                   set_kv,
                                   data_type="Float", category="Simulator"))

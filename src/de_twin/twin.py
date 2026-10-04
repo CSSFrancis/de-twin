@@ -98,6 +98,9 @@ class DigitalTwin:
         if self.optics_config.realism is not None and column is None:
             self.column.backlash_um = float(self.optics_config.realism.backlash_um)
         self.renderer = Renderer(self.specimen, render_config)
+        #: material id -> user EBSD master patterns (``set_master_pattern``)
+        self._user_masters: dict = {}
+        self.renderer.ebsd_user_masters = self._user_masters
         # Only a column the twin built is its to move: a supplied one may be a mirror of
         # real hardware, whose stage and beam are the operator's.
         self._own_column = column is None
@@ -200,6 +203,7 @@ class DigitalTwin:
         with self.lock:
             self.specimen = specimen
             self.renderer = Renderer(specimen, getattr(self.renderer, "config", None))
+            self.renderer.ebsd_user_masters = self._user_masters
         if start and getattr(self, "_own_column", False):
             self.start_on_specimen()
 
@@ -493,6 +497,56 @@ class DigitalTwin:
                 self.column._set_local("HighTension", float(beam_kv) * 1000.0)
         return g
 
+    def set_master_pattern(self, phase, source, *, energy_kv: Optional[float] = None, kv: Optional[float] = None,
+                           projection: Optional[str] = None, hemisphere: Optional[str] = None, energies=None,
+                           weights=None, centrosymmetric: Optional[bool] = None, validate: bool = True):
+        """Use your own EBSD master pattern for ``phase`` instead of the kinematic one, and return
+        it (a :class:`~de_twin.ebsd.MasterPattern`; ``nbytes``, ``symmetry_error``).
+
+        ``phase``: a material id or name (``"Nickel"``). ``source``: an EMsoft ``EMEBSDmaster``
+        HDF5 file, a kikuchipy ``EBSDMasterPattern`` saved to HDF5, or a NumPy array — (n, n),
+        (2, n, n) north/south, (nE, n, n) with ``energies``, (2, nE, n, n) — with ``projection``
+        ("lambert" | "stereographic") and ``hemisphere`` ("north" | "south" | "both").
+        ``energy_kv`` picks (interpolates) an energy bin; by default the Monte-Carlo
+        energy-weighted sum when the file has one, else the highest energy. ``kv``: the beam energy
+        it is used at (default the selected / highest energy, else the column's HT; it is used
+        within 0.5 kV of it). It is resampled and quantised to ``EbsdGeometry.master_resolution_deg``
+        (a few MB) and validated against the phase's point group (see :mod:`de_twin.ebsd.io`).
+        """
+        from .ebsd import EbsdGeometry
+        from .ebsd.io import load_master_pattern
+
+        mid = _material_id(phase)
+        g = self.ebsd or EbsdGeometry()
+        if kv is None and energy_kv is None and energies is None and not isinstance(source, (str, bytes)) \
+                and not hasattr(source, "__fspath__"):
+            kv = float(self.column.state().ht_kv)
+        mp = load_master_pattern(source, mid, resolution_deg=g.master_resolution_deg, energy_kv=energy_kv, kv=kv,
+                                 projection=projection, hemisphere=hemisphere, energies=energies,
+                                 weights=weights, centrosymmetric=centrosymmetric, validate=validate)
+        with self.lock:
+            lst = [m for m in self._user_masters.get(mid, []) if abs(m.kv - mp.kv) > 1e-6]
+            self._user_masters[mid] = lst + [mp]
+        return mp
+
+    def clear_master_patterns(self, phase=None) -> None:
+        """Back to kinematic master patterns (for ``phase``, or all)."""
+        with self.lock:
+            if phase is None:
+                self._user_masters.clear()
+            else:
+                self._user_masters.pop(_material_id(phase), None)
+
+    def master_patterns(self) -> list:
+        """The user master patterns in use: dicts of phase, kv, source, bytes, hemispheres,
+        symmetry error."""
+        from .specimen.materials import material
+
+        return [{"phase": material(mid).name, "material_id": mid, "kv": m.kv, "source": m.source,
+                 "nbytes": m.nbytes, "hemispheres": 1 if m.south is None else 2,
+                 "symmetry_error": getattr(m, "symmetry_error", float("nan"))}
+                for mid, lst in sorted(self._user_masters.items()) for m in lst]
+
     def ebsd_patterns(self, request: AcquisitionRequest, *, out=None, dtype=np.float32) -> np.ndarray:
         """Noiseless EBSD patterns of the request's scan: (scan ny, nx, h, w) at the detector's
         *binned* output shape, electrons per binned pixel per second (x the dwell time for
@@ -644,6 +698,19 @@ class DigitalTwin:
                     close()
                 except Exception:  # pragma: no cover - best effort
                     pass
+
+
+def _material_id(phase) -> int:
+    """A material id from an id or a (case-insensitive) material name."""
+    from .specimen.materials import MATERIALS
+
+    if isinstance(phase, str):
+        key = phase.strip().lower()
+        for m in MATERIALS:
+            if m.name.lower() == key:
+                return int(m.id)
+        raise KeyError(f"unknown material {phase!r}")
+    return int(phase)
 
 
 def _make_specimen(specimen):
