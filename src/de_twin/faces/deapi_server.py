@@ -53,6 +53,7 @@ import threading
 import time
 import traceback
 from collections import deque
+from dataclasses import replace
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -157,6 +158,42 @@ def model_counting(twin) -> bool:
     return bool(getattr(twin.detector.model, "hardware_counting", False))
 
 
+#: DE-Server's scan coil properties, with DE-Server's defaults.
+SCAN_COIL_PROPERTIES = {
+    "Scan - Voltage H Min": -1.0, "Scan - Voltage H Max": 1.0,
+    "Scan - Voltage V Min": -1.0, "Scan - Voltage V Max": 1.0,
+    "Scan - Pixel Offset X": 0.0, "Scan - Pixel Offset Y": 0.0,
+    "Scan - Rotation": 0.0,
+}
+SCAN_FLIP_PROPERTIES = ("Scan - Flip Horizontally", "Scan - Flip Vertically")
+
+
+def scan_coil_settings(get: Callable[[str], Any]) -> dict:
+    """The ScanRequest fields the scan coils take from properties (de_twin.optics.scan_coils).
+
+    These are what a client changes WHILE scanning (pan, zoom, drift correction, a moving
+    probe), so a running acquisition re-reads them between repetitions."""
+    def number(name):
+        try:
+            return float(get(name))
+        except (KeyError, TypeError, ValueError):
+            return SCAN_COIL_PROPERTIES[name]
+
+    def flag(name):
+        try:
+            return _to_bool(get(name))
+        except KeyError:
+            return False
+
+    return {
+        "voltage_h": (number("Scan - Voltage H Min"), number("Scan - Voltage H Max")),
+        "voltage_v": (number("Scan - Voltage V Min"), number("Scan - Voltage V Max")),
+        "pixel_offset": (number("Scan - Pixel Offset X"), number("Scan - Pixel Offset Y")),
+        "rotation_deg": number("Scan - Rotation"),
+        "flip": tuple(flag(name) for name in SCAN_FLIP_PROPERTIES),
+    }
+
+
 def request_from_properties(get: Callable[[str], Any], camera_model: str,
                             sensor_shape: tuple[int, int], *,
                             scan_points: Optional[list] = None,
@@ -189,7 +226,7 @@ def request_from_properties(get: Callable[[str], Any], camera_model: str,
         elif sroi is not None:
             points = [(sroi.x + i, sroi.y + j) for j in range(sroi.h) for i in range(sroi.w)]
         scan = ScanRequest(enabled=True, size=(nx, ny), dwell_s=fpp / fps, frames_per_point=fpp,
-                           roi=sroi, repeats=repeats, points=points)
+                           roi=sroi, repeats=repeats, points=points, **scan_coil_settings(get))
         n_points = len(points) if points else nx * ny
         frame_count = n_points * fpp * repeats
     return AcquisitionRequest(
@@ -298,6 +335,10 @@ class _Acquisition:
                 if self.continuous and a:
                     with self.cond:
                         self.sum = None  # the sum is per repetition, like one live buffer
+                    # a client steers the probe while it scans: take the coils' settings now
+                    if self.request.scan.enabled:
+                        self.request = replace(self.request, scan=replace(
+                            self.request.scan, **scan_coil_settings(srv.__getitem__)))
                 for raw, meta in srv.twin.frames(self.request, pace=srv.pace, stop=self.stop):
                     self._add(raw, meta)
                     if self.stop.is_set():
@@ -464,8 +505,10 @@ class TwinFakeServer(FakeServer):  # type: ignore[misc,valid-type]
                                   data_type="Float", category="Simulator"))
         self._put(DynamicProperty("Simulator Virtual Specimen", lambda: self._specimen_name,
                                   self._set_specimen, category="Simulator"))
-        self._plain("Scan - Pixel Offset X", 0, "Integer")
-        self._plain("Scan - Pixel Offset Y", 0, "Integer")
+        for name, value in SCAN_COIL_PROPERTIES.items():
+            self._plain(name, value, "Float", category="Scan")
+        for name in SCAN_FLIP_PROPERTIES:
+            self._plain(name, "Off", category="Scan")
         clock = getattr(self.twin, "clock", None)
         self._put(DynamicProperty("Twin Clock (seconds)",
                                   lambda: clock.now() if hasattr(clock, "now") else time.time(),

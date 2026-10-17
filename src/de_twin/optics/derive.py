@@ -31,6 +31,7 @@ from .calibration import Calibration
 from .config import OpticsConfig
 from .aberrations import Aberrations, uncorrected
 from .physics import electron_wavelength_nm, focal_spread_nm
+from .scan_coils import nm_per_volt, scan_coils
 from .state import OpticsState
 
 #: The default of `OpticsConfig.max_raster_pixels`: the largest raster a TEM image is
@@ -204,6 +205,11 @@ def derive_optics(state: MicroscopeState, request: AcquisitionRequest, camera,
             step_nm = calibration.stem_step_nm(state, (max(nx_scan, 1), max(ny_scan, 1)))
             if not step_nm > 0:
                 step_nm = float(cfg.fallback_pixel_nm)
+    # The calibrated step is the default voltage range's; the coils' range sets the real one
+    coils = scan_coils(scan) if scanning else None
+    nm_per_v = nm_per_volt(step_nm, (nx_scan, ny_scan)) if scanning else 0.0
+    if scanning:
+        step_nm = nm_per_v * coils.volts_per_point
 
     # Tilt: alpha (about the lab x axis) compresses y, beta (about y) compresses x; the same
     # rotation S = Rx(alpha) Ry(beta) turns every grain (de_twin.crystal.orientation).
@@ -242,12 +248,18 @@ def derive_optics(state: MicroscopeState, request: AcquisitionRequest, camera,
         # [twin] an off-centre hardware ROI looks at an off-centre part of the field
         cx += roi_offset_px[0] * nm_per_px / 1000.0 / cos_x
         cy += roi_offset_px[1] * nm_per_px / 1000.0 / cos_y
+    if scanning:
+        # the coils deflect the probe off axis: the range's midpoint plus the pixel offset
+        cx += coils.center_volts[0] * nm_per_v / 1000.0 / cos_x
+        cy += coils.center_volts[1] * nm_per_v / 1000.0 / cos_y
     rotation = math.radians(scan.rotation_deg) if scanning else 0.0
     if cfg.realism is not None and mode == RenderMode.TEM_IMAGING and not scanning:
         rotation = cfg.realism.rotation_rad(state.mag_mode, state.magnification)
         rotation += cfg.realism.defocus_rotation_rad(state.defocus_um + cfg.defocus_offset_um)
+    flip_x, flip_y = coils.flip if scanning else (False, False)
     view = ViewWindow(center_um=(cx, cy), pixel_um=raster_nm / 1000.0, shape=(int(ry), int(rx)),
-                      rotation_rad=rotation, cos_alpha=cos_y, cos_beta=cos_x)
+                      rotation_rad=rotation, flip_x=flip_x, flip_y=flip_y,
+                      cos_alpha=cos_y, cos_beta=cos_x)
     # TEM imaging: where beam shift has put the illuminated disc, raster pixels from centre
     beam_offset_px = (0.0, 0.0)
     if mode == RenderMode.TEM_IMAGING and (state.beam_shift_um.x or state.beam_shift_um.y):
@@ -370,6 +382,8 @@ def derive_optics(state: MicroscopeState, request: AcquisitionRequest, camera,
         "blur_sigma_render_px": blur_sigma_render,
         "illumination_semi_angle_mrad": theta_ill_mrad,
         "stem_step_nm": step_nm,
+        "scan_nm_per_volt": nm_per_v,
+        "scan_center_volts": coils.center_volts if scanning else (0.0, 0.0),
         "probe_blend_offset_px": (0.5 * probe_d / step_nm) if step_nm > 0 else 0.0,
         "nominal_pixel_nm": float(nominal_nm_per_px),
         "render_nm_per_px": render_nm,
