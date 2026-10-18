@@ -150,7 +150,14 @@ class ShmFace:
             while True:
                 if self._stop.is_set() or p.request_changed(request_id):
                     return p.poll_request()
-                got = pool.take(KEEPALIVE_S)
+                while not p.wait_slot_free(timeout=0.05):
+                    if self._stop.is_set() or p.request_changed(request_id):
+                        return p.poll_request()
+                # as many frames as DE-Server has room for, in one go
+                count = p.free_slots() if recycle else 1
+                if request.total_frames > 0:
+                    count = min(count, request.total_frames - k)
+                got = pool.take_many(count, KEEPALIVE_S)
                 if got is _DONE:
                     return None
                 if isinstance(got, BaseException):
@@ -159,21 +166,18 @@ class ShmFace:
                     last = self._last_frame
                     if last is None or last[0].shape != shape or last[0].dtype != dtype:
                         continue
-                    got = (last[1], False)
-                (raw, meta), fresh = got
-                if not fresh and not recycle:
-                    self.keepalives += 1
-                while not p.wait_slot_free(timeout=0.05):
-                    if self._stop.is_set() or p.request_changed(request_id):
-                        return p.poll_request()
-                out = _fit(raw, shape, dtype)
-                p.publish(out, request_id=request_id, frame_index=k,
-                          flags=L.FLAG_BLANKED if meta.blanked else 0)
+                    got = [(last[1], False)]
+                for (raw, meta), fresh in got:
+                    if not fresh and not recycle:
+                        self.keepalives += 1
+                    out = _fit(raw, shape, dtype)
+                    p.publish(out, request_id=request_id, frame_index=k,
+                              flags=L.FLAG_BLANKED if meta.blanked else 0)
+                    self.frames_reused += 0 if fresh else 1
+                    k += 1
                 self._last_frame = (out, (raw, meta))
                 self._pool_used = _now()
-                self.frames_published += 1
-                self.frames_reused += 0 if fresh else 1
-                k += 1
+                self.frames_published += len(got)
                 if request.total_frames > 0 and k >= request.total_frames:
                     return None
                 if recycle and self.pace:
@@ -265,21 +269,36 @@ class _FramePool:
             except Exception:  # noqa: BLE001 - no numba: nothing to cap
                 pass
         state = None
+        # A scan's frames depend on their index, so only a fixed view is re-rendered from
+        # the start when the column moves (diffraction and STEM freeze the optics for the
+        # whole of a `frames` call, so a running one would never see the move).
+        watch = not request.scan.enabled
         try:
-            for item in twin.frames(request, pace=pace, stop=self._stop):
-                with self._cond:
-                    if item[1].microscope != state:
-                        state = item[1].microscope
-                        self._ring = []  # a new view: nothing older may be shown
-                    while not self._stop.is_set() and sum(1 for e in self._ring if e[1] == 0) >= self.size:
-                        self._cond.wait(0.05)
-                    if self._stop.is_set():
-                        return
-                    self._ring.append([item, 0])
-                    if len(self._ring) > self.size:  # drop the most-used frame
-                        worst = max(range(len(self._ring) - 1), key=lambda i: self._ring[i][1])
-                        del self._ring[worst]
-                    self._cond.notify_all()
+            restart = True
+            while restart:
+                restart = False
+                for item in twin.frames(request, pace=pace, stop=self._stop):
+                    with self._cond:
+                        if item[1].microscope != state:
+                            state = item[1].microscope
+                            self._ring = []  # a new view: nothing older may be shown
+                        # A ring full of frames that may still be published is a library:
+                        # stop rendering, which also stops taking the interpreter from the
+                        # thread that publishes them, until the view changes.
+                        while not self._stop.is_set() and self._publishable() >= self.size:
+                            self._cond.wait(0.05)
+                            if watch and twin.column.state() != state:
+                                restart, self._ring = True, []
+                                break
+                        if self._stop.is_set():
+                            return
+                        if restart:
+                            break
+                        self._ring.append([item, 0])
+                        if len(self._ring) > self.size:  # drop the most-used frame
+                            worst = max(range(len(self._ring) - 1), key=lambda i: self._ring[i][1])
+                            del self._ring[worst]
+                        self._cond.notify_all()
             end = _DONE
         except Exception as e:  # noqa: BLE001 - raised on the publishing thread
             end = e
@@ -287,32 +306,47 @@ class _FramePool:
             self._end = end
             self._cond.notify_all()
 
+    def _publishable(self) -> int:
+        return sum(1 for e in self._ring if e[1] < self.reuse)
+
     def take(self, keepalive: float):
         """``((raw, meta), fresh)``, ``_DONE``, an exception, or None (nothing yet)."""
+        got = self.take_many(1, keepalive)
+        return got[0] if isinstance(got, list) else got
+
+    def take_many(self, count: int, keepalive: float):
+        """Up to *count* frames as a list of ``((raw, meta), fresh)``, in the order
+        :meth:`take` would hand them out, or what `take` returns when there are none. Waits
+        only for the first: one lock and one pass over the ring for the lot is what lets a
+        recycled stream reach tens of thousands of frames a second."""
         import time
 
         deadline = time.monotonic() + keepalive
         with self._cond:
             while True:
-                fresh = [e for e in self._ring if e[1] == 0]
-                if fresh:
-                    e = fresh[0]
+                taken = [e for e in self._ring if e[1] == 0][:count]
+                for e in taken:
                     e[1] += 1
+                out = [(e[0], True) for e in taken]
+                if taken:
                     self._cond.notify_all()
-                    self._last = e[0]
-                    return e[0], True
-                if self._end is not None:
+                elif self._end is not None:
                     return self._end
-                if self.reuse > 1:
-                    usable = [e for e in self._ring if e[1] < self.reuse]
-                    if usable:
-                        e = min(usable, key=lambda e: e[1])
-                        e[1] += 1
-                        self._last = e[0]
-                        return e[0], False
+                if self.reuse > 1 and len(out) < count and self._end is None:
+                    usable = sorted((e for e in self._ring if e[1] < self.reuse), key=lambda e: e[1])
+                    while usable and len(out) < count:  # least used first, round and round
+                        for e in usable:
+                            e[1] += 1
+                            out.append((e[0], False))
+                            if len(out) == count:
+                                break
+                        usable = [e for e in usable if e[1] < self.reuse]
+                if out:
+                    self._last = out[-1][0]
+                    return out
                 left = deadline - time.monotonic()
                 if left <= 0:
-                    return (self._last, False) if self._last is not None else None
+                    return [(self._last, False)] if self._last is not None else None
                 self._cond.wait(left)
 
     @property

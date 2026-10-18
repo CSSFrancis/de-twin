@@ -70,6 +70,7 @@ bool ExternalFrameSource::ReadFrame(void* dst, size_t dstStrideBytes, uint32_t t
 		return false;
 
 	const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+	const ULONGLONG spinUntil = GetTickCount64() + 5;
 	while (true)
 	{
 		const uint64_t n = m_header->readCount;
@@ -93,7 +94,12 @@ bool ExternalFrameSource::ReadFrame(void* dst, size_t dstStrideBytes, uint32_t t
 		}
 		if (GetTickCount64() >= deadline)
 			return false;
-		Sleep(1);
+		// Give the core away without sleeping for the first few ms of a wait: Sleep(1) is
+		// one to two ms on Windows, as long as a fast camera takes for the whole ring.
+		if (GetTickCount64() < spinUntil)
+			SwitchToThread();
+		else
+			Sleep(1);
 	}
 }
 
