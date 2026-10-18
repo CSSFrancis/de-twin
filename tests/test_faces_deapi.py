@@ -314,6 +314,52 @@ def test_a_live_scan_follows_the_offset_and_zoom_as_they_change(client, twin):
             time.sleep(0.01)
 
 
+def _offset_per_repeat(server, twin, *, output_buffer_ms, change_at_frame=20):
+    """Scan 8x8 ten times, change the pixel offset at ``change_at_frame``, and return the
+    offset each repeat scanned with."""
+    face = server.fake
+    face["Scan - Enable"] = "On"
+    face["Scan - Size X"] = face["Scan - Size Y"] = 8
+    face["Scan - Repeats"] = 10
+    face["Frames Per Second"] = 40
+    face["Scan - Output Buffer (milliseconds)"] = output_buffer_ms
+    frames = twin.frames
+
+    def changing(request, pace=False, stop=None):
+        for raw, meta in frames(request, pace=pace, stop=stop):
+            if sum(r.total_frames for r in twin.requests[:-1]) + meta.frame_index == change_at_frame:
+                face["Scan - Pixel Offset X"] = 3.0
+            yield raw, meta
+
+    twin.frames = changing
+    face._start(_start_command(1))
+    face._acq.thread.join(timeout=10)
+    return [r.scan.pixel_offset[0] for r in twin.requests]
+
+
+def _start_command(n):
+    from deapi.buffer_protocols import pb
+
+    command = pb.DEPacket()
+    c = command.command.add()
+    c.command_id = 0
+    p = c.parameter.add()
+    p.type, p.p_int = pb.AnyParameter.P_INT, n
+    return command
+
+
+def test_an_offset_lands_one_output_buffer_later_on_a_repeat_boundary(server, twin):
+    """DE-Server queues the output buffer ahead of the beam (6.4 s at 40 fps is 256 points):
+    an offset written at point 20 is in the points written at 20 + 256, i.e. from repeat 5."""
+    assert _offset_per_repeat(server, twin, output_buffer_ms=6400.0) == [0.0] * 5 + [3.0] * 5
+
+
+def test_by_default_an_offset_waits_out_half_the_fifo(server, twin):
+    """Without an output buffer set, DE-Server queues 524,288 points: a 640-point scan never
+    sees an offset written while it runs."""
+    assert _offset_per_repeat(server, twin, output_buffer_ms=0.0) == [0.0] * 10
+
+
 def test_real_twin_if_available():
     try:
         from de_twin.twin import DigitalTwin
