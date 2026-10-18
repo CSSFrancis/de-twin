@@ -4,16 +4,27 @@ DE-Server (test pattern "External Frame Source (Shared Memory)") creates the sha
 memory and publishes each acquisition's request. This face turns the request into an
 ``AcquisitionRequest``, renders frames through the twin and publishes them, paced to the
 frame time and throttled by DE-Server's reads.
+
+In a scan, DE-Server's scan simulator also shares the coil voltages it outputs
+(:mod:`de_twin.transport.scan_output`), as the scan card drives a microscope's coils. Each
+frame is then rendered where those voltages put the beam, so whatever steers the scan (a
+pixel offset, an XY array, drift correction) moves the beam with the latency DE-Server's
+output buffer gives it on hardware. Without them the twin rasters the grid by frame index.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import threading
+import time
+from collections import OrderedDict
 from typing import Optional
 
 import numpy as np
 
+from ..optics.scan_coils import point_from_volts
+from ..transport import scan_output as S
 from ..transport import shm_layout as L
 
 log = logging.getLogger(__name__)
@@ -41,12 +52,17 @@ class ShmFace:
     physics renders tens; ``threads`` caps the cores the physics takes. Every frame is a
     correct single frame of the current view; what recycling costs is independence, so a
     sum of many frames is noisier than N-fold as many would be. ``reuse=1`` (the default)
-    publishes every frame once.
+    publishes every frame once. In a scan steered by DE-Server's voltages, the frames are
+    kept per scan point instead: a probe held on one point is rendered ``pool_size``
+    times and then picked from.
     """
 
     def __init__(self, twin, name: str = L.DEFAULT_NAME, pace: bool = True, warm_up: bool = True,
-                 *, reuse: int = 1, pool_size: int = 16, threads: Optional[int] = None):
+                 *, reuse: int = 1, pool_size: int = 16, threads: Optional[int] = None,
+                 scan_output: str = S.DEFAULT_NAME):
         self.twin = twin
+        self.scan_output_name = scan_output
+        self._scan_output: Optional[S.ScanOutputReader] = None
         self.reuse = max(1, int(reuse))
         self.pool_size = int(pool_size)
         self.threads = threads
@@ -78,6 +94,8 @@ class ShmFace:
         self._close_pool()
         if self.producer is not None:
             self.producer.close()
+        if self._scan_output is not None:
+            self._scan_output.close()
 
     def __enter__(self):
         return self.start()
@@ -135,8 +153,10 @@ class ShmFace:
         the stream runs at the frame rate DE-Server asks for rather than at the rate the
         detector physics can manage.
         """
-        import time
-
+        if request.scan.enabled:
+            coils = self._coils()
+            if coils is not None:
+                return self._serve_steered(request_id, request, coils)
         p = self.producer
         h = p.hdr
         shape = (h.frame_height, h.frame_width)
@@ -190,6 +210,57 @@ class ShmFace:
                 pool.close()
                 if self._pool is pool:
                     self._pool = None
+
+    def _coils(self) -> Optional[S.ScanOutputReader]:
+        """DE-Server's scan output, once its scan simulator has made one."""
+        if self._scan_output is None:
+            try:
+                self._scan_output = S.ScanOutputReader(self.scan_output_name)
+            except (FileNotFoundError, RuntimeError):
+                return None
+        return self._scan_output
+
+    def _serve_steered(self, request_id: int, request, coils: S.ScanOutputReader):
+        """`_serve` for a scan whose beam DE-Server's coil voltages place: each frame is
+        rendered at the grid point its scan point's voltages put the beam on, through a
+        library per point (`_PointLibrary`). Rendering happens on this thread, between
+        publications, so nothing competes with publishing for the interpreter."""
+        p = self.producer
+        h = p.hdr
+        shape = (h.frame_height, h.frame_width)
+        dtype = np.uint8 if h.bytes_per_pixel == 1 else np.uint16
+        library = _PointLibrary(self.twin, request, coils, size=self.pool_size if self.reuse > 1 else 0)
+        frame_time = max(float(request.frame_time_s), 1e-6)
+        t0 = time.monotonic()
+        k = 0
+        try:
+            while True:
+                if self._stop.is_set() or p.request_changed(request_id):
+                    return p.poll_request()
+                while not p.wait_slot_free(timeout=0.05):
+                    if self._stop.is_set() or p.request_changed(request_id):
+                        return p.poll_request()
+                count = p.free_slots()
+                if request.total_frames > 0:
+                    count = min(count, request.total_frames - k)
+                if count <= 0:
+                    continue
+                for (raw, meta), fresh in library.frames(k, count):
+                    out = _fit(raw, shape, dtype)
+                    p.publish(out, request_id=request_id, frame_index=k,
+                              flags=L.FLAG_BLANKED if meta.blanked else 0)
+                    self.frames_reused += 0 if fresh else 1
+                    k += 1
+                self._last_frame = (out, (raw, meta))
+                self.frames_published += count
+                if request.total_frames > 0 and k >= request.total_frames:
+                    return None
+                if self.pace:
+                    delay = t0 + k * frame_time - time.monotonic()
+                    if delay > 0:
+                        self._stop.wait(delay)
+        finally:
+            library.close()
 
     def _pool_for(self, request, recycle: bool) -> "_FramePool":
         """The frame pool for *request*: the running one when the request asks for the
@@ -358,3 +429,130 @@ class _FramePool:
         self._stop.set()  # the renderer stops at its next frame; the twin's lock orders them
         with self._cond:
             self._cond.notify_all()
+
+
+#: A scan's frame library holds at most this many bytes; the points used longest ago go.
+LIBRARY_BYTES = 512 * 1024 * 1024
+#: How often a library checks that the column has not moved under it.
+VIEW_CHECK_S = 0.05
+#: Frames whose beam positions a library works out at once.
+POINTS_AHEAD = 1024
+
+
+class _Wanted:
+    """A scan's points as ``twin.frames`` reads them: whichever point is rendered next."""
+
+    point = (0, 0)
+
+    def __len__(self) -> int:
+        return 1 << 62
+
+    def __getitem__(self, index) -> tuple[int, int]:
+        return self.point
+
+
+class _PointLibrary:
+    """Frames of one scan, rendered where DE-Server's coil voltages put the beam.
+
+    Frame k covers scan point ``k * points_per_frame``; that point's voltages, through the
+    inverse of the coil transform, give the grid point the beam is on (rounded, and kept
+    on the grid: the twin renders the grid's field only). Voltages not written yet are
+    the coils still driven at the last ones written, as a real scan card holds its output.
+
+    With *size*, each grid point keeps up to *size* frames: a probe held on one point is
+    rendered *size* times and then picked from. A move of the column, or a new scan,
+    starts the library again.
+    """
+
+    def __init__(self, twin, request, coils: S.ScanOutputReader, *, size: int):
+        self.twin = twin
+        self.coils = coils
+        self.size = int(size)
+        self._request = request
+        self._wanted = _Wanted()
+        self._frames: "OrderedDict[tuple[int, int], list]" = OrderedDict()  # point -> [items, next]
+        self._bytes = 0
+        self._render = None
+        self._scan_id = None
+        self._state = None
+        self._checked = 0.0
+        self._stop = threading.Event()
+
+    def _restart(self) -> None:
+        g = self.coils.geometry()
+        self._scan_id = self.coils.scan_id
+        self.geometry = g
+        self.scan = dataclasses.replace(self._request.scan, size=g.size, voltage_h=g.voltage_h,
+                                        voltage_v=g.voltage_v, rotation_deg=g.rotation_deg, flip=g.flip,
+                                        pixel_offset=(0.0, 0.0), points=self._wanted)
+        if self._render is not None:
+            self._render.close()
+        # the coil transform is affine, so its inverse is too: (x, y) = (H, V) @ matrix + origin
+        origin = np.array(point_from_volts(self.scan, 0.0, 0.0))
+        self._matrix = np.array([point_from_volts(self.scan, 1.0, 0.0), point_from_volts(self.scan, 0.0, 1.0)]) - origin
+        self._origin = origin
+        self._state = self.twin.column.state()
+        self._render = self.twin.frames(dataclasses.replace(self._request, total_frames=0, scan=self.scan),
+                                        stop=self._stop)
+        self._frames.clear()
+        self._bytes = 0
+        self._ahead = (0, [])
+
+    def points(self, first_frame: int, count: int) -> list:
+        """The grid points, a list of (x, y), the beam is on for frames *first_frame*
+        onwards. DE-Server frees a slot or two at a time, so the points of frames whose
+        voltages are already written are worked out POINTS_AHEAD at a time and kept."""
+        first, ahead = self._ahead
+        if first <= first_frame and first_frame + count <= first + len(ahead):
+            return ahead[first_frame - first:first_frame - first + count]
+        # keep only frames whose voltages are written: the others hold the last ones for now
+        last_written = int((self.coils.written - 1) / self.geometry.points_per_frame)
+        settled = max(0, min(POINTS_AHEAD, last_written - first_frame + 1))
+        points = [tuple(p) for p in self._points(first_frame, max(count, settled)).tolist()]
+        self._ahead = (first_frame, points[:settled])
+        return points[:count]
+
+    def _points(self, first_frame: int, count: int) -> np.ndarray:
+        nx, ny = self.geometry.size
+        index = (np.arange(first_frame, first_frame + count) * self.geometry.points_per_frame).astype(np.int64)
+        volts = self.coils.volts_many(index)
+        unset = np.isnan(volts[:, 0])
+        xy = np.rint(volts @ self._matrix + self._origin)
+        xy[unset] = np.stack([index[unset] % nx, (index[unset] // nx) % ny], axis=1)  # nothing output yet
+        return np.clip(xy, 0, [nx - 1, ny - 1]).astype(np.int64)
+
+    def frames(self, first_frame: int, count: int) -> list:
+        """``((raw, meta), fresh)`` for each of *count* frames from *first_frame* on."""
+        now = time.monotonic()
+        if self._render is None or self.coils.scan_id != self._scan_id:
+            self._restart()
+        elif now - self._checked > VIEW_CHECK_S:
+            self._checked = now
+            if self.twin.column.state() != self._state:
+                self._restart()
+        return [self._frame(point) for point in self.points(first_frame, count)]
+
+    def _frame(self, point: tuple[int, int]):
+        entry = self._frames.get(point)
+        if entry is not None and len(entry[0]) >= self.size:
+            self._frames.move_to_end(point)
+            item = entry[0][entry[1] % len(entry[0])]
+            entry[1] += 1
+            return item, False
+        self._wanted.point = point
+        item = next(self._render)
+        if self.size > 0:
+            if entry is None:
+                entry = self._frames[point] = [[], 0]
+            entry[0].append(item)
+            self._frames.move_to_end(point)
+            self._bytes += item[0].nbytes
+            while self._bytes > LIBRARY_BYTES and len(self._frames) > 1:
+                _, (items, _) = self._frames.popitem(last=False)
+                self._bytes -= sum(raw.nbytes for raw, _ in items)
+        return item, True
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._render is not None:
+            self._render.close()

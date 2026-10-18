@@ -1,11 +1,13 @@
 // Stand-alone check of ExternalFrameSource, used by tests/test_shm_interop.py.
 //
 //   test_consumer layout
-//       print every field offset, to compare with de_twin/transport/shm_layout.py
+//       print every field offset, to compare with de_twin/transport/shm_layout.py and
+//       scan_output.py
 //   test_consumer <mapping> <frames> <width> <height> <exposureMode>
 //       act like DE-Server: publish a request, read the frames, print one line per frame
 
 #include "ExternalFrameSource.h"
+#include "ScanOutput.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -51,6 +53,25 @@ int main(int argc, char** argv)
 		FIELD(ExternalFrameSlot, height);
 		FIELD(ExternalFrameSlot, bytesPerPixel);
 		FIELD(ExternalFrameSlot, flags);
+		FIELD(ScanOutputHeader, magic);
+		FIELD(ScanOutputHeader, version);
+		FIELD(ScanOutputHeader, capacity);
+		FIELD(ScanOutputHeader, scanId);
+		FIELD(ScanOutputHeader, written);
+		FIELD(ScanOutputHeader, output);
+		FIELD(ScanOutputHeader, totalPoints);
+		FIELD(ScanOutputHeader, sizeX);
+		FIELD(ScanOutputHeader, sizeY);
+		FIELD(ScanOutputHeader, voltageMinH);
+		FIELD(ScanOutputHeader, voltageMaxH);
+		FIELD(ScanOutputHeader, voltageMinV);
+		FIELD(ScanOutputHeader, voltageMaxV);
+		FIELD(ScanOutputHeader, rotationDeg);
+		FIELD(ScanOutputHeader, flipHorizontal);
+		FIELD(ScanOutputHeader, flipVertical);
+		FIELD(ScanOutputHeader, pointsPerFrame);
+		FIELD(ScanOutputHeader, outputHz);
+		std::printf("ScanOutputHeader.sizeof %zu\n", sizeof(ScanOutputHeader));
 		return 0;
 	}
 	if (argc != 6)

@@ -9,3 +9,9 @@ The shared-memory face keeps up with a fast camera: with ``reuse``, a full frame
 library that is picked from rather than rendered into, re-rendered when the column moves, and
 frames go to DE-Server a batch at a time. Its C++ reader yields instead of sleeping for the
 first few ms of a wait. A 256x256 stream reaches about 27,000 frames a second, from 580.
+
+In a scan, the shared-memory face follows DE-Server's scan coil voltages (``DE_ScanOutput``,
+which DE-Server's scan simulator writes as a scan card would be written): each frame is
+rendered where its point's voltages put the beam, so a pixel offset, an XY array or drift
+correction moves the beam with DE-Server's output-buffer latency. A probe held on one point
+is rendered ``pool_size`` times and then picked from (about 25,000 frames a second at 256x256).

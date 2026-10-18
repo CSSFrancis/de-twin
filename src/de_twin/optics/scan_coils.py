@@ -107,6 +107,24 @@ def point_volts(scan, x: float, y: float) -> tuple[float, float]:
             coils.center_volts[1] + coils.volts_per_point * v)
 
 
+def point_from_volts(scan, h: float, v: float) -> tuple[float, float]:
+    """The full-grid point (x, y) the coils put the probe on at voltages (H, V): the
+    inverse of :func:`point_volts`. Not rounded, nor kept inside the grid: an offset can
+    put the probe off the grid's edge."""
+    coils = scan_coils(scan)
+    nx, ny = max(1, int(scan.size[0])), max(1, int(scan.size[1]))
+    u = (h - coils.center_volts[0]) / coils.volts_per_point
+    w = (v - coils.center_volts[1]) / coils.volts_per_point
+    a = math.radians(coils.rotation_deg)
+    c, s = math.cos(a), math.sin(a)
+    u, w = u * c + w * s, -u * s + w * c
+    if coils.flip[0]:
+        u = -u
+    if coils.flip[1]:
+        w = -w
+    return u + (nx - 1) / 2.0, w + (ny - 1) / 2.0
+
+
 def nm_per_volt(default_step_nm: float, size: tuple[int, int]) -> float:
     """Specimen nm per coil volt, from the calibrated step of a scan of *size* at the
     default range (the field at the default range, over that range)."""
