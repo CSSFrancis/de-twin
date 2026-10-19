@@ -597,6 +597,7 @@ def _band(b, r0, r1, d32, dui, bank, bank_n, face0, full, offs, scales, mats, o1
         zg = U64((zstart + base) & _MASK)
         zp = U64((zstart + _SECOND_STREAM + base) & _MASK)
         s0 = U64((r % 3) * W)
+        dim = zero  # (`&`, not `and`: a short-circuit is a branch, and a branch stops vectorisation)
         for cc in range(w):  # every pixel by the normal approximation (right from the cut up)
             L = lam[cc]
             cu = U64(cc)
@@ -604,10 +605,8 @@ def _band(b, r0, r1, d32, dui, bank, bank_n, face0, full, offs, scales, mats, o1
             ri = one / math.sqrt(max(nn, one) * k32)
             g = max(one - ninth * ri * ri + third * table[zg + cu] * ri, zero)
             S3[s0 + cu] = nn * adu32 * g * g * g
-        dim = 0  # (`&`, not `and`: a short-circuit is a branch, and a branch stops vectorisation)
-        for cc in range(w):
-            dim += 1 if ((lam[cc] < cut) & (lam[cc] > zero)) else 0
-        if dim > 0:  # the dim pixels again, exactly
+            dim += one if ((L < cut) & (L > zero)) else zero
+        if dim > zero:  # the dim pixels again, exactly
             m = 0
             for cc in range(w):
                 lane[m] = U32(cc)

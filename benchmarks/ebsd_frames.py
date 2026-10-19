@@ -81,6 +81,7 @@ def general(tw, n):
         lut, table, adu = fast.gamma_lut(k), fast.normal_table(), det._adu_at(KV)
         dep = per_call(lambda i: fast.deposit(lam, p0, adu, k, np.uint64(fast.frame_key(1, i, 1)), S, table, 1234 * i,
                                               lut))
+        det._build_maps()
         gain, off = det._binned_maps(det.roi(req), 2, 2)
         raw = np.empty((512, 512), np.uint16)
         hot = np.zeros((512, 512), np.float32)
@@ -111,20 +112,26 @@ def fused(tw, n):
     one = per_call(lambda i: src.render_one(local, out, (i * 37) % 65536, 1, i), n=100, reps=3)
     per_job = tw.FRAMES_PER_JOB
     workers = pool()
-    ring = [np.empty((per_job, *src.shape), np.uint16) for _ in range(2 * workers.threads)]
+    in_flight = workers.threads + workers.threads // 2  # as twin.frames keeps them
+    ring = [np.empty((per_job, *src.shape), np.uint16) for _ in range(in_flight + 1)]
 
-    def burst(count):
-        jobs = [src.submit(workers, ring[i % len(ring)], [(i * 37 + b) % 65536 for b in range(per_job)], 1,
-                           list(range(i * per_job, (i + 1) * per_job))) for i in range(count)]
-        for j in jobs:
-            j.wait()
+    def run(jobs):
+        from collections import deque
 
-    burst(2 * workers.threads)
+        pending = deque()
+        for i in range(jobs):
+            if len(pending) == in_flight:
+                pending.popleft().wait()
+            ks = [(i * per_job * 37 + b) % 65536 for b in range(per_job)]
+            pending.append(src.submit(workers, ring[i % len(ring)], ks, 1, range(i * per_job, (i + 1) * per_job)))
+        for job in pending:
+            job.wait()
+
+    run(in_flight)
+    jobs = max(n // per_job, 4 * in_flight)
     t0 = time.perf_counter()
-    m = max(n // 4 // per_job, 4 * workers.threads)
-    for start in range(0, m, len(ring)):  # never more jobs in flight than buffers
-        burst(len(ring))
-    raw_rate = m * per_job / (time.perf_counter() - t0)
+    run(jobs)
+    raw_rate = jobs * per_job / (time.perf_counter() - t0)
     fps = frames_rate(tw.frames(req), n)
     print(f"fused path ({workers.threads} worker threads)")
     print(f"  one frame on one core        {one * 1e3:7.3f} ms")
