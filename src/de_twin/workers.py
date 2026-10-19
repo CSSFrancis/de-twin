@@ -87,15 +87,8 @@ class Workers:
     ``fn(local, *args)``, where ``local`` is a dict private to the worker running it (for its
     scratch buffers)."""
 
-    #: The interpreter's switch interval while a pool runs. A worker needs the interpreter to
-    #: start a job and to hand it back; at the default 5 ms it waits that long whenever the
-    #: thread consuming the frames is busy in Python, which is a large share of a ~13 ms job.
-    SWITCH_INTERVAL_S = 0.0005
-
     def __init__(self, threads: Optional[int] = None):
         self.threads = int(threads or default_threads())
-        if sys.getswitchinterval() > self.SWITCH_INTERVAL_S:
-            sys.setswitchinterval(self.SWITCH_INTERVAL_S)
         self._jobs: "queue.SimpleQueue" = queue.SimpleQueue()
         self._threads = [threading.Thread(target=self._run, name=f"de-twin-frames-{i}", daemon=True)
                          for i in range(self.threads)]
