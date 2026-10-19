@@ -101,6 +101,13 @@ class CameraModel:
     #: its energy, so the ADU per electron falls in proportion to the energy (the HT table's
     #: log-log trend only holds while electrons pass through). SEM energies (EBSD, 5-30 kV).
     full_stop_kv: float = 40.0
+    #: "high" (the HT table) or "low": a low-gain readout trades sensitivity for range, so that
+    #: ``low_gain_full_well_e`` electrons in one pixel take it from the dark offset to the top of
+    #: the ADC at any beam energy. The per-electron spread (``adu_cv``), read noise and the maps
+    #: are those of the high-gain mode. For bright beams: an SEM's EBSD current puts several
+    #: electrons in a pixel per frame, which pins a high-gain pixel at 20 kV (~1800 ADU each).
+    gain_mode: str = "high"
+    low_gain_full_well_e: float = 100.0
     aliases: tuple[str, ...] = field(default=(), compare=False)
 
     # ------------------------------------------------------------- derived
@@ -130,9 +137,14 @@ class CameraModel:
         return self.adu_per_electron_at(self.reference_ht_kv)
 
     def adu_per_electron_at(self, ht_kv: float) -> float:
-        """Total ADU per primary electron at ``ht_kv`` (log-log interpolation of the HT table)."""
+        """Total ADU per primary electron at ``ht_kv`` (log-log interpolation of the HT table; in
+        the low-gain mode the ADC range over ``low_gain_full_well_e``)."""
         if self.hardware_counting:
             return 1.0
+        if self.gain_mode == "low":
+            return (self.max_value - self.dark_offset_adu) / max(float(self.low_gain_full_well_e), 1e-9)
+        if self.gain_mode != "high":
+            raise ValueError(f"unknown gain mode {self.gain_mode!r} (high | low)")
         kv = np.array([p[0] for p in self.adu_table])
         adu = np.array([p[1] for p in self.adu_table])
         ht = float(np.clip(ht_kv, 1.0, 1000.0))

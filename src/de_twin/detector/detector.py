@@ -100,6 +100,12 @@ class Detector:
     def __repr__(self) -> str:
         return f"Detector({self.model.name!r}, seed={self.seed}, ht_kv={self.ht_kv})"
 
+    def set_gain_mode(self, mode: str) -> None:
+        """Read out at ``"high"`` or ``"low"`` gain (``CameraModel.gain_mode``) from the next frame."""
+        if mode not in ("high", "low"):
+            raise ValueError(f"unknown gain mode {mode!r} (high | low)")
+        self.model = self.model.with_(gain_mode=mode)
+
     def _adu_at(self, ht: float) -> float:
         """``model.adu_per_electron_at``, remembered for the last energy (a per-frame cost)."""
         hit = getattr(self, "_adu_memo", None)
