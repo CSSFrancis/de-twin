@@ -29,8 +29,9 @@ class DigitalTwin:
     Parameters
     ----------
     specimen
-        A preset/pattern name (see ``de_twin.specimen.PRESETS``/``PATTERNS``),
-        a ``SpecimenConfig`` or a ready ``Specimen``.
+        A preset/pattern name (see ``de_twin.specimen.PRESETS``/``PATTERNS``, and the bulk EBSD
+        specimens ``de_twin.specimen.BULK_PRESETS``), a ``SpecimenConfig``, a
+        ``BulkSurfaceConfig`` or a ready ``Specimen`` / ``BulkSurface``.
     camera
         A camera model name (``de_twin.detector.CAMERAS``) or ``CameraModel``.
     column
@@ -72,7 +73,6 @@ class DigitalTwin:
         from .holder import connect_holder
         from .optics import Calibration, OpticsConfig
         from .render import Renderer
-        from .specimen import Specimen, SpecimenConfig, from_name
 
         self.lock = threading.RLock()
         self._frame_serial = 0  # frames exposed so far; seeds the detector noise
@@ -80,11 +80,7 @@ class DigitalTwin:
         self.seed = int(seed)
         self.flood_for_gain = flood_for_gain
 
-        if isinstance(specimen, str):
-            specimen = Specimen(from_name(specimen))
-        elif isinstance(specimen, SpecimenConfig):
-            specimen = Specimen(specimen)
-        self.specimen = specimen
+        self.specimen = _make_specimen(specimen)
 
         model = camera_by_name(camera) if isinstance(camera, str) else camera
         self.detector = Detector(model, seed=self.seed, **(detector_overrides or {}))
@@ -102,6 +98,9 @@ class DigitalTwin:
         if self.optics_config.realism is not None and column is None:
             self.column.backlash_um = float(self.optics_config.realism.backlash_um)
         self.renderer = Renderer(self.specimen, render_config)
+        #: material id -> user EBSD master patterns (``set_master_pattern``)
+        self._user_masters: dict = {}
+        self.renderer.ebsd_user_masters = self._user_masters
         # Only a column the twin built is its to move: a supplied one may be a mirror of
         # real hardware, whose stage and beam are the operator's.
         self._own_column = column is None
@@ -199,15 +198,12 @@ class DigitalTwin:
         """Swap the specimen (e.g. a new preset) keeping column/holder/detector. With
         *start*, the column is pointed at the new specimen (`start_on_specimen`)."""
         from .render import Renderer
-        from .specimen import Specimen, SpecimenConfig, from_name
 
-        if isinstance(specimen, str):
-            specimen = Specimen(from_name(specimen))
-        elif isinstance(specimen, SpecimenConfig):
-            specimen = Specimen(specimen)
+        specimen = _make_specimen(specimen)
         with self.lock:
             self.specimen = specimen
             self.renderer = Renderer(specimen, getattr(self.renderer, "config", None))
+            self.renderer.ebsd_user_masters = self._user_masters
         if start and getattr(self, "_own_column", False):
             self.start_on_specimen()
 
@@ -254,25 +250,41 @@ class DigitalTwin:
         time_s: Optional[float] = None,
     ) -> Optional[np.ndarray]:
         """Noiseless electrons/pixel/second on the ROI, or None if no beam."""
+        img, _ = self._flux(request, frame_index, scan_point, state=state, optics=optics, time_s=time_s)
+        return img
+
+    def _flux(self, request, frame_index=0, scan_point=None, *, state=None, optics=None, time_s=None,
+              frame_time_s: Optional[float] = None):
+        """``(flux, means)``: ``means`` (the detector's Poisson means, see ``Detector.expose``) when
+        the renderer made them on the way (an EBSD frame with ``frame_time_s``), else None. That
+        flux is a reused buffer, valid until the next frame."""
         with self.lock:
             t = self.clock.now() if time_s is None else time_s
             state = state or self.column.state()
             if not self.beam_on_detector(request, state):
-                return None
+                return None, None
             optics = optics or self.optics(request, state)
             roi = self.detector.roi(request)
             shape = (roi.h, roi.w)
             if self.flood_for_gain and request.exposure_mode in (ExposureMode.GAIN, ExposureMode.VACUUM):
-                return self._flood(optics, shape)
+                return self._flood(optics, shape), None
             self.specimen.update(t, self.holder_state(t))
             if scan_point is None:
                 scan_point = self.scan_point(request, frame_index)
+            if (optics.render_mode == RenderMode.EBSD and frame_time_s is not None and not optics.beam_blanked
+                    and not self.detector.super_resolution(request)):
+                bx, by = (max(1, int(v)) for v in (request.hw_binning or (1, 1)))
+                nb = bx * by if (bx, by) != (1, 1) else 1
+                return self.renderer.render_ebsd_frame(optics, frame_index, scan_point, t,
+                                                       float(frame_time_s) * nb)
             img = self.renderer.render(optics, frame_index=frame_index, scan_point=scan_point, time_s=t)
             if self.renderer.config.prefetch and optics.render_mode == RenderMode.TEM_IMAGING:
                 self._prefetch_next(request, state, t)
+            if optics.render_mode == RenderMode.EBSD and img.shape == self.detector._grid_shape(request):
+                return img, None  # rendered on the binned grid already (per sensor pixel: expose takes it)
             if img.shape != shape:
                 img = _fit(img, shape)
-            return img
+            return img, None
 
     # -------------------------------------------------------------- prefetch
     _VIEW_FIELDS = ("magnification", "defocus_um")
@@ -356,7 +368,8 @@ class DigitalTwin:
                     optics = self.optics(request, state)
             with self.lock:
                 holder_state = self.holder_state(t)
-                flux = self.flux(request, i, state=state, optics=optics, time_s=t)
+                flux, means = self._flux(request, i, state=state, optics=optics, time_s=t,
+                                         frame_time_s=frame_time)
                 blanked = flux is None
                 # Noise is seeded by a twin-wide frame counter, not the index within this
                 # request: repeated acquisitions (live view) must not repeat their noise.
@@ -367,7 +380,7 @@ class DigitalTwin:
                 else:
                     serial, seed = i, int(request.seed)
                 raw, info = self.detector.expose(flux, frame_time, request, serial,
-                                                 ht_kv=state.ht_kv, seed=seed)
+                                                 ht_kv=state.ht_kv, seed=seed, means=means)
             meta = FrameMeta(
                 frame_index=i,
                 time_s=t,
@@ -439,13 +452,113 @@ class DigitalTwin:
     def datacube(self, request: AcquisitionRequest) -> np.ndarray:
         """Noiseless 4D-STEM data for the request's scan: float32 (scan ny, nx, Hd, Wd) at the
         detector's *binned* output shape, electrons per binned pixel per second (multiply by the
-        dwell time for electrons per pattern). The same patterns :meth:`frames` exposes."""
+        dwell time for electrons per pattern). The same patterns :meth:`frames` exposes. In EBSD
+        mode, the EBSD pattern stack (:meth:`ebsd_patterns`)."""
         with self.lock:
             state = self.column.state()
             optics = self.optics(request, state)
             t = self.clock.now()
             self.specimen.update(t, self.holder_state(t))
             return self.renderer.datacube(optics, time_s=t)
+
+    # ------------------------------------------------------------------ EBSD
+    @property
+    def ebsd(self):
+        """The EBSD geometry (:class:`~de_twin.ebsd.EbsdGeometry`) when the twin is an SEM with
+        an EBSD detector, else None."""
+        return getattr(self.optics_config, "ebsd", None)
+
+    def configure_ebsd(self, geometry=None, *, beam_kv: Optional[float] = None, **fields):
+        """Make the twin an SEM with this camera as its EBSD detector, and return the geometry.
+
+        ``geometry``: an :class:`~de_twin.ebsd.EbsdGeometry` (default: the current one, or the
+        defaults: 70 deg sample tilt, Bruker pattern centre (0.5, 0.3, 0.6), 0.1 nA); ``fields``
+        change it (``sample_tilt_deg=70, pcz=0.55, ...``). ``beam_kv`` sets the column's high
+        tension (EBSD is done at 5-30 kV); left out, a twin column outside 5-30 kV is set to
+        20 kV when EBSD is enabled. ``configure_ebsd(enabled=False)`` returns to a TEM (the HT
+        stays where it is).
+        """
+        from .ebsd import EbsdGeometry
+
+        g = geometry if geometry is not None else (self.ebsd or EbsdGeometry())
+        if fields:
+            g = g.replace(**fields)
+        with self.lock:
+            self.optics_config.ebsd = g
+            if (beam_kv is None and g.enabled and getattr(self, "_own_column", False)
+                    and not 5.0 <= float(self.column.state().ht_kv) <= 30.0):
+                beam_kv = 20.0
+            if beam_kv is not None:
+                if not getattr(self, "_own_column", False):
+                    raise ValueError("beam_kv sets the twin's own column's HT; a supplied column's is "
+                                     "the operator's")
+                # Choosing the SEM's energy builds the instrument; the column's operator guard
+                # on HT (allow_ht) is for remote control, so go round it here.
+                self.column._set_local("HighTension", float(beam_kv) * 1000.0)
+        return g
+
+    def set_master_pattern(self, phase, source, *, energy_kv: Optional[float] = None, kv: Optional[float] = None,
+                           projection: Optional[str] = None, hemisphere: Optional[str] = None, energies=None,
+                           weights=None, centrosymmetric: Optional[bool] = None, validate: bool = True):
+        """Use your own EBSD master pattern for ``phase`` instead of the kinematic one, and return
+        it (a :class:`~de_twin.ebsd.MasterPattern`; ``nbytes``, ``symmetry_error``).
+
+        ``phase``: a material id or name (``"Nickel"``). ``source``: an EMsoft ``EMEBSDmaster``
+        HDF5 file, a kikuchipy ``EBSDMasterPattern`` saved to HDF5, or a NumPy array — (n, n),
+        (2, n, n) north/south, (nE, n, n) with ``energies``, (2, nE, n, n) — with ``projection``
+        ("lambert" | "stereographic") and ``hemisphere`` ("north" | "south" | "both").
+        ``energy_kv`` picks (interpolates) an energy bin; by default the Monte-Carlo
+        energy-weighted sum when the file has one, else the highest energy. ``kv``: the beam energy
+        it is used at (default the selected / highest energy, else the column's HT; it is used
+        within 0.5 kV of it). It is resampled and quantised to ``EbsdGeometry.master_resolution_deg``
+        (a few MB) and validated against the phase's point group (see :mod:`de_twin.ebsd.io`).
+        """
+        from .ebsd import EbsdGeometry
+        from .ebsd.io import load_master_pattern
+
+        mid = _material_id(phase)
+        g = self.ebsd or EbsdGeometry()
+        if kv is None and energy_kv is None and energies is None and not isinstance(source, (str, bytes)) \
+                and not hasattr(source, "__fspath__"):
+            kv = float(self.column.state().ht_kv)
+        mp = load_master_pattern(source, mid, resolution_deg=g.master_resolution_deg, energy_kv=energy_kv, kv=kv,
+                                 projection=projection, hemisphere=hemisphere, energies=energies,
+                                 weights=weights, centrosymmetric=centrosymmetric, validate=validate)
+        with self.lock:
+            lst = [m for m in self._user_masters.get(mid, []) if abs(m.kv - mp.kv) > 1e-6]
+            self._user_masters[mid] = lst + [mp]
+        return mp
+
+    def clear_master_patterns(self, phase=None) -> None:
+        """Back to kinematic master patterns (for ``phase``, or all)."""
+        with self.lock:
+            if phase is None:
+                self._user_masters.clear()
+            else:
+                self._user_masters.pop(_material_id(phase), None)
+
+    def master_patterns(self) -> list:
+        """The user master patterns in use: dicts of phase, kv, source, bytes, hemispheres,
+        symmetry error."""
+        from .specimen.materials import material
+
+        return [{"phase": material(mid).name, "material_id": mid, "kv": m.kv, "source": m.source,
+                 "nbytes": m.nbytes, "hemispheres": 1 if m.south is None else 2,
+                 "symmetry_error": getattr(m, "symmetry_error", float("nan"))}
+                for mid, lst in sorted(self._user_masters.items()) for m in lst]
+
+    def ebsd_patterns(self, request: AcquisitionRequest, *, out=None, dtype=np.float32) -> np.ndarray:
+        """Noiseless EBSD patterns of the request's scan: (scan ny, nx, h, w) at the detector's
+        *binned* output shape, electrons per binned pixel per second (x the dwell time for
+        electrons per pattern): the same patterns :meth:`frames` exposes. ``out``: a
+        preallocated (e.g. ``np.memmap``) array to fill instead of allocating
+        ``ny * nx * h * w * itemsize`` bytes."""
+        with self.lock:
+            state = self.column.state()
+            optics = self.optics(request, state)
+            t = self.clock.now()
+            self.specimen.update(t, self.holder_state(t))
+            return self.renderer.ebsd_patterns(optics, time_s=t, out=out, dtype=dtype)
 
     def stem_model(self, request: AcquisitionRequest) -> str:
         """"coherent" or "kinematic": the STEM model the renderer uses for this request."""
@@ -528,7 +641,13 @@ class DigitalTwin:
         pixel of a TEM view, for scoring orientation maps (e.g. pyxem against
         ``CrystalLibrary.template_library``). An orix ``CrystalMap`` (phase id = material id,
         ``-1`` = not indexed: vacuum/amorphous; props ``grain_id``, ``thickness_nm``; x/y in nm),
-        or the raw arrays with ``as_arrays=True``."""
+        or the raw arrays with ``as_arrays=True``.
+
+        In EBSD mode, per scan point: phase, grain id, the orientation in the *sample* frame
+        (x_s scan x, y_s scan y, z_s into the sample; orix convention, see
+        :mod:`de_twin.ebsd.geometry`), the Bruker pattern centre and a band-contrast proxy
+        (CrystalMap props ``grain_id``, ``band_contrast``, ``quality``, ``mix``, ``pcx``,
+        ``pcy``, ``pcz``; x/y in µm)."""
         with self.lock:
             state = self.column.state()
             optics = self.optics(request or self.request(), state)
@@ -542,6 +661,20 @@ class DigitalTwin:
 
         from .crystal import phase_for
 
+        if "pattern_centre" in gt:  # EBSD: sample-frame orientations per scan point
+            gid, mat = gt["grain_id"].ravel(), gt["material_id"].ravel()
+            ids = [int(i) for i in np.unique(mat[gid >= 0])]
+            ny, nx = gt["grain_id"].shape
+            step = gt["view"].pixel_um
+            y, x = np.mgrid[0:ny, 0:nx] * step
+            pc = gt["pattern_centre"].reshape(-1, 3)
+            return CrystalMap(Rotation(gt["quaternion"].reshape(-1, 4)),
+                              np.where(gid >= 0, mat.astype(int), -1),
+                              x=x.ravel(), y=y.ravel(),
+                              phase_list=PhaseList([phase_for(i) for i in ids], ids=ids) if ids else None,
+                              prop={"grain_id": gid, "band_contrast": gt["band_contrast"].ravel(),
+                                    "quality": gt["quality"].ravel(), "mix": gt["mix"].ravel(),
+                                    "pcx": pc[:, 0], "pcy": pc[:, 1], "pcz": pc[:, 2]}, scan_unit="um")
         gid, mat = gt["grain_id"].ravel(), gt["material_id"].ravel()
         ids = [int(i) for i in np.unique(mat[gid >= 0])]
         ny, nx = gt["grain_id"].shape
@@ -565,6 +698,34 @@ class DigitalTwin:
                     close()
                 except Exception:  # pragma: no cover - best effort
                     pass
+
+
+def _material_id(phase) -> int:
+    """A material id from an id or a (case-insensitive) material name."""
+    from .specimen.materials import MATERIALS
+
+    if isinstance(phase, str):
+        key = phase.strip().lower()
+        for m in MATERIALS:
+            if m.name.lower() == key:
+                return int(m.id)
+        raise KeyError(f"unknown material {phase!r}")
+    return int(phase)
+
+
+def _make_specimen(specimen):
+    """A specimen from a preset name, a config or a ready specimen."""
+    from .specimen import Specimen, SpecimenConfig, from_name
+    from .specimen.bulk import BulkSurface, BulkSurfaceConfig, bulk_from_name
+
+    if isinstance(specimen, str):
+        bulk = bulk_from_name(specimen)
+        return BulkSurface(bulk) if bulk is not None else Specimen(from_name(specimen))
+    if isinstance(specimen, BulkSurfaceConfig):
+        return BulkSurface(specimen)
+    if isinstance(specimen, SpecimenConfig):
+        return Specimen(specimen)
+    return specimen
 
 
 def _fit(img: np.ndarray, shape: tuple[int, int]) -> np.ndarray:

@@ -100,6 +100,13 @@ class Detector:
     def __repr__(self) -> str:
         return f"Detector({self.model.name!r}, seed={self.seed}, ht_kv={self.ht_kv})"
 
+    def _adu_at(self, ht: float) -> float:
+        """``model.adu_per_electron_at``, remembered for the last energy (a per-frame cost)."""
+        hit = getattr(self, "_adu_memo", None)
+        if hit is None or hit[0] != (self.model, ht):
+            hit = self._adu_memo = ((self.model, ht), float(self.model.adu_per_electron_at(ht)))
+        return hit[1]
+
     # ------------------------------------------------------------ geometry
     def roi(self, request: Optional[AcquisitionRequest] = None) -> Roi:
         """Resolved hardware ROI: the requested ROI clamped to the sensor (0 size = full).
@@ -254,7 +261,7 @@ class Detector:
     # --------------------------------------------------------------- expose
     def expose(self, flux, exposure_s: float, request: Optional[AcquisitionRequest] = None,
                frame_index: int = 0, *, ht_kv: Optional[float] = None,
-               seed: Optional[int] = None) -> tuple[np.ndarray, dict]:
+               seed: Optional[int] = None, means=None) -> tuple[np.ndarray, dict]:
         """Simulate one raw frame.
 
         ``flux``: electrons / sensor pixel / second, a float array of the ROI
@@ -265,6 +272,11 @@ class Detector:
         ``dose_e_per_px`` (mean electrons per sensor pixel), ``saturated``,
         ``saturated_pixels``, ``blanked`` and the resolved geometry.
         ``seed`` replaces the detector's own for this frame's noise (a pinned acquisition).
+        ``means``: ``(lam, p0, dose, t_nb[, row_totals])``, the exposure's Poisson means already
+        made by the renderer (``lam = flux * t_nb`` per grid pixel, ``p0 = exp(-lam)``, their sum,
+        the ``t_nb`` they were made for and optionally each row's sum), as ``detector.fast.prepare``
+        would make them; used by the fused integrating path when they match this frame (else
+        ignored). The row totals are what an electron-by-electron (sparse) path needs.
         """
         self._build_maps()
         m = self.model
@@ -321,10 +333,14 @@ class Detector:
         scale = 2.0 ** (min(bd, m.bit_depth) - m.bit_depth) if bd else 1.0
         vmax = float(min(m.max_value, (1 << bd) - 1) if bd else m.max_value)
 
-        ctx = _Ctx(model=m, seed=self.seed if seed is None else int(seed), frame_index=int(frame_index), t=t, flux=flux,
+        if means is not None and (flux is None or tuple(np.shape(means[0])) != tuple(flux.shape)
+                                  or abs(float(means[3]) - t * nb) > 1e-9 * max(t * nb, 1e-30)):
+            means = None  # made for another grid or exposure
+        ctx = _Ctx(model=m, seed=self.seed if seed is None else int(seed), frame_index=int(frame_index), t=t,
+                   flux=flux, means=means,
                    nb=nb, gain=gain, off=off, gbx=gbx, gby=gby, out=out, vmax=vmax, scale=scale,
                    hy=hy, hx=hx, hrate=hrate, S=None,
-                   adu=m.adu_per_electron_at(ht),
+                   adu=self._adu_at(ht),
                    a=m.charge_spread_at(ht) / (bx if direct else 1))
 
         with self._lock:
@@ -376,7 +392,10 @@ class Detector:
             if self._S is None or self._S.shape != (gh, gw):
                 self._S = np.empty((gh, gw), np.float32)
             k = 1.0 / max(m.adu_cv, 1e-3) ** 2
-            lam, p0, dose = self._exposure_means(ctx.flux, float(ctx.t * ctx.nb))
+            if getattr(ctx, "means", None) is not None:
+                lam, p0, dose = ctx.means[0], ctx.means[1], float(ctx.means[2])
+            else:
+                lam, p0, dose = self._exposure_means(ctx.flux, float(ctx.t * ctx.nb))
             lut = getattr(self, "_gamma_lut", None)
             if lut is None or lut[0] != k:
                 lut = self._gamma_lut = (k, fast.gamma_lut(k))
