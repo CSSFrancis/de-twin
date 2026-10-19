@@ -355,6 +355,10 @@ class DigitalTwin:
         state = self.column.state()
         optics = self.optics(request, state)
         frozen = optics.render_mode != RenderMode.TEM_IMAGING
+        source = self.ebsd_frame_source(request, state=state, optics=optics)
+        if source is not None:
+            yield from self._fused_frames(request, source, state, optics, pace=pace, stop=stop)
+            return
         t_start = self.clock.now()
         i = 0
         while request.total_frames <= 0 or i < request.total_frames:
@@ -396,6 +400,113 @@ class DigitalTwin:
                 self.clock.sleep_until(t_start + (i + 1) * frame_time)
             yield raw, meta
             i += 1
+
+    def noise_serial(self, request: AcquisitionRequest, index: int) -> tuple[int, int]:
+        """``(serial, seed)`` of frame *index* of *request*: the twin-wide frame count (taking the
+        next one) and the detector's seed, or (index, request.seed) for a pinned acquisition."""
+        if request.seed is not None:
+            return int(index), int(request.seed)
+        with self.lock:
+            serial = self._frame_serial
+            self._frame_serial += 1
+        return serial, self.detector.seed
+
+    def ebsd_frame_source(self, request: AcquisitionRequest, *, state: Optional[MicroscopeState] = None,
+                          optics=None):
+        """An :class:`~de_twin.ebsd.framesource.EbsdFrameSource` making *request*'s EBSD camera
+        frames in one fused CPU pass each, at the column's current state (or *state*,
+        *optics*); None when its frames are not that path (not an EBSD camera frame, the beam
+        off the detector, a counting camera, supersampled binning...): :meth:`frames` then
+        takes the general path. ``DE_TWIN_FUSED_EBSD=0`` turns it off."""
+        import os
+
+        from .ebsd import framesource
+
+        if os.environ.get("DE_TWIN_FUSED_EBSD") == "0":
+            return None
+        with self.lock:
+            state = state or self.column.state()
+            optics = optics or self.optics(request, state)
+            if optics.render_mode != RenderMode.EBSD or optics.beam_blanked or not framesource.usable(optics):
+                return None
+            if not self.beam_on_detector(request, state) or self.detector.super_resolution(request):
+                return None
+            if self.flood_for_gain and request.exposure_mode in (ExposureMode.GAIN, ExposureMode.VACUUM):
+                return None
+            exposure = self.detector.grid_exposure(max(float(request.frame_time_s), 1e-6), request,
+                                                   ht_kv=state.ht_kv)
+            if exposure is None:
+                return None
+            grid = self.renderer.ebsd.grid(optics)
+            if tuple(grid[:2]) != tuple(exposure.shape):
+                return None
+            t = self.clock.now()
+            self.specimen.update(t, self.holder_state(t))
+            plan = self.renderer.ebsd_plan(optics, t)
+        return framesource.EbsdFrameSource(plan, grid, exposure)
+
+    #: Frames made ahead of the consumer, per worker thread.
+    FRAMES_AHEAD_PER_WORKER = 2
+
+    def _fused_frames(self, request, source, state, optics, *, pace, stop):
+        """:meth:`frames` through an `EbsdFrameSource`: frames are jobs for the worker threads,
+        submitted ahead of the consumer, each into a frame buffer of a ring. A buffer is used
+        again only when the consumer let go of the frame it held (a consumer that keeps frames
+        gets new buffers)."""
+        import sys
+        from collections import deque
+
+        from .workers import pool
+
+        workers = pool()
+        frame_time = max(float(request.frame_time_s), 1e-6)
+        h, w = source.shape
+        total = request.total_frames
+        # points a running acquisition may still change (a steered list) are made one at a time
+        ahead = workers.threads * self.FRAMES_AHEAD_PER_WORKER
+        if request.scan.points is not None and not isinstance(request.scan.points, (list, tuple, np.ndarray)):
+            ahead = 1
+        ring = [None] * ahead
+        pending: deque = deque()  # (index, slot, batch)
+        t_start = self.clock.now()
+        i = nxt = 0
+        try:
+            while total <= 0 or i < total:
+                if stop is not None and stop.is_set():
+                    return
+                while nxt - i < ahead and (total <= 0 or nxt < total):
+                    slot = nxt % ahead
+                    buf = ring[slot]
+                    if buf is None or sys.getrefcount(buf) > 3:  # held elsewhere than ring, buf and the call
+                        buf = ring[slot] = np.empty((h, w), np.uint16)
+                    k = self.renderer.ebsd_flat_point(optics, self.scan_point(request, nxt), nxt)
+                    serial, seed = self.noise_serial(request, nxt)
+                    pending.append((nxt, slot, source.submit(workers, [buf], [k], seed, [serial])))
+                    nxt += 1
+                index, slot, batch = pending.popleft()
+                (electrons, _), = batch.wait()
+                t = self.clock.now()
+                meta = FrameMeta(
+                    frame_index=i,
+                    time_s=t,
+                    exposure_s=frame_time,
+                    electrons_per_pixel=electrons / source.sensor_pixels,
+                    render_mode=optics.render_mode,
+                    blanked=False,
+                    scan_point=self.scan_point(request, i),
+                    microscope=state,
+                    holder=self.holder_state(t),
+                )
+                if pace:
+                    self.clock.sleep_until(t_start + (i + 1) * frame_time)
+                raw = ring[slot]
+                yield raw, meta
+                del raw
+                i += 1
+        finally:
+            for _, _, batch in pending:  # let the jobs finish before their buffers go
+                batch.wait()
+            self.renderer.ebsd.patterns_rendered += nxt
 
     def reset_serial(self) -> None:
         """Restart the running frame count that seeds the detector noise, so the next

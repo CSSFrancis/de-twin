@@ -644,6 +644,17 @@ class Renderer:
             ix, iy = resolve_scan_point(optics, scan_point, frame_index, self.specimen, self.config)
             return self.ebsd.render_frame(self.specimen, optics, ix, iy, t_nb, *self._ebsd_source(optics, time_s))
 
+    def ebsd_plan(self, optics, time_s: float):
+        """The EBSD scan's per-point plan (``EbsdRenderer.plan``) at the current specimen."""
+        with self._lock:
+            return self.ebsd.plan(self.specimen, optics, *self._ebsd_source(optics, time_s))
+
+    def ebsd_flat_point(self, optics, scan_point, frame_index: int) -> int:
+        """The flat scan point (``iy * nx + ix``) :meth:`render_ebsd_frame` renders for this
+        frame."""
+        ix, iy = resolve_scan_point(optics, scan_point, frame_index, self.specimen, self.config)
+        return iy * optics.view.shape[1] + ix
+
     def _ebsd_source(self, optics, time_s: float) -> tuple:
         """(field map, grain table) for an EBSD scan of a specimen that has no ``sample``
         (a TEM specimen read through its field map); (None, None) for a bulk surface."""

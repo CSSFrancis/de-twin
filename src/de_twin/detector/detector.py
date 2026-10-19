@@ -384,6 +384,54 @@ class Detector:
         }
         return out, info
 
+    def grid_exposure(self, exposure_s: float, request: Optional[AcquisitionRequest] = None, *,
+                      ht_kv: Optional[float] = None) -> Optional["GridExposure"]:
+        """What :meth:`expose` works out for an integrating frame whose flux (or Poisson means)
+        is given on the output grid, independent of the flux: the maps, the noise parameters
+        and the clip. A fused frame kernel (``de_twin.ebsd.frames``) makes the same frames from
+        it. None where :meth:`expose` would take another path (a counting camera,
+        super-resolution, the numpy reference detector, not 16-bit)."""
+        from . import fast
+
+        m = self.model
+        request = request if request is not None else AcquisitionRequest(camera_model=m.name)
+        if m.hardware_counting or self.super_resolution(request) or not _fast_detector(m) \
+                or np.dtype(m.dtype) != np.uint16:
+            return None
+        self._build_maps()
+        ht = float(ht_kv if ht_kv is not None else self.ht_kv)
+        t = max(0.0, float(exposure_s))
+        r = self.roi(request)
+        bx, by = _binning(request)
+        bd = request.bit_depth
+        key = (m, self.seed, r.x, r.y, r.w, r.h, bx, by, t, bd, ht)
+        held = getattr(self, "_grid_exposure", None)
+        if held is not None and held.key == key:
+            return held
+        oh, ow = self._grid_shape(request)
+        gain, off = self._binned_maps(r, bx, by)
+        nb = bx * by
+        scale = 2.0 ** (min(bd, m.bit_depth) - m.bit_depth) if bd else 1.0
+        vmax = float(min(m.max_value, (1 << bd) - 1) if bd else m.max_value)
+        hm = ((self._hot_y >= r.y) & (self._hot_y < r.y + oh * by)
+              & (self._hot_x >= r.x) & (self._hot_x < r.x + ow * bx))
+        hot = np.zeros((oh, ow), np.float32)  # as _hot_grid makes it
+        if hm.any():
+            np.add.at(hot, ((self._hot_y[hm] - r.y) // by, (self._hot_x[hm] - r.x) // bx),
+                      self._hot_rate[hm] / np.float32(nb) * np.float32(t * scale))
+        rows, cols = np.nonzero(hot)
+        hot_ptr = np.zeros(oh + 1, np.int64)
+        np.add.at(hot_ptr, rows + 1, 1)
+        self._grid_exposure = GridExposure(
+            key=key, shape=(oh, ow),
+            gain=np.ascontiguousarray(gain, np.float32).ravel(),
+            offset=(np.asarray(off, np.float32) + np.float32(m.dark_current_adu_per_s * t)).ravel(),
+            hot_ptr=np.cumsum(hot_ptr), hot_col=cols.astype(np.int64), hot_val=hot[rows, cols],
+            adu=self._adu_at(ht), k=1.0 / max(m.adu_cv, 1e-3) ** 2, a=float(m.charge_spread_at(ht) / bx),
+            inv_nb=1.0 / nb, sigma=float(m.read_noise_adu / math.sqrt(nb)) if m.read_noise_adu > 0 else 0.0,
+            scale=float(scale), vmax=vmax, t_nb=t * nb, seed=self.seed, table=fast.normal_table())
+        return self._grid_exposure
+
     def _expose_fast(self, ctx: "_Ctx", gh: int, gw: int) -> tuple[float, int]:
         """One integrating frame through the fused numba kernels (`detector.fast`).
         Returns ``(dose, saturated pixels)`` like the band workers do."""
@@ -531,6 +579,29 @@ class Detector:
                 self._binned_cache.clear()
             self._binned_cache[key] = hit
         return hit
+
+
+@dataclasses.dataclass(eq=False)
+class GridExposure:
+    """:meth:`Detector.grid_exposure`: one exposure's detector, on the output grid."""
+
+    key: tuple
+    shape: tuple  # (h, w) of the grid
+    gain: np.ndarray  # flat float32, mean 1 (binned)
+    offset: np.ndarray  # flat float32: dark offset + dark current of the exposure, ADU
+    hot_ptr: np.ndarray  # hot pixels by grid row (CSR): row r's are hot_ptr[r] .. hot_ptr[r + 1]
+    hot_col: np.ndarray
+    hot_val: np.ndarray  # their dark current in the frame, ADU (x the bit-depth scale)
+    adu: float  # ADU per electron
+    k: float  # the deposit's gamma shape per electron, 1 / cv^2
+    a: float  # charge sharing on the grid
+    inv_nb: float  # 1 / sensor pixels per grid pixel
+    sigma: float  # read noise per grid pixel, ADU
+    scale: float  # bit-depth scale
+    vmax: float  # clip
+    t_nb: float  # exposure x sensor pixels per grid pixel: Poisson mean = flux x t_nb
+    seed: int  # the detector's noise seed
+    table: np.ndarray  # detector.fast.normal_table()
 
 
 class _Ctx:
