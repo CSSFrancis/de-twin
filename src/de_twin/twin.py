@@ -445,14 +445,15 @@ class DigitalTwin:
             plan = self.renderer.ebsd_plan(optics, t)
         return framesource.EbsdFrameSource(plan, grid, exposure)
 
-    #: Frames made ahead of the consumer, per worker thread.
-    FRAMES_AHEAD_PER_WORKER = 2
+    #: Frames a worker makes per job: the interpreter is taken once a job (to start it and to
+    #: hand it back), and a busy consumer holds it, so a job of several frames waits less.
+    FRAMES_PER_JOB = 4
 
     def _fused_frames(self, request, source, state, optics, *, pace, stop):
-        """:meth:`frames` through an `EbsdFrameSource`: frames are jobs for the worker threads,
-        submitted ahead of the consumer, each into a frame buffer of a ring. A buffer is used
-        again only when the consumer let go of the frame it held (a consumer that keeps frames
-        gets new buffers)."""
+        """:meth:`frames` through an `EbsdFrameSource`: frames are jobs for the worker threads
+        (:mod:`de_twin.workers`), a few frames each, submitted ahead of the consumer into a
+        ring of frame buffers. A buffer is used again only once the consumer has let go of
+        every frame it held in it (a consumer that keeps frames gets new buffers)."""
         import sys
         from collections import deque
 
@@ -462,50 +463,65 @@ class DigitalTwin:
         frame_time = max(float(request.frame_time_s), 1e-6)
         h, w = source.shape
         total = request.total_frames
+        per_job = self.FRAMES_PER_JOB
+        jobs_ahead = workers.threads + workers.threads // 2
         # points a running acquisition may still change (a steered list) are made one at a time
-        ahead = workers.threads * self.FRAMES_AHEAD_PER_WORKER
         if request.scan.points is not None and not isinstance(request.scan.points, (list, tuple, np.ndarray)):
-            ahead = 1
-        ring = [None] * ahead
-        pending: deque = deque()  # (index, slot, batch)
+            per_job, jobs_ahead = 1, 1
+        # more buffers than jobs in flight: the one a job takes was filled a few jobs ago, not
+        # the one whose frame the consumer still holds while it asks for the next
+        ring = [None] * (jobs_ahead + 2)
+        pending: deque = deque()  # (first frame, frames, slot, batch)
         t_start = self.clock.now()
         i = nxt = 0
+        n_jobs = 0
         try:
             while total <= 0 or i < total:
                 if stop is not None and stop.is_set():
                     return
-                while nxt - i < ahead and (total <= 0 or nxt < total):
-                    slot = nxt % ahead
+                while len(pending) < jobs_ahead and (total <= 0 or nxt < total):
+                    count = per_job if total <= 0 else min(per_job, total - nxt)
+                    slot = n_jobs % len(ring)
                     buf = ring[slot]
                     if buf is None or sys.getrefcount(buf) > 3:  # held elsewhere than ring, buf and the call
-                        buf = ring[slot] = np.empty((h, w), np.uint16)
-                    k = self.renderer.ebsd_flat_point(optics, self.scan_point(request, nxt), nxt)
-                    serial, seed = self.noise_serial(request, nxt)
-                    pending.append((nxt, slot, source.submit(workers, [buf], [k], seed, [serial])))
-                    nxt += 1
-                index, slot, batch = pending.popleft()
+                        buf = ring[slot] = np.empty((per_job, h, w), np.uint16)
+                    ks, serials, seed = [], [], 0
+                    for j in range(nxt, nxt + count):
+                        ks.append(self.renderer.ebsd_flat_point(optics, self.scan_point(request, j), j))
+                        serial, seed = self.noise_serial(request, j)
+                        serials.append(serial)
+                    pending.append((nxt, count, slot, source.submit(workers, buf, ks, seed, serials)))
+                    nxt += count
+                    n_jobs += 1
+                first, count, slot, batch = pending.popleft()
                 (electrons, _), = batch.wait()
-                t = self.clock.now()
-                meta = FrameMeta(
-                    frame_index=i,
-                    time_s=t,
-                    exposure_s=frame_time,
-                    electrons_per_pixel=electrons / source.sensor_pixels,
-                    render_mode=optics.render_mode,
-                    blanked=False,
-                    scan_point=self.scan_point(request, i),
-                    microscope=state,
-                    holder=self.holder_state(t),
-                )
-                if pace:
-                    self.clock.sleep_until(t_start + (i + 1) * frame_time)
-                raw = ring[slot]
-                yield raw, meta
-                del raw
-                i += 1
+                chunk = ring[slot]
+                for b in range(count):
+                    if stop is not None and stop.is_set():
+                        return
+                    t = self.clock.now()
+                    meta = FrameMeta(
+                        frame_index=i,
+                        time_s=t,
+                        exposure_s=frame_time,
+                        electrons_per_pixel=float(electrons[b]) / source.sensor_pixels,
+                        render_mode=optics.render_mode,
+                        blanked=False,
+                        scan_point=self.scan_point(request, i),
+                        microscope=state,
+                        holder=self.holder_state(t),
+                    )
+                    if pace:
+                        self.clock.sleep_until(t_start + (i + 1) * frame_time)
+                    yield chunk[b], meta
+                    i += 1
+                del chunk
         finally:
-            for _, _, batch in pending:  # let the jobs finish before their buffers go
-                batch.wait()
+            # let the jobs finish with their buffers; not at interpreter exit, when the worker
+            # threads have stopped and a generator left open is closed by the collector
+            if not sys.is_finalizing():
+                for _, _, _, batch in pending:
+                    batch.wait_done(10.0)
             self.renderer.ebsd.patterns_rendered += nxt
 
     def reset_serial(self) -> None:

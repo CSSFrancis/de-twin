@@ -1,14 +1,16 @@
 """A pool of CPU worker threads, one per logical processor, for frame-parallel numba kernels.
 
-numba's own threads split one call's loop between them, so they wait for the slowest at the
-end of every call, and Windows leaves them wherever it likes: on this kind of kernel (a whole
-camera frame per task, memory-bound in places) two of them often share a core while another
-core idles. Here each thread is pinned to its own logical processor and takes the next job
-as soon as it finishes one, and the caller submits jobs ahead (a frame each) without waiting.
+numba's own threads split one call's loop between them, so every call waits for the slowest
+of them, and the next call cannot start until it does. Here each thread takes the next job (a
+few camera frames) as soon as it finishes one, and the caller submits jobs ahead without
+waiting, so no core idles at the end of a batch.
 
 The threads run below normal priority: the twin feeds a consumer (DE-Server reading frames
 out of shared memory), and a consumer that cannot get a core is a camera that drops frames.
-``DE_TWIN_FRAME_THREADS`` sets their number (default: every logical processor).
+They are not pinned to processors: pinned, at that priority, they stall for milliseconds at a
+time on this kind of machine (two sockets, 48 logical processors; measured: 1,500-6,900
+frames/s pinned against a steady ~7,400 not). ``DE_TWIN_FRAME_THREADS`` sets their number
+(default: every logical processor).
 """
 
 from __future__ import annotations
@@ -30,26 +32,18 @@ def default_threads() -> int:
     return max(1, n or os.cpu_count() or 1)
 
 
-def _pin_and_lower(cpu: Optional[int]) -> None:
-    """Pin the calling thread to logical processor *cpu* (None: leave it) and lower its
-    priority. Best effort: a refusal leaves the thread as it was."""
+def _lower_priority() -> None:
+    """Lower the calling thread's priority. Best effort: a refusal leaves it as it was."""
     try:
         if _WINDOWS:
             import ctypes
 
             k32 = ctypes.WinDLL("kernel32", use_last_error=True)
             k32.GetCurrentThread.restype = ctypes.c_void_p
-            k32.SetThreadAffinityMask.restype = ctypes.c_size_t
-            k32.SetThreadAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
             k32.SetThreadPriority.argtypes = [ctypes.c_void_p, ctypes.c_int]
-            me = k32.GetCurrentThread()
-            if cpu is not None and cpu < 64:  # one processor group
-                k32.SetThreadAffinityMask(me, 1 << cpu)
-            k32.SetThreadPriority(me, -1)  # THREAD_PRIORITY_BELOW_NORMAL
-        elif cpu is not None and hasattr(os, "sched_setaffinity"):
-            os.sched_setaffinity(0, {cpu})  # Linux: the calling thread
-    except Exception:  # noqa: BLE001 - pinning is an optimisation only
-        log.debug("could not pin a worker thread", exc_info=True)
+            k32.SetThreadPriority(k32.GetCurrentThread(), -1)  # THREAD_PRIORITY_BELOW_NORMAL
+    except Exception:  # noqa: BLE001 - priority is a courtesy only
+        log.debug("could not lower a worker thread's priority", exc_info=True)
 
 
 class Batch:
@@ -89,24 +83,27 @@ class Batch:
 
 
 class Workers:
-    """*threads* pinned worker threads (default :func:`default_threads`). A job is
+    """*threads* worker threads (default :func:`default_threads`). A job is
     ``fn(local, *args)``, where ``local`` is a dict private to the worker running it (for its
     scratch buffers)."""
 
-    def __init__(self, threads: Optional[int] = None, *, pin: bool = True):
+    #: The interpreter's switch interval while a pool runs. A worker needs the interpreter to
+    #: start a job and to hand it back; at the default 5 ms it waits that long whenever the
+    #: thread consuming the frames is busy in Python, which is a large share of a ~13 ms job.
+    SWITCH_INTERVAL_S = 0.0005
+
+    def __init__(self, threads: Optional[int] = None):
         self.threads = int(threads or default_threads())
+        if sys.getswitchinterval() > self.SWITCH_INTERVAL_S:
+            sys.setswitchinterval(self.SWITCH_INTERVAL_S)
         self._jobs: "queue.SimpleQueue" = queue.SimpleQueue()
-        cpus = os.cpu_count() or self.threads
-        self._threads = [
-            threading.Thread(target=self._run, args=(i % cpus if pin else None,),
-                             name=f"de-twin-frames-{i}", daemon=True)
-            for i in range(self.threads)
-        ]
+        self._threads = [threading.Thread(target=self._run, name=f"de-twin-frames-{i}", daemon=True)
+                         for i in range(self.threads)]
         for t in self._threads:
             t.start()
 
-    def _run(self, cpu: Optional[int]) -> None:
-        _pin_and_lower(cpu)
+    def _run(self) -> None:
+        _lower_priority()
         local: dict = {}
         while True:
             item = self._jobs.get()

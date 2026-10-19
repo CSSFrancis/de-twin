@@ -104,9 +104,8 @@ def _exp(x, bits, scale, n):
         t = x[i]
         k = np.floor(t * log2e + half)
         r = (t - k * hi) - k * lo
-        p = F32(_EXP_C[0])
-        for c in _EXP_C[1:]:
-            p = p * r + F32(c)
+        p = ((((((F32(_EXP_C[0]) * r + F32(_EXP_C[1])) * r + F32(_EXP_C[2])) * r + F32(_EXP_C[3])) * r
+                + F32(_EXP_C[4])) * r + F32(_EXP_C[5])) * r + F32(_EXP_C[6])) * r + F32(_EXP_C[7])
         x[i] = p
         bits[i] = (np.int32(k) + np.int32(127)) << np.int32(23)
     for i in range(n):
@@ -458,11 +457,15 @@ def _band(b, r0, r1, d32, dui, bank, bank_n, face0, full, offs, scales, mats, o1
           h, gain, offb, hot_ptr, hot_col, hot_val, adu, k, a, inv_nb, sigma, scale, vmax, table,
           ks, keys, zstarts, nstarts, out, offsets):
     """Rows r0 .. r1 of frame b (see :func:`raw_frames`), in the scratch ``d32``, ``dui``.
-    Returns (electrons, clipped pixels)."""
+    Returns (electrons, clipped pixels).
+
+    The rows' projection, deposit and analogue stage are written out here rather than called:
+    a call with this many arrays costs as much as one of the row's loops."""
     w = gain.shape[0] // h
     na = (w - 1) // LOBE_STEP + 2
     W = d32.shape[0] // _ROWS32  # scratch row length (>= w)
-    iota = d32[0:w]
+    iota = d32[0:W]  # (W >= w and >= the lobe's anchors)
+    iw = d32[0:w]
     ex = d32[W:W + w]
     bgf = d32[2 * W:2 * W + w]
     val = d32[3 * W:3 * W + w]
@@ -470,12 +473,12 @@ def _band(b, r0, r1, d32, dui, bank, bank_n, face0, full, offs, scales, mats, o1
     tx = d32[5 * W:5 * W + w]
     ty = d32[6 * W:6 * W + w]
     lam = d32[7 * W:7 * W + w]
-    v = d32[8 * W:8 * W + w]
+    vrow = d32[8 * W:8 * W + w]
     S3 = d32[9 * W:12 * W]
-    u = d32[12 * W:13 * W]
-    p = d32[13 * W:14 * W]
-    f = d32[14 * W:15 * W]
-    cnt = d32[15 * W:16 * W]
+    lu = d32[12 * W:13 * W]
+    lp = d32[13 * W:14 * W]
+    lf = d32[14 * W:15 * W]
+    lcnt = d32[15 * W:16 * W]
     ln = d32[16 * W:17 * W]
     lob = d32[17 * W:17 * W + na]
     Ls = d32[18 * W:19 * W]
@@ -483,37 +486,218 @@ def _band(b, r0, r1, d32, dui, bank, bank_n, face0, full, offs, scales, mats, o1
     lane = dui[W:2 * W]
     bits = dui[2 * W:3 * W].view(np.int32)
     bitsf = dui[2 * W:3 * W].view(np.float32)
-    for j in range(w):
+    for j in range(W):
         iota[j] = F32(j)
     M1 = np.zeros((3, 3))
     M2 = np.zeros((3, 3))
     w2, x0, y0, dd, c, e, p1, p2, g1 = _point(ks[b], mats, o1, o2, ph1, ph2, mix, contrast, es, finv, has_f,
                                               dx, dy, pc_lin, s2dT, M1, M2)
+    one = F32(1.0)
+    zero = F32(0.0)
+    half = F32(0.5)
+    # per point: the projection's constants
+    X0 = ox + 0.5 * bx - x0
+    kf = F32(kappa)
+    Xa0 = F32(X0)
+    astep = F32(LOBE_STEP * bx)
+    alast = F32(ox + (w - 1 + 0.5) * bx - x0)
+    f0 = F32(fwd[0])
+    quarter = F32(1.0 / LOBE_STEP)
+    jl0 = ((w - 1) // LOBE_STEP) * LOBE_STEP  # the last lobe segment may be shorter
+    jl1 = min(jl0 + LOBE_STEP, w - 1)
+    X0f = F32(X0)
+    bxf = F32(bx)
+    ddf = F32(dd)
+    n0 = F32(normal[0])
+    k_cos = F32(t_nb * e * (1.0 - lobe) / math.pi / (dd * dd))
+    k_lobe = F32(t_nb * e * lobe * vmf / (dd * dd))
+    inv_rim = F32(1.0 / 0.03)
+    cf = F32(c)
+    wa = F32(1.0 - w2)
+    wb = F32(w2)
+    # per frame: the detector's constants
+    adu32 = F32(adu)
+    k32 = F32(k)
+    ninth = F32(1.0 / 9.0)
+    third = F32(1.0 / 3.0)
+    cut = F32(POISSON_EXACT_BELOW)
+    ukey = U64(keys[b])
+    zstart = zstarts[b]
+    nstart = nstarts[b]
+    a32 = F32(a)
+    ca = F32((1.0 - 2.0 * a) / a) if a > 0 else F32(0.0)
+    inb = F32(inv_nb)
+    s32 = F32(sigma)
+    sc = F32(scale)
+    vm = F32(vmax)
+
     acc = 0.0
     sat = 0
     first = max(r0 - 1, 0)
     last = min(r1, h - 1)
     o_frame = offsets[b]
     for r in range(first, last + 1):
-        rd = _project_row(r, bank, bank_n, face0, full, offs, scales, M1, M2, w2, x0, y0, dd, c, e, p1, p2,
-                          g1, ox, oy, bx, by, normal, fwd, lobe, kappa, vmf, t_nb, iota, lob, bits, bitsf, ex,
-                          bgf, val, val2, q, tx, ty, lam)
+        # ---- projection: row r's Poisson means (kernels.render, ss = 1)
+        Y = oy + (r + 0.5) * by - y0
+        yy = F32(Y * Y + dd * dd)
+        if kappa > 0.0:  # the lobe is smooth: exact every LOBE_STEP pixels, linear between
+            yf = F32(Y * fwd[1] + dd * fwd[2])
+            for ia in range(na):
+                Xa = min(Xa0 + iota[ia] * astep, alast)  # (iota: a float index converts without a scalar step)
+                lob[ia] = kf * ((Xa * f0 + yf) / math.sqrt(Xa * Xa + yy) - one)
+            _exp(lob, bits, bitsf, na)
+            for ia in range(w // LOBE_STEP):
+                l0 = lob[ia]
+                dl = (lob[ia + 1] - l0) * quarter
+                for s in range(LOBE_STEP):
+                    ex[ia * LOBE_STEP + s] = l0 + F32(s) * dl
+            ia = jl0 // LOBE_STEP
+            for j in range(jl0, w):
+                t = F32((j - jl0) / (jl1 - jl0)) if jl1 > jl0 else zero
+                ex[j] = lob[ia] + (lob[ia + 1] - lob[ia]) * t
+        else:
+            for j in range(w):
+                ex[j] = one
+        yn = F32(Y * normal[1] + dd * normal[2])
+        for j in range(w):  # the backscatter background and solid angle
+            X = X0f + iota[j] * bxf
+            inv = one / math.sqrt(X * X + yy)
+            rz = ddf * inv
+            rn = (X * n0 + yn) * inv
+            shadow = min(rn * inv_rim, one)
+            fb = shadow * (k_cos * rn + k_lobe * ex[j]) * rz * rz * rz
+            bgf[j] = fb if rn > zero else zero
+        rd = 0.0
+        if g1 >= 0:  # the master pattern and the band modulation
+            _nodes(bank_n, face0[p1], full[p1], M1[0, 0] * X0 + M1[0, 1] * Y + M1[0, 2] * dd, M1[0, 0] * bx,
+                   M1[1, 0] * X0 + M1[1, 1] * Y + M1[1, 2] * dd, M1[1, 0] * bx,
+                   M1[2, 0] * X0 + M1[2, 1] * Y + M1[2, 2] * dd, M1[2, 0] * bx, iw, q, tx, ty)
+            _gather(bank, bank_n, offs[p1], scales[p1], q, tx, ty, val)
+            if w2 > 0.0:
+                _nodes(bank_n, face0[p2], full[p2], M2[0, 0] * X0 + M2[0, 1] * Y + M2[0, 2] * dd, M2[0, 0] * bx,
+                       M2[1, 0] * X0 + M2[1, 1] * Y + M2[1, 2] * dd, M2[1, 0] * bx,
+                       M2[2, 0] * X0 + M2[2, 1] * Y + M2[2, 2] * dd, M2[2, 0] * bx, iw, q, tx, ty)
+                _gather(bank, bank_n, offs[p2], scales[p2], q, tx, ty, val2)
+                for j in range(w):
+                    val[j] = wa * val[j] + wb * val2[j]
+            for j in range(w):
+                lv = max(bgf[j] * (one + cf * val[j]), zero)
+                lam[j] = lv
+                rd += lv
+        else:
+            for j in range(w):
+                lv = bgf[j]
+                lam[j] = lv
+                rd += lv
         if r >= r0 and r < r1:
             acc += rd
-        _deposit_row(r, lam, S3, (r % 3) * W, adu, k, keys[b], table, zstarts[b], lane, ln, bits, bitsf,
-                     u, p, f, cnt, Ls)
+
+        # ---- deposit: detector.fast.deposit for row r, into S3 at (r % 3) * W
+        base = r * w
+        zg = U64((zstart + base) & _MASK)
+        zp = U64((zstart + _SECOND_STREAM + base) & _MASK)
+        s0 = U64((r % 3) * W)
+        for cc in range(w):  # every pixel by the normal approximation (right from the cut up)
+            L = lam[cc]
+            cu = U64(cc)
+            nn = max(np.floor(L + math.sqrt(L) * table[zp + cu] + half), zero)
+            ri = one / math.sqrt(max(nn, one) * k32)
+            g = max(one - ninth * ri * ri + third * table[zg + cu] * ri, zero)
+            S3[s0 + cu] = nn * adu32 * g * g * g
+        dim = 0  # (`&`, not `and`: a short-circuit is a branch, and a branch stops vectorisation)
+        for cc in range(w):
+            dim += 1 if ((lam[cc] < cut) & (lam[cc] > zero)) else 0
+        if dim > 0:  # the dim pixels again, exactly
+            m = 0
+            for cc in range(w):
+                lane[m] = U32(cc)
+                m += 1 if ((lam[cc] < cut) & (lam[cc] > zero)) else 0
+            for i in range(m):
+                L = lam[lane[i]]
+                Ls[i] = L
+                ln[i] = -L
+            _exp(ln, bits, bitsf, m)  # P(0)
+            for i in range(m):
+                xh = ukey + U64(base + lane[i]) * U64(_GOLD)
+                xh = (xh ^ (xh >> U64(30))) * U64(_M1)
+                xh = (xh ^ (xh >> U64(27))) * U64(_M2)
+                xh = xh ^ (xh >> U64(31))
+                lu[i] = F32(((xh >> U64(11)) + U64(1)) * _U53)
+                lp[i] = ln[i]
+                lf[i] = ln[i]
+                lcnt[i] = zero
+            mp = (m + _CHUNK - 1) // _CHUNK * _CHUNK  # whole vectors: no scalar remainder per count
+            for i in range(m, mp):  # padding lanes, never drawn
+                lu[i] = zero
+                lp[i] = zero
+                lf[i] = one
+                Ls[i] = zero
+                lcnt[i] = zero
+            # inversion, n = #{k >= 1 : u > F(k - 1)}: the row's dim pixels a count at a time
+            for kk in range(1, _MAX_COUNT + 1):
+                inv_k = F32(1.0 / kk)
+                more = zero  # a float sum vectorises with the rest; an integer one halves the width
+                for i in range(mp):
+                    up = lu[i] > lf[i]
+                    lcnt[i] += one if up else zero
+                    more += one if up else zero
+                    lp[i] *= Ls[i] * inv_k
+                    lf[i] += lp[i]
+                if more == zero:
+                    break
+            for i in range(m):
+                cc = lane[i]
+                nn = lcnt[i]
+                ri = one / math.sqrt(max(nn, one) * k32)
+                g = max(one - ninth * ri * ri + third * table[zg + U64(cc)] * ri, zero)
+                S3[s0 + U64(cc)] = nn * adu32 * g * g * g
+
+        # ---- analogue: the row above, now that the deposits around it are there
         qr = r - 1
-        if qr >= r0 and qr < r1:
+        if r == h - 1 and r1 == h:
+            nq = 2  # the last row too: below it is itself
+        else:
+            nq = 1
+        for iq in range(nq):
+            if iq == 1:
+                qr = h - 1
+            if qr < r0 or qr >= r1:
+                continue
             pu = qr - 1 if qr > 0 else qr
-            sat += _analog_row(qr, S3, (pu % 3) * W, (qr % 3) * W, (r % 3) * W,
-                               a, inv_nb, gain, offb, hot_ptr, hot_col, hot_val, sigma, scale, vmax,
-                               table, nstarts[b], v, out, o_frame + qr * w)
-    if r1 == h:  # the last row: below it is itself
-        qr = h - 1
-        pu = qr - 1 if qr > 0 else qr
-        sat += _analog_row(qr, S3, (pu % 3) * W, (qr % 3) * W, (qr % 3) * W, a, inv_nb, gain, offb,
-                           hot_ptr, hot_col, hot_val, sigma, scale, vmax, table, nstarts[b], v, out,
-                           o_frame + qr * w)
+            pd = qr + 1 if qr < h - 1 else qr
+            su = U64((pu % 3) * W)
+            sr = U64((qr % 3) * W)
+            sd = U64((pd % 3) * W)
+            m0 = U64(qr * w)  # gain, offb: flat (h * w)
+            z0 = U64((nstart + qr * w) & _MASK)
+            oo = U64(o_frame + qr * w)
+            if a > 0:
+                for cc in range(w):
+                    cu = U64(cc)
+                    vrow[cc] = a32 * (S3[su + cu] + S3[sd + cu] + S3[sr + cu] * ca)
+            else:
+                for cc in range(w):
+                    vrow[cc] = S3[sr + U64(cc)]
+            if a > 0 and w > 2:
+                for cc in range(1, w - 1):
+                    cu = U64(cc)
+                    y = (a32 * (vrow[cc - 1] + vrow[cc + 1] + vrow[cc] * ca) * inb * gain[m0 + cu] + offb[m0 + cu]
+                         + s32 * table[z0 + cu]) * sc
+                    sat += 1 if y >= vm else 0
+                    out[oo + cu] = np.uint16(min(max(y, zero), vm) + half)
+                sat += _analog_pixel(0, vrow, a, inv_nb, gain, offb, sigma, scale, vmax, table, m0, z0, zero, out, oo)
+                sat += _analog_pixel(w - 1, vrow, a, inv_nb, gain, offb, sigma, scale, vmax, table, m0, z0, zero, out,
+                                     oo)
+            else:
+                for cc in range(w):
+                    sat += _analog_pixel(cc, vrow, a, inv_nb, gain, offb, sigma, scale, vmax, table, m0, z0, zero,
+                                         out, oo)
+            for hh in range(hot_ptr[qr], hot_ptr[qr + 1]):  # hot pixels: again, with their dark current
+                cc = hot_col[hh]
+                y = _analog_value(cc, vrow, a, inv_nb, gain, offb, sigma, scale, table, m0, z0, hot_val[hh])
+                old = _analog_value(cc, vrow, a, inv_nb, gain, offb, sigma, scale, table, m0, z0, zero)
+                sat += (1 if y >= vm else 0) - (1 if old >= vm else 0)
+                out[oo + U64(cc)] = np.uint16(min(max(y, zero), vm) + half)
     return acc, sat
 
 

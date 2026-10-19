@@ -282,12 +282,12 @@ class ShmFace:
         h = self.producer.hdr
         return h.bytes_per_pixel == 2 and tuple(feed.source.shape) == (h.frame_height, h.frame_width)
 
-    #: Frames made ahead of DE-Server, per worker thread.
-    FRAMES_AHEAD_PER_WORKER = 2
+    #: Frames a worker makes per job (see `DigitalTwin.FRAMES_PER_JOB`).
+    FRAMES_PER_JOB = 4
 
     def _serve_fused(self, request_id: int, request, feed):
         """`_serve` for frames made by the fused EBSD kernel (`DigitalTwin.ebsd_frame_source`):
-        each frame is a job for the worker threads (:mod:`de_twin.workers`), submitted ahead
+        a few frames a job for the worker threads (:mod:`de_twin.workers`), submitted ahead
         into a ring of frame buffers, and published in order as DE-Server frees its slots.
         DE-Server's ring holds a few frames, too few to keep every core busy, so the frames
         are made in buffers of the twin's and copied into the slots (~40 us a frame).
@@ -302,18 +302,20 @@ class ShmFace:
         h = p.hdr
         shape = (h.frame_height, h.frame_width)
         workers = pool()
-        ahead = workers.threads * self.FRAMES_AHEAD_PER_WORKER
-        ring = [np.empty(shape, np.uint16) for _ in range(ahead)]
+        per_job = self.FRAMES_PER_JOB
+        jobs_ahead = workers.threads + workers.threads // 2
+        ring = [np.empty((per_job, *shape), np.uint16) for _ in range(jobs_ahead + 1)]
         frame_time = max(float(request.frame_time_s), 1e-6)
         total = request.total_frames
-        pending: deque = deque()  # (frame, slot, batch)
+        pending: deque = deque()  # (first frame, frames, slot, batch)
         t0 = time.monotonic()
         k = nxt = 0
+        n_jobs = 0
         last = None
 
         def drain():
-            for _, _, batch in pending:
-                batch.wait()
+            for *_, batch in pending:
+                batch.wait_done(10.0)
             pending.clear()
 
         try:
@@ -323,37 +325,41 @@ class ShmFace:
                 if feed.changed():  # a new scan, or the column moved: frames from k on afresh
                     drain()
                     nxt = k
-                limit = k + ahead if total <= 0 else min(k + ahead, total)
+                limit = 1 << 62 if total <= 0 else total
                 limit = min(limit, max(k + 1, feed.settled()))
-                if nxt < limit:
-                    source = feed.source
-                    for j, point in enumerate(feed.points(nxt, limit - nxt), nxt):
-                        slot = j % ahead
+                while len(pending) < jobs_ahead and nxt < limit:
+                    count = min(per_job, limit - nxt)
+                    slot = n_jobs % len(ring)
+                    ks, serials, seed = [], [], 0
+                    for j, point in enumerate(feed.points(nxt, count), nxt):
+                        ks.append(feed.flat(point, j))
                         serial, seed = self.twin.noise_serial(request, j)
-                        pending.append((j, slot, source.submit(workers, [ring[slot]], [feed.flat(point, j)],
-                                                               seed, [serial])))
-                    nxt = limit
-                _, slot, batch = pending[0]
+                        serials.append(serial)
+                    pending.append((nxt, count, slot, feed.source.submit(workers, ring[slot], ks, seed, serials)))
+                    nxt += count
+                    n_jobs += 1
+                first, count, slot, batch = pending[0]
                 if not batch.wait_done(KEEPALIVE_S):  # a slow start (the kernels compiling)
                     if last is not None and p.free_slots() > 0:
                         p.publish(last, request_id=request_id, frame_index=k)
                         self.keepalives += 1
                     continue
                 batch.wait()
-                while not p.wait_slot_free(timeout=0.05):
-                    if self._stop.is_set() or p.request_changed(request_id):
-                        return p.poll_request()
-                last = ring[slot]
-                p.publish(last, request_id=request_id, frame_index=k)
                 pending.popleft()
-                k += 1
-                self.frames_published += 1
-                if total > 0 and k >= total:
-                    return None
-                if self.pace:
-                    delay = t0 + k * frame_time - time.monotonic()
-                    if delay > 0:
-                        self._stop.wait(delay)
+                for b in range(k - first, count):  # (after a restart, the frames before k are done)
+                    while not p.wait_slot_free(timeout=0.05):
+                        if self._stop.is_set() or p.request_changed(request_id):
+                            return p.poll_request()
+                    last = ring[slot][b]
+                    p.publish(last, request_id=request_id, frame_index=k)
+                    k += 1
+                    self.frames_published += 1
+                    if total > 0 and k >= total:
+                        return None
+                    if self.pace:
+                        delay = t0 + k * frame_time - time.monotonic()
+                        if delay > 0:
+                            self._stop.wait(delay)
         finally:
             drain()
             if last is not None:  # the keep-alive frame for what comes next
