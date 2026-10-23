@@ -9,6 +9,9 @@ scan is a position inside it.
 * ``Scan - Pixel Offset X/Y`` adds ``offset x volts per point`` to every output
   voltage, so it pans by a fraction of a scan point, in the coils' frame (scan rotation
   does not turn it). Drift correction and a live probe crosshair steer this.
+* The offset moves the scan by at most half its own range each way, and never past the
+  scan card's +-10 V output (``ScanController::GetAnalogOutputRange``); beyond that it
+  is clamped.
 * An ROI or an XY array addresses points of the same full grid.
 
 This follows ``ScanPattern::_TransformCoordinates`` and
@@ -32,6 +35,8 @@ from dataclasses import dataclass
 #: DE-Server's default ``Scan - Voltage H/V Min/Max``.
 DEFAULT_VOLTAGE_RANGE = (-1.0, 1.0)
 DEFAULT_VOLTAGE_SPAN = DEFAULT_VOLTAGE_RANGE[1] - DEFAULT_VOLTAGE_RANGE[0]
+#: What DE-Server's scan card can output, in volts.
+OUTPUT_LIMIT_VOLTS = 10.0
 
 
 @dataclass(frozen=True)
@@ -62,15 +67,25 @@ def _actual_ranges(size: tuple[int, int], voltage_h: tuple[float, float],
     return span_h, span_v
 
 
+def _clamp_shift(shift: float, middle: float, span: float) -> float:
+    """The offset DE-Server can output: half the scan's span each way, inside the card's
+    range."""
+    half = 0.5 * abs(span)
+    low = max(-half, -OUTPUT_LIMIT_VOLTS - middle + half)
+    high = min(half, OUTPUT_LIMIT_VOLTS - middle - half)
+    return min(max(shift, low), high)
+
+
 def scan_coils(scan) -> ScanCoils:
     """The coil geometry a :class:`~de_twin.state.ScanRequest` asks for."""
     nx, ny = max(1, int(scan.size[0])), max(1, int(scan.size[1]))
     span_h, span_v = _actual_ranges((nx, ny), scan.voltage_h, scan.voltage_v)
     volts_per_point = span_h / nx if nx >= ny else span_v / ny
-    shift_h = float(scan.pixel_offset[0]) * span_h / nx
-    shift_v = float(scan.pixel_offset[1]) * span_v / ny
-    center = (0.5 * (scan.voltage_h[0] + scan.voltage_h[1]) + shift_h,
-              0.5 * (scan.voltage_v[0] + scan.voltage_v[1]) + shift_v)
+    middle_h = 0.5 * (scan.voltage_h[0] + scan.voltage_h[1])
+    middle_v = 0.5 * (scan.voltage_v[0] + scan.voltage_v[1])
+    shift_h = _clamp_shift(float(scan.pixel_offset[0]) * span_h / nx, middle_h, span_h)
+    shift_v = _clamp_shift(float(scan.pixel_offset[1]) * span_v / ny, middle_v, span_v)
+    center = (middle_h + shift_h, middle_v + shift_v)
     return ScanCoils(volts_per_point=volts_per_point, center_volts=center,
                      rotation_deg=float(scan.rotation_deg), flip=(bool(scan.flip[0]), bool(scan.flip[1])))
 
@@ -90,6 +105,24 @@ def point_volts(scan, x: float, y: float) -> tuple[float, float]:
     u, v = u * c - v * s, u * s + v * c
     return (coils.center_volts[0] + coils.volts_per_point * u,
             coils.center_volts[1] + coils.volts_per_point * v)
+
+
+def point_from_volts(scan, h: float, v: float) -> tuple[float, float]:
+    """The full-grid point (x, y) the coils put the probe on at voltages (H, V): the
+    inverse of :func:`point_volts`. Not rounded, nor kept inside the grid: an offset can
+    put the probe off the grid's edge."""
+    coils = scan_coils(scan)
+    nx, ny = max(1, int(scan.size[0])), max(1, int(scan.size[1]))
+    u = (h - coils.center_volts[0]) / coils.volts_per_point
+    w = (v - coils.center_volts[1]) / coils.volts_per_point
+    a = math.radians(coils.rotation_deg)
+    c, s = math.cos(a), math.sin(a)
+    u, w = u * c + w * s, -u * s + w * c
+    if coils.flip[0]:
+        u = -u
+    if coils.flip[1]:
+        w = -w
+    return u + (nx - 1) / 2.0, w + (ny - 1) / 2.0
 
 
 def nm_per_volt(default_step_nm: float, size: tuple[int, int]) -> float:

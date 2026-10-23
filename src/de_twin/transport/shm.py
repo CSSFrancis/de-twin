@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import mmap
 import os
+import struct
 import sys
 import time
 from typing import Optional
@@ -21,6 +22,12 @@ from ..state import AcquisitionRequest, ExposureMode, Roi, ScanRequest
 from . import shm_layout as L
 
 _WINDOWS = sys.platform == "win32"
+#: The hot path packs fields directly: a field at a time through ``L.View`` is ~1 us each,
+#: a third of the budget for a frame at 30,000 frames a second.
+_READ_COUNT = L.HEADER["read_count"].offset
+_WRITE_COUNT = L.HEADER["write_count"].offset
+#: A slot's fields after frame_number, in ``L.SLOT`` order: request_id .. flags.
+_SLOT_FIELDS = "<QQIIII"
 
 
 def mapping_exists(name: str) -> bool:
@@ -114,6 +121,7 @@ class FrameProducer(_Mapping):
         super().__init__(name, _map(name, L.mapping_size(slot_bytes, slot_count)), slot_bytes, slot_count)
         # A request DE-Server is still acquiring for when we attach gets served; an old one does not.
         self._served = 0 if self.hdr.acquiring else self.hdr.request_id
+        self._written = self.hdr.write_count  # only the producer writes it
 
     @property
     def max_frame_bytes(self) -> int:
@@ -137,12 +145,17 @@ class FrameProducer(_Mapping):
     def request_changed(self, request_id: int) -> bool:
         return self.hdr.request_id != request_id or not self.hdr.acquiring
 
+    def free_slots(self) -> int:
+        return self.slot_count - (self._written - struct.unpack_from("<Q", self.mm, _READ_COUNT)[0])
+
     def wait_slot_free(self, timeout: float) -> bool:
+        # Yield instead of sleeping: at tens of thousands of frames a second the whole ring
+        # drains in well under a millisecond, and Windows rounds any sleep up to about one.
         deadline = time.monotonic() + timeout
-        while self.hdr.write_count - self.hdr.read_count >= self.slot_count:
+        while self.free_slots() <= 0:
             if time.monotonic() >= deadline:
                 return False
-            time.sleep(0.0005)
+            time.sleep(0)
         return True
 
     def publish(self, frame: np.ndarray, *, request_id: int, frame_index: int, flags: int = 0) -> int:
@@ -150,20 +163,18 @@ class FrameProducer(_Mapping):
         frame = np.ascontiguousarray(frame)
         if frame.nbytes > self.max_frame_bytes:
             raise ValueError(f"frame of {frame.nbytes} bytes exceeds the slot ({self.max_frame_bytes} bytes)")
-        n = self.hdr.write_count
-        s = self.slot(n)
-        s.frame_number = 0  # not ready while being written
-        off = self.payload(n)
-        dst = np.frombuffer(self.mm, np.uint8, frame.nbytes, off)
+        n = self._written
+        slot = L.slot_offset(n, self.slot_bytes, self.slot_count)
+        struct.pack_into("<Q", self.mm, slot, 0)  # frame_number: not ready while being written
+        dst = np.frombuffer(self.mm, np.uint8, frame.nbytes, slot + L.SLOT_HEADER_BYTES)
         np.copyto(dst, frame.reshape(-1).view(np.uint8))  # one copy, no bytes object
         del dst  # a live view would keep the mapping from closing
-        s.request_id = request_id
-        s.frame_index = frame_index
-        s.height, s.width = frame.shape
-        s.bytes_per_pixel = frame.dtype.itemsize
-        s.flags = flags
-        s.frame_number = n + 1  # ready
-        self.hdr.write_count = n + 1
+        height, width = frame.shape
+        struct.pack_into(_SLOT_FIELDS, self.mm, slot + L.SLOT["request_id"].offset,
+                         request_id, frame_index, width, height, frame.dtype.itemsize, flags)
+        struct.pack_into("<Q", self.mm, slot, n + 1)  # frame_number: ready
+        self._written = n + 1
+        struct.pack_into("<Q", self.mm, _WRITE_COUNT, n + 1)
         return n
 
 

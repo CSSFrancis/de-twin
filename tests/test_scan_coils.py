@@ -97,3 +97,14 @@ class TestOptics:
             here = renderer.render(moved, scan_point=(col, row))
             np.testing.assert_allclose(here, renderer.render(o, scan_point=(col + 3, row)), rtol=1e-5)
             assert not np.allclose(here, film, rtol=0.01)  # it really is on a particle
+
+
+class TestClamp:
+    def test_the_offset_stops_at_half_the_range(self):
+        step = 2.0 / 64
+        assert scan_coils(_scan(pixel_offset=(32.0, -32.0))).center_volts == pytest.approx((32 * step, -32 * step))
+        assert scan_coils(_scan(pixel_offset=(100.0, -100.0))).center_volts == pytest.approx((1.0, -1.0))
+
+    def test_the_offset_stays_inside_the_cards_output(self):
+        coils = scan_coils(_scan(voltage_h=(6.0, 9.0), pixel_offset=(64.0, 0.0)))
+        assert coils.center_volts[0] == pytest.approx(10.0 - 1.5)  # the scan's edge at +10 V

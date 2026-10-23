@@ -45,10 +45,29 @@ against the compiled header.
 Dark references work because the twin blanks the beam when the request's exposure mode
 is Dark.
 
+## Scan coil voltages
+
+`ScanOutput.h` (DE-Server's `Scanner/ScanOutput.h`) is the scan card's side. In simulator
+mode there is no card, so the scan simulator writes the voltages it would have sent into
+the shared memory `DE_ScanOutput`: block by block, with the pixel offset read once per
+block, and as far ahead of the beam as the card's FIFO would hold
+(`Scan - Output Buffer (milliseconds)`). The twin renders each frame where its point's
+voltages put the beam, so a pixel offset, an XY array or drift correction steers it with
+the latency a real scan card gives.
+
+| File | Change |
+|---|---|
+| `Scanner/ScanOutput.h` | new: the layout and a small writer |
+| `Scanner/ScanController.h/.cpp` | `_SizeOutputBlocks()` (the card's block sizing, now shared with the simulator), `_BeginSimulatedOutput()` when a simulated scan starts, `_WriteSimulatedOutputBlock()` as the simulator advances |
+
+Its Python mirror is `de_twin/transport/scan_output.py`, checked against the compiled
+header by `tests/test_scan_output.py`.
+
 ## Testing without DE-Server
 
 `build.bat` builds `build\test_consumer.exe` from the same `ExternalFrameSource.cpp`:
 
-* `test_consumer layout` prints every struct offset, compared by `tests/test_shm_layout.py`.
+* `test_consumer layout` prints every struct offset, compared by `tests/test_shm_layout.py`
+  and `tests/test_scan_output.py`.
 * `test_consumer <mapping> <frames> <w> <h> <exposureMode>` acts like DE-Server. The
   twin's shared-memory face serves it in `tests/test_shm_interop.py`.
