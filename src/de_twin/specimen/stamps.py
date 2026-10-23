@@ -24,6 +24,8 @@ from pathlib import Path
 
 import numpy as np
 
+from ..parallel import PARALLEL
+
 try:
     import numba as nb
 
@@ -189,6 +191,8 @@ def _hash(seed, i, j):
 def _njit(**kw):
     if not AVAILABLE:
         return lambda f: f
+    if kw.get("parallel"):
+        kw["parallel"] = PARALLEL
     return nb.njit(cache=True, fastmath=True, nogil=True, **kw)
 
 
