@@ -46,6 +46,7 @@ import numba as nb
 import numpy as np
 
 from ..detector.fast import _GOLD, _M1, _M2, _U53, NORMALS, POISSON_EXACT_BELOW
+from ..parallel import PARALLEL
 from .kernels import LOBE_STEP, _detector_to_crystal
 
 _MASK = NORMALS - 1
@@ -67,6 +68,8 @@ _ROWSU32 = 3
 
 
 def _njit(**kw):
+    if kw.get("parallel"):
+        kw["parallel"] = PARALLEL
     return nb.njit(cache=True, nogil=True, fastmath=True, error_model="numpy", **kw)
 
 

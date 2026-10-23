@@ -22,6 +22,8 @@ import math
 import numba as nb
 import numpy as np
 
+from ..parallel import PARALLEL
+
 SQRT_PI = math.sqrt(math.pi)
 LAMBERT_L = math.sqrt(math.pi / 2.0)
 
@@ -38,6 +40,8 @@ EDGE_MIN_SIGMA = 0.05
 
 
 def _njit(**kw):
+    if kw.get("parallel"):
+        kw["parallel"] = PARALLEL
     return nb.njit(cache=True, nogil=True, fastmath=True, error_model="numpy", **kw)
 
 
