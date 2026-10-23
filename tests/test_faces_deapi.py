@@ -289,6 +289,31 @@ def test_zero_acquisitions_is_live_until_stopped(client):
     assert not client.acquiring
 
 
+def test_a_live_scan_follows_the_offset_and_zoom_as_they_change(client, twin):
+    """The coils are what a client steers while scanning (probe, drift, pan, zoom)."""
+    client["Scan - Enable"] = "On"
+    client["Scan - Size X"] = 4  # the smallest scan DE-Server accepts
+    client["Scan - Size Y"] = 4
+    client["Scan - Voltage H Max"] = 0.5
+    client.start_acquisition(0)
+    try:
+        deadline = time.time() + 5
+        while not twin.requests and time.time() < deadline:
+            time.sleep(0.01)
+        assert twin.requests[-1].scan.voltage_h == (-1.0, 0.5)
+        client["Scan - Pixel Offset X"] = 2.5
+        client["Scan - Voltage V Min"] = -0.25
+        while twin.requests[-1].scan.pixel_offset != (2.5, 0.0) and time.time() < deadline:
+            time.sleep(0.01)
+        assert twin.requests[-1].scan.pixel_offset == (2.5, 0.0)
+        assert twin.requests[-1].scan.voltage_v == (-0.25, 1.0)
+        assert twin.requests[-1].total_frames == 16  # the grid itself does not change mid-scan
+    finally:
+        client.stop_acquisition()
+        while client.acquiring:
+            time.sleep(0.01)
+
+
 def test_real_twin_if_available():
     try:
         from de_twin.twin import DigitalTwin
