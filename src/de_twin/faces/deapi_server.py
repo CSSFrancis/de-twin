@@ -34,7 +34,13 @@ properties mirroring the column (``Instrument Stage Position X (micrometers)``,
 
 Extra commands answered (beyond deapi's fake server): ``SET_HW_ROI`` (16),
 ``SET_SCAN_SIZE`` (27), ``SET_SCAN_ROI`` (28), ``SET_SCAN_XY_ARRAY`` (32),
-``GET_PROPERTY_SPECIFICATIONS`` (35).
+``GET_PROPERTY_SPECIFICATIONS`` (35) and ``GET_GPU_FRAMES`` (44): the twin's frames in
+shared GPU memory, as DE-Server shares its movie buffers (:mod:`de_twin.faces.gpu_frames`).
+
+A scan acquisition runs a repeat at a time, and each repeat scans with the coil settings
+(pixel offset, voltages, rotation, flips) DE-Server would have written for it:
+``Scan - Output Buffer (milliseconds)`` of scan output is queued ahead of the beam, so a
+change reaches the beam that much later, on a repeat boundary (:class:`_CoilTimeline`).
 
 Launcher (deapi-compatible CLI, "started .... " banner)::
 
@@ -44,6 +50,7 @@ Launcher (deapi-compatible CLI, "started .... " banner)::
 from __future__ import annotations
 
 import argparse
+import bisect
 import itertools
 import logging
 import socket as _socketmod
@@ -53,6 +60,7 @@ import threading
 import time
 import traceback
 from collections import deque
+from dataclasses import replace
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -100,6 +108,12 @@ SET_SCAN_SIZE = 27
 SET_SCAN_ROI = 28
 SET_SCAN_XY_ARRAY = 32
 GET_PROPERTY_SPECIFICATIONS = 35
+GET_GPU_FRAMES = 44
+
+#: Frames per shared GPU buffer, and the longest a frame waits for its buffer to fill
+#: before it is handed over anyway (a live view should not wait for 64 frames).
+GPU_BUFFER_FRAMES = 64
+GPU_PUBLISH_S = 0.02
 
 TEMPERATURE_PROP = "Simulator Virtual Specimen Temperature (C)"
 
@@ -157,6 +171,83 @@ def model_counting(twin) -> bool:
     return bool(getattr(twin.detector.model, "hardware_counting", False))
 
 
+#: DE-Server's scan coil properties, with DE-Server's defaults.
+SCAN_COIL_PROPERTIES = {
+    "Scan - Voltage H Min": -1.0, "Scan - Voltage H Max": 1.0,
+    "Scan - Voltage V Min": -1.0, "Scan - Voltage V Max": 1.0,
+    "Scan - Pixel Offset X": 0.0, "Scan - Pixel Offset Y": 0.0,
+    "Scan - Rotation": 0.0,
+}
+SCAN_FLIP_PROPERTIES = ("Scan - Flip Horizontally", "Scan - Flip Vertically")
+#: How much scan output DE-Server queues ahead of the beam, in milliseconds; 0 is its
+#: default, two quarter-FIFO blocks (DEFAULT_QUEUED_POINTS).
+OUTPUT_BUFFER_PROPERTY = "Scan - Output Buffer (milliseconds)"
+DEFAULT_QUEUED_POINTS = 2 * (1048576 // 4)
+
+
+def scan_coil_settings(get: Callable[[str], Any]) -> dict:
+    """The ScanRequest fields the scan coils take from properties (de_twin.optics.scan_coils).
+
+    These are what a client changes WHILE scanning (pan, zoom, drift correction, a moving
+    probe), so a running acquisition re-reads them between repetitions."""
+    def number(name):
+        try:
+            return float(get(name))
+        except (KeyError, TypeError, ValueError):
+            return SCAN_COIL_PROPERTIES[name]
+
+    def flag(name):
+        try:
+            return _to_bool(get(name))
+        except KeyError:
+            return False
+
+    return {
+        "voltage_h": (number("Scan - Voltage H Min"), number("Scan - Voltage H Max")),
+        "voltage_v": (number("Scan - Voltage V Min"), number("Scan - Voltage V Max")),
+        "pixel_offset": (number("Scan - Pixel Offset X"), number("Scan - Pixel Offset Y")),
+        "rotation_deg": number("Scan - Rotation"),
+        "flip": tuple(flag(name) for name in SCAN_FLIP_PROPERTIES),
+    }
+
+
+def queued_scan_points(get: Callable[[str], Any], fps: float) -> int:
+    """How many scan points DE-Server has written ahead of the beam, so how many points
+    later a coil setting written now reaches it (ScanController's analog output: four
+    blocks of at least 2 ms when ``Scan - Output Buffer (milliseconds)`` is set)."""
+    try:
+        ms = float(get(OUTPUT_BUFFER_PROPERTY))
+    except (KeyError, TypeError, ValueError):
+        ms = 0.0
+    if ms <= 0:
+        return DEFAULT_QUEUED_POINTS
+    block = max(1, int(0.002 * fps), int(ms * 1e-3 * fps) // 4)
+    return min(4 * block, DEFAULT_QUEUED_POINTS)
+
+
+class _CoilTimeline:
+    """The coil settings a client wrote during one acquisition, by the scan point the beam
+    was on when it wrote them.
+
+    DE-Server writes scan output ``queued`` points ahead of the beam and adds the offset
+    (and the rest of the coil settings) as it writes, so repeat ``r`` of an N-point
+    pattern scans with the settings as of point ``r * N - queued``: a change made now
+    lands ``queued`` points later, on a repeat boundary.
+    """
+
+    def __init__(self, settings: dict):
+        self._points = [0]
+        self._settings = [settings]
+
+    def record(self, point: int, settings: dict) -> None:
+        if settings != self._settings[-1]:
+            self._points.append(point)
+            self._settings.append(settings)
+
+    def at(self, point: int) -> dict:
+        return self._settings[max(0, bisect.bisect_right(self._points, point) - 1)]
+
+
 def request_from_properties(get: Callable[[str], Any], camera_model: str,
                             sensor_shape: tuple[int, int], *,
                             scan_points: Optional[list] = None,
@@ -189,7 +280,7 @@ def request_from_properties(get: Callable[[str], Any], camera_model: str,
         elif sroi is not None:
             points = [(sroi.x + i, sroi.y + j) for j in range(sroi.h) for i in range(sroi.w)]
         scan = ScanRequest(enabled=True, size=(nx, ny), dwell_s=fpp / fps, frames_per_point=fpp,
-                           roi=sroi, repeats=repeats, points=points)
+                           roi=sroi, repeats=repeats, points=points, **scan_coil_settings(get))
         n_points = len(points) if points else nx * ny
         frame_count = n_points * fpp * repeats
     return AcquisitionRequest(
@@ -215,6 +306,12 @@ def _resample(img: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     ys = (np.arange(shape[0]) * img.shape[0] / shape[0]).astype(int)
     xs = (np.arange(shape[1]) * img.shape[1] / shape[1]).astype(int)
     return img[ys][:, xs]
+
+
+def _gpu_image_dtype():
+    from .gpu_frames import IMAGE
+
+    return IMAGE
 
 
 def _convert(img: np.ndarray, pixel_format: int) -> np.ndarray:
@@ -249,6 +346,9 @@ class _Acquisition:
         self.refs = None
         self.done = False
         self.started = time.time()
+        self.gpu_images: list = []
+        self.gpu_info: list = []
+        self.gpu_batch_started = 0.0
         scan = request.scan
         self.virtual = None
         if scan.enabled:
@@ -298,12 +398,20 @@ class _Acquisition:
                 if self.continuous and a:
                     with self.cond:
                         self.sum = None  # the sum is per repetition, like one live buffer
-                for raw, meta in srv.twin.frames(self.request, pace=srv.pace, stop=self.stop):
-                    self._add(raw, meta)
-                    if self.stop.is_set():
-                        break
+                    # a client steers the probe while it scans: take the coils' settings now
+                    if self.request.scan.enabled:
+                        self.request = replace(self.request, scan=replace(
+                            self.request.scan, **scan_coil_settings(srv.__getitem__)))
+                if self.request.scan.enabled:
+                    self._scan()
+                else:
+                    for raw, meta in srv.twin.frames(self.request, pace=srv.pace, stop=self.stop):
+                        self._add(raw, meta)
+                        if self.stop.is_set():
+                            break
                 if self.stop.is_set():
                     break
+            self._share_gpu_frames()
             self._store_references()
         except Exception as exc:  # noqa: BLE001
             self.error = f"{type(exc).__name__}: {exc}"
@@ -312,6 +420,54 @@ class _Acquisition:
             with self.cond:
                 self.done = True
                 self.cond.notify_all()
+
+    def _scan(self) -> None:
+        """One scan acquisition, a repeat at a time, each repeat with the coil settings
+        DE-Server would have written for it (see :class:`_CoilTimeline`)."""
+        srv, request = self._server, self.request
+        scan = request.scan
+        repeats = max(1, scan.repeats)
+        frames_per_repeat = request.total_frames // repeats
+        points_per_repeat = max(1, frames_per_repeat // max(1, scan.frames_per_point))
+        queued = queued_scan_points(srv.__getitem__, 1.0 / max(request.frame_time_s, 1e-9))
+        timeline = _CoilTimeline({name: getattr(scan, name) for name in scan_coil_settings(srv.__getitem__)})
+        frames = 0
+        for repeat in range(repeats):
+            settings = timeline.at(repeat * points_per_repeat - queued)
+            this_repeat = replace(request, total_frames=frames_per_repeat,
+                                  scan=replace(scan, repeats=1, **settings))
+            for raw, meta in srv.twin.frames(this_repeat, pace=srv.pace, stop=self.stop):
+                self._add(raw, meta)
+                frames += 1
+                timeline.record(frames // max(1, scan.frames_per_point), scan_coil_settings(srv.__getitem__))
+                if self.stop.is_set():
+                    return
+
+    def _share_gpu_frames(self) -> None:
+        """Hand the frames gathered so far to a GPU frames client, if one is attached."""
+        shared = self._server._shared_frames
+        if not self.gpu_images or shared is None:
+            self.gpu_images, self.gpu_info = [], []
+            return
+        images = np.stack(self.gpu_images).astype(np.float32, copy=False)
+        info = np.zeros(len(images), _gpu_image_dtype())
+        info["frame"], info["scanX"], info["scanY"] = np.array(self.gpu_info).T
+        info["valid"] = 1
+        self.gpu_images, self.gpu_info = [], []
+        shared.allocate(GPU_BUFFER_FRAMES, *images.shape[1:])
+        shared.publish(images, info, stop=self.stop)
+
+    def _gather_gpu_frame(self, frame: np.ndarray, meta) -> None:
+        shared = self._server._shared_frames
+        if shared is None or not shared.attached:
+            return
+        if not self.gpu_images:
+            self.gpu_batch_started = time.monotonic()
+        point = getattr(meta, "scan_point", None)
+        self.gpu_images.append(frame)
+        self.gpu_info.append((self.count - 1, *(point if point is not None else (-1, -1))))
+        if len(self.gpu_images) >= GPU_BUFFER_FRAMES or time.monotonic() - self.gpu_batch_started >= GPU_PUBLISH_S:
+            self._share_gpu_frames()
 
     def _add(self, raw: np.ndarray, meta) -> None:
         if self.refs is not None:
@@ -341,6 +497,7 @@ class _Acquisition:
                 if 0 <= iy < ny and 0 <= ix < nx:
                     self.virtual[:, iy, ix] += vi_vals
             self.cond.notify_all()
+        self._gather_gpu_frame(raw, meta)
 
     def wait_first(self, timeout: float) -> bool:
         with self.cond:
@@ -373,6 +530,7 @@ class TwinFakeServer(FakeServer):  # type: ignore[misc,valid-type]
             self.pace = pace
         self._acq: Optional[_Acquisition] = None
         self._acq_count = 0
+        self._shared_frames = None  # de_twin.faces.gpu_frames.SharedFrames, made on first attach
         self._scan_points: Optional[list] = None
         self._specimen_name = ""
         self._mask_cache: dict = {}
@@ -464,8 +622,11 @@ class TwinFakeServer(FakeServer):  # type: ignore[misc,valid-type]
                                   data_type="Float", category="Simulator"))
         self._put(DynamicProperty("Simulator Virtual Specimen", lambda: self._specimen_name,
                                   self._set_specimen, category="Simulator"))
-        self._plain("Scan - Pixel Offset X", 0, "Integer")
-        self._plain("Scan - Pixel Offset Y", 0, "Integer")
+        for name, value in SCAN_COIL_PROPERTIES.items():
+            self._plain(name, value, "Float", category="Scan")
+        self._plain(OUTPUT_BUFFER_PROPERTY, 0.0, "Float", category="Scan")
+        for name in SCAN_FLIP_PROPERTIES:
+            self._plain(name, "Off", category="Scan")
         clock = getattr(self.twin, "clock", None)
         self._put(DynamicProperty("Twin Clock (seconds)",
                                   lambda: clock.now() if hasattr(clock, "now") else time.time(),
@@ -762,6 +923,8 @@ class TwinFakeServer(FakeServer):  # type: ignore[misc,valid-type]
                 return self._virtual_image_info(command)
             if cid == self.GET_VIRTUAL_IMAGE:
                 return self._virtual_image(command)
+            if cid == GET_GPU_FRAMES:
+                return self._gpu_frames(command)
             if cid == self.LIST_CAMERAS:
                 return (self._ack(command, str(self.twin.detector.model.name)),)
             return super()._respond_to_command(command)
@@ -831,10 +994,46 @@ class TwinFakeServer(FakeServer):  # type: ignore[misc,valid-type]
             self._acq.stop.set()
             self._acq.thread.join(timeout=5)
         req = self.request()
+        if self._shared_frames is not None:
+            self._shared_frames.new_acquisition()
         self._acq_count += 1
         self.number_of_frames_requested = req.total_frames * max(1, n_acq)
         self._acq = _Acquisition(self, req, n_acq, movie).start()
         return (self._ack(command),)
+
+    def _gpu_frames(self, command):
+        """GET_GPU_FRAMES (client pid, attach): attach answers the client's handle to the
+        control block, as DE-Server does. Without GPU memory sharing on this computer it
+        answers "simulated", as deapi's fake server does."""
+        from . import gpu_frames
+
+        params = command.command[0].parameter
+        pid = int(params[0].p_string)
+        attach = bool(params[1].p_bool) if len(params) > 1 else True
+        if not attach:
+            if self._shared_frames is not None:
+                self._shared_frames.detach()
+            return (self._ack(command),)
+        if self._shared_frames is None:
+            if not gpu_frames.sharing_available():
+                log.warning("this GPU cannot share memory with another process: GPU frames are simulated")
+                return (self._ack(command, "simulated"),)
+            self._shared_frames = gpu_frames.SharedFrames()
+        h, w = self._frame_shape()
+        try:
+            handle = self._shared_frames.attach(pid, (GPU_BUFFER_FRAMES, h, w))
+        except OSError as exc:
+            log.warning("GPU frames: %s", exc)
+            return (self._ack(command, error=True),)
+        return (self._ack(command, str(handle)),)
+
+    def _frame_shape(self) -> tuple[int, int]:
+        """The shape of the frames the next acquisition will render."""
+        detector = self.twin.detector
+        request = self.request()
+        if hasattr(detector, "output_shape"):
+            return tuple(int(v) for v in detector.output_shape(request))
+        return self._image_shape()
 
     # ------------------------------------------------------------ results
     def _result_image(self, frame_type: int, timeout_s: float):
@@ -1050,6 +1249,12 @@ class TwinDeapiServer:
     def stop(self) -> None:
         self._stop.set()
         self.fake.stop()
+        shared = getattr(self.fake, "_shared_frames", None)
+        if shared is not None:
+            if self.fake._acq is not None:
+                self.fake._acq.thread.join(timeout=5)
+            shared.close()
+            self.fake._shared_frames = None
         if self._tcp is not None:
             try:
                 self._tcp.close()

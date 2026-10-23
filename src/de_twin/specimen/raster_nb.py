@@ -12,6 +12,8 @@ import math
 
 import numpy as np
 
+from ..parallel import PARALLEL
+
 try:
     import numba as nb
 
@@ -23,6 +25,8 @@ except Exception:  # noqa: BLE001
 def njit(**kw):
     if not AVAILABLE:
         return lambda f: f
+    if kw.get("parallel"):
+        kw["parallel"] = PARALLEL
     return nb.njit(cache=True, nogil=True, error_model="numpy", **kw)
 
 

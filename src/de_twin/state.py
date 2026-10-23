@@ -195,6 +195,12 @@ class ScanRequest:
     park_position: tuple[int, int] = (0, 0)
     repeats: int = 1
     points: Optional[list[tuple[int, int]]] = None  # explicit XY list overrides raster
+    # Scan coils (de_twin.optics.scan_coils): the voltage range is the field the full grid
+    # spans; the pixel offset (in scan points, fractional) pans it in the coils' frame
+    voltage_h: tuple[float, float] = (-1.0, 1.0)
+    voltage_v: tuple[float, float] = (-1.0, 1.0)
+    pixel_offset: tuple[float, float] = (0.0, 0.0)
+    flip: tuple[bool, bool] = (False, False)
 
 
 @dataclass

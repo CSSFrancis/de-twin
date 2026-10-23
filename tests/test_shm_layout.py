@@ -56,7 +56,7 @@ def test_offsets_match_compiled_cpp():
         cpp[(struct_name, field)] = int(off)
     request_base = cpp[("ExternalFrameHeader", "request")]
     for (struct_name, field), off in cpp.items():
-        if field == "request":
+        if field == "request" or struct_name == "ScanOutputHeader":  # test_scan_output.py
             continue
         py = CPP_TO_PY[field]
         if struct_name == "ExternalFrameSlot":

@@ -180,6 +180,60 @@ def test_a_view_change_drops_recycled_frames():
         pool.close()
 
 
+def test_a_full_pool_is_a_library_until_the_view_changes(monkeypatch):
+    """With frames to recycle, the renderer stops once the pool is full: publishing picks
+    from it instead, and the interpreter is left to the thread that publishes. A move of
+    the column renders a new set, even in diffraction, whose optics are frozen for the
+    whole of a ``frames`` call."""
+    import time
+
+    from de_twin.faces.shm_face import _FramePool
+    from de_twin.state import TemStem
+
+    twin = DigitalTwin("Dense Au on holey C", camera="DESim", clock=ManualClock())
+    twin.column.set_tem_stem(TemStem.STEM)
+    rendered = {"n": 0}
+    real = twin.frames
+
+    def counted(request, **kw):
+        for item in real(request, **kw):
+            rendered["n"] += 1
+            yield item
+
+    monkeypatch.setattr(twin, "frames", counted)
+    pool = _FramePool(twin, twin.request(total_frames=0, frame_time_s=0.001), size=4, reuse=10**9,
+                      pace=False)
+    try:
+        x0 = pool.take(10)[0][1].microscope.stage.x_um
+        assert len(pool.take_many(100, 10)) == 100  # far more than were rendered
+        time.sleep(0.3)
+        assert rendered["n"] <= 5  # the pool, and the one frame waiting to join it
+        twin.column.move_stage(x=x0 + 1.0)
+        twin.column.state()  # the stage settles on the manual clock
+        deadline = time.monotonic() + 20
+        while pool.take(10)[0][1].microscope.stage.x_um == x0:
+            assert time.monotonic() < deadline
+        assert all(item[1].microscope.stage.x_um != x0 for item, _ in pool.take_many(20, 10))
+    finally:
+        pool.close()
+
+
+def test_frames_are_taken_in_the_order_take_hands_them_out():
+    """take_many is take, many times over, under one lock: fresh frames first, then the
+    least-used, never more than *reuse* times each."""
+    from de_twin.faces.shm_face import _FramePool
+
+    pool = _FramePool.__new__(_FramePool)
+    import threading
+
+    pool.reuse, pool._cond, pool._end, pool._last = 2, threading.Condition(), None, None
+    pool._ring = [[("a", None), 1], [("b", None), 0], [("c", None), 0]]
+    got = pool.take_many(10, 0.0)
+    assert [(item[0], fresh) for item, fresh in got] == [("b", True), ("c", True), ("a", False),
+                                                         ("b", False), ("c", False)]
+    assert pool.take_many(1, 0.0) == [(("c", None), False)]  # spent: the last frame, as a keep-alive
+
+
 def test_live_view_as_short_acquisitions_is_kept_fed(monkeypatch):
     """DE-MC's live view is a string of short acquisitions, one request each. The pool
     (and so the keep-alive) carries over between them, so a slow render at the start of
